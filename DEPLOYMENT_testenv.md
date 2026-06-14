@@ -178,6 +178,9 @@ WorkingDirectory=/opt/nas-backup-test/nas-backup-backend
 ExecStart=/usr/local/go/bin/go run cmd/nas-backup/main.go -- -config /opt/nas-backup-test/nas-backup-backend/config.yaml
 Restart=always
 RestartSec=5
+Environment=HOME=/root
+Environment=PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=GOPATH=/root/go
 Environment=GOGC=off
 
 # 资源限制（测试环境适当放宽）
