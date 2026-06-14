@@ -1,11 +1,13 @@
 // Package api implements the HTTP API layer for the NAS backup system.
 // It registers all routes, applies CORS middleware, and delegates request
-// handling to the handler methods defined in handlers.go.
+// handling to the handler methods defined in domain-specific handler files.
 package api
 
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/nas-backup/internal/backup"
 	"github.com/nas-backup/internal/config"
@@ -141,4 +143,38 @@ func (r *Router) jsonError(w http.ResponseWriter, message string, status int) {
 		Success: false,
 		Error:   message,
 	})
+}
+
+// parsePagination extracts page and size from query parameters with defaults.
+func parsePagination(req *http.Request) (page, size int) {
+	page, _ = strconv.Atoi(req.URL.Query().Get("page"))
+	size, _ = strconv.Atoi(req.URL.Query().Get("size"))
+	if page < 1 {
+		page = 1
+	}
+	if size < 1 {
+		size = 20
+	}
+	return page, size
+}
+
+// parseStringSlice parses a comma-separated string into a slice.
+func parseStringSlice(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	result := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+	return result
+}
+
+// formatStringSlice formats a string slice as a comma-separated string.
+func formatStringSlice(parts []string) string {
+	return strings.Join(parts, ",")
 }

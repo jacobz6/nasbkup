@@ -10,6 +10,8 @@
 
 # Output of the go coverage tool
 *.out
+*.coverprofile
+coverage.txt
 
 # Go workspace file
 go.work
@@ -17,18 +19,40 @@ go.work
 # Dependency directories
 vendor/
 
-# Binary
-nas-backup
+# Build output
+/nas-backup
+/build/
+/dist/
 
-# Data
-data/*.db
-data/*.db-shm
-data/*.db-wal
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
 
-# Configuration files (keep only .example files in repo)
+# Database files
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Data directory (runtime data)
+data/
+
+# Configuration files with sensitive data
 config.yaml
-data/rclone.conf
-data/master.key
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.bak
+*.cache
 
 # Allow example files
 !config.yaml.example
