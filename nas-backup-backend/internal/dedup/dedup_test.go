@@ -14,7 +14,7 @@ func setupTestDB(t *testing.T) (*db.HashRepository, func()) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.db")
 
-	database, err := db.NewDatabase(dbPath)
+	database, err := db.Open(dbPath)
 	if err != nil {
 		t.Skipf("SQLite not available: %v", err)
 	}

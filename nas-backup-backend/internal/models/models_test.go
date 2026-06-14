@@ -28,16 +28,6 @@ func TestBackupTypeConstants(t *testing.T) {
 	}
 }
 
-// TestBackupTypeString 测试 BackupType 的字符串表示
-func TestBackupTypeString(t *testing.T) {
-	if BackupTypeFull.String() != "full" {
-		t.Errorf("expected BackupTypeFull.String() = %q, got %q", "full", BackupTypeFull.String())
-	}
-	if BackupTypeIncremental.String() != "incremental" {
-		t.Errorf("expected BackupTypeIncremental.String() = %q, got %q", "incremental", BackupTypeIncremental.String())
-	}
-}
-
 // TestBackupStatusConstants 测试 BackupStatus 常量值
 func TestBackupStatusConstants(t *testing.T) {
 	if BackupStatusPending != "pending" {

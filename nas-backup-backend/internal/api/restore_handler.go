@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 
 	"github.com/nas-backup/internal/models"
 )
@@ -22,6 +23,17 @@ func (r *Router) handleRestore(w http.ResponseWriter, req *http.Request) {
 	}
 	if restoreReq.OutputDir == "" {
 		r.jsonError(w, "output_dir is required", http.StatusBadRequest)
+		return
+	}
+
+	// Validate output directory exists and is a directory.
+	info, err := os.Stat(restoreReq.OutputDir)
+	if err != nil {
+		r.jsonError(w, fmt.Sprintf("output_dir does not exist: %v", err), http.StatusBadRequest)
+		return
+	}
+	if !info.IsDir() {
+		r.jsonError(w, "output_dir must be a directory", http.StatusBadRequest)
 		return
 	}
 

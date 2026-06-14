@@ -39,7 +39,8 @@ type StorageManager struct {
 }
 
 // NewStorageManager creates a StorageManager from the application configuration.
-// It locates the rclone binary at init time and verifies it is runnable.
+// It locates the rclone binary at init time but does not fail if rclone is not found.
+// Operations requiring rclone will fail gracefully when invoked.
 func NewStorageManager(cfg *config.AppConfig) (*StorageManager, error) {
         sm := &StorageManager{
                 rcloneBinCfg: cfg.Rclone.BinaryPath,
@@ -52,14 +53,18 @@ func NewStorageManager(cfg *config.AppConfig) (*StorageManager, error) {
                 ossAKSecret:  cfg.OSS.AccessKeySecret,
         }
 
+        // Try to find rclone binary, but don't fail if not found.
         sm.rcloneBin = sm.FindRcloneBinary()
         if sm.rcloneBin == "" {
-                return nil, fmt.Errorf("rclone binary not found in PATH or common installation locations")
-        }
-
-        // Verify rclone is runnable and log its version for diagnostics.
-        if err := sm.checkRcloneVersion(); err != nil {
-                return nil, fmt.Errorf("rclone version check failed: %w", err)
+                // Log warning but allow service to start.
+                // Operations requiring rclone will fail gracefully.
+                fmt.Printf("WARNING: rclone binary not found. Storage operations will be unavailable.\n")
+        } else {
+                // Verify rclone is runnable and log its version for diagnostics.
+                if err := sm.checkRcloneVersion(); err != nil {
+                        fmt.Printf("WARNING: rclone version check failed: %v. Storage operations may be unavailable.\n", err)
+                        sm.rcloneBin = ""
+                }
         }
 
         return sm, nil

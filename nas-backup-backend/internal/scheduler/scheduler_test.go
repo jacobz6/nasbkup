@@ -15,7 +15,7 @@ func setupTestDB(t *testing.T) (*db.Database, func()) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.db")
 
-	database, err := db.NewDatabase(dbPath)
+	database, err := db.Open(dbPath)
 	if err != nil {
 		t.Skipf("SQLite not available: %v", err)
 	}
@@ -291,21 +291,20 @@ func TestBackupHistoryCreateAndGet(t *testing.T) {
 	database, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	now := time.Now()
-	completedAt := now.Add(5 * time.Minute)
-	id, err := database.BackupRepo.Create(models.BackupRecord{
-		Type:        models.BackupTypeIncremental,
-		Status:      models.BackupStatusCompleted,
-		TotalFiles:  100,
-		TotalSize:   1024,
-		StartedAt:   &now,
-		CompletedAt: &completedAt,
-	})
+	id, err := database.BackupRepo.Create(models.BackupTypeIncremental, nil)
 	if err != nil {
 		t.Fatalf("Create failed: %v", err)
 	}
 	if id == 0 {
 		t.Error("expected non-zero ID")
+	}
+
+	// Set status to running and then completed with timestamps
+	if err := database.BackupRepo.UpdateStatus(id, models.BackupStatusRunning, ""); err != nil {
+		t.Fatalf("UpdateStatus to running failed: %v", err)
+	}
+	if err := database.BackupRepo.UpdateStatus(id, models.BackupStatusCompleted, ""); err != nil {
+		t.Fatalf("UpdateStatus to completed failed: %v", err)
 	}
 
 	rec, err := database.BackupRepo.GetByID(id)
@@ -325,35 +324,18 @@ func TestBackupHistoryList(t *testing.T) {
 	defer cleanup()
 
 	for i := 0; i < 5; i++ {
-		now := time.Now().Add(-time.Duration(i) * time.Hour)
-		_, err := database.BackupRepo.Create(models.BackupRecord{
-			Type:      models.BackupTypeFull,
-			Status:    models.BackupStatusCompleted,
-			TotalFiles: i + 1,
-			StartedAt: &now,
-		})
+		_, err := database.BackupRepo.Create(models.BackupTypeFull, nil)
 		if err != nil {
 			t.Fatalf("Create record %d failed: %v", i, err)
 		}
 	}
 
-	all, err := database.BackupRepo.List()
+	all, err := database.BackupRepo.List(100, 0)
 	if err != nil {
 		t.Fatalf("List failed: %v", err)
 	}
 	if len(all) != 5 {
 		t.Errorf("expected 5 records, got %d", len(all))
-	}
-
-	page, err := database.BackupRepo.ListPaged(1, 2)
-	if err != nil {
-		t.Fatalf("ListPaged failed: %v", err)
-	}
-	if len(page.Items) != 2 {
-		t.Errorf("expected 2 items, got %d", len(page.Items))
-	}
-	if page.Total != 5 {
-		t.Errorf("expected total 5, got %d", page.Total)
 	}
 }
 
@@ -370,15 +352,16 @@ func TestGetLatestFullBackup(t *testing.T) {
 		t.Error("expected no latest full backup")
 	}
 
-	// 插入全量备份
-	now := time.Now()
-	_, err = database.BackupRepo.Create(models.BackupRecord{
-		Type:      models.BackupTypeFull,
-		Status:    models.BackupStatusCompleted,
-		StartedAt: &now,
-	})
+	// 插入全量备份并完成它
+	id, err := database.BackupRepo.Create(models.BackupTypeFull, nil)
 	if err != nil {
 		t.Fatalf("Create failed: %v", err)
+	}
+	if err := database.BackupRepo.UpdateStatus(id, models.BackupStatusRunning, ""); err != nil {
+		t.Fatalf("UpdateStatus to running failed: %v", err)
+	}
+	if err := database.BackupRepo.UpdateStatus(id, models.BackupStatusCompleted, ""); err != nil {
+		t.Fatalf("UpdateStatus to completed failed: %v", err)
 	}
 
 	latest, err = database.BackupRepo.GetLatestFull()
@@ -397,54 +380,42 @@ func TestBackupRepoUpdate(t *testing.T) {
 	database, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	now := time.Now()
-	id, _ := database.BackupRepo.Create(models.BackupRecord{
-		Type:      models.BackupTypeFull,
-		Status:    models.BackupStatusPending,
-		StartedAt: &now,
-	})
+	id, _ := database.BackupRepo.Create(models.BackupTypeFull, nil)
 
 	// 更新状态
-	compTime := now.Add(10 * time.Minute)
-	err := database.BackupRepo.Update(id, models.BackupRecord{
-		Status:      models.BackupStatusCompleted,
-		CompletedAt: &compTime,
-		TotalFiles:  100,
-	})
+	err := database.BackupRepo.UpdateStatus(id, models.BackupStatusRunning, "")
 	if err != nil {
-		t.Fatalf("Update failed: %v", err)
+		t.Fatalf("UpdateStatus to running failed: %v", err)
 	}
 
 	rec, _ := database.BackupRepo.GetByID(id)
-	if rec.Status != models.BackupStatusCompleted {
-		t.Errorf("expected Status Completed, got %q", rec.Status)
+	if rec.Status != models.BackupStatusRunning {
+		t.Errorf("expected Status Running, got %q", rec.Status)
 	}
+
+	// 更新统计信息
+	err = database.BackupRepo.UpdateStats(id, 100, 1024, 800, 20, 10, 512)
+	if err != nil {
+		t.Fatalf("UpdateStats failed: %v", err)
+	}
+
+	rec, _ = database.BackupRepo.GetByID(id)
 	if rec.TotalFiles != 100 {
 		t.Errorf("expected TotalFiles 100, got %d", rec.TotalFiles)
 	}
-}
-
-func TestBackupRepoDelete(t *testing.T) {
-	database, cleanup := setupTestDB(t)
-	defer cleanup()
-
-	now := time.Now()
-	id, _ := database.BackupRepo.Create(models.BackupRecord{
-		Type:      models.BackupTypeFull,
-		Status:    models.BackupStatusCompleted,
-		StartedAt: &now,
-	})
-
-	if err := database.BackupRepo.Delete(id); err != nil {
-		t.Fatalf("Delete failed: %v", err)
+	if rec.TotalSize != 1024 {
+		t.Errorf("expected TotalSize 1024, got %d", rec.TotalSize)
 	}
 
-	rec, err := database.BackupRepo.GetByID(id)
-	if err == nil {
-		t.Fatal("expected error for deleted record")
+	// 更新状态为完成
+	err = database.BackupRepo.UpdateStatus(id, models.BackupStatusCompleted, "")
+	if err != nil {
+		t.Fatalf("UpdateStatus to completed failed: %v", err)
 	}
-	if rec != nil {
-		t.Error("expected nil record after delete")
+
+	rec, _ = database.BackupRepo.GetByID(id)
+	if rec.Status != models.BackupStatusCompleted {
+		t.Errorf("expected Status Completed, got %q", rec.Status)
 	}
 }
 
@@ -486,24 +457,5 @@ func TestConfigToModelsRetentionConfig(t *testing.T) {
 	}
 	if mc.OrphanGraceDays != 120 {
 		t.Errorf("expected OrphanGraceDays 120, got %d", mc.OrphanGraceDays)
-	}
-}
-
-func TestBackupStatusStruct(t *testing.T) {
-	now := time.Now()
-	status := models.BackupStatus{
-		Running:        true,
-		BackupID:       42,
-		BackupType:     models.BackupTypeFull,
-		FilesScanned:   1000,
-		FilesProcessed: 800,
-		BytesProcessed: 1024 * 1024 * 100,
-		StartTime:      now,
-	}
-	if !status.Running {
-		t.Error("expected Running true")
-	}
-	if status.BackupID != 42 {
-		t.Errorf("expected BackupID 42, got %d", status.BackupID)
 	}
 }

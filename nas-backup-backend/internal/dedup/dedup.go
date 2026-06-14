@@ -35,6 +35,15 @@ type DedupResult struct {
 	TotalSaved int64               // Bytes saved by skipping duplicates.
 }
 
+// truncateHash returns the first n characters of hash, or the full hash if
+// it is shorter than n, avoiding a slice-bounds panic.
+func truncateHash(hash string, n int) string {
+	if len(hash) < n {
+		return hash
+	}
+	return hash[:n]
+}
+
 // Deduplicator checks file changes against the global hash index.
 type Deduplicator struct {
 	hashRepo *db.HashRepository
@@ -98,7 +107,7 @@ func (d *Deduplicator) processChange(change scanner.FileChange, result *DedupRes
 			Path:               change.Path,
 			Hash:               change.NewHash,
 			ExistingStorageKey: existing.StorageKey,
-			Reason:             fmt.Sprintf("content already stored (hash=%s, ref_count=%d)", change.NewHash[:16], existing.RefCount+1),
+			Reason:             fmt.Sprintf("content already stored (hash=%s, ref_count=%d)", truncateHash(change.NewHash, 16), existing.RefCount+1),
 		})
 		result.TotalSaved += change.Size
 	} else {

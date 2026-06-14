@@ -22,6 +22,12 @@ func (r *Router) handleFSBrowse(w http.ResponseWriter, req *http.Request) {
 	// Clean the path to prevent directory traversal.
 	path = filepath.Clean(path)
 
+	// Reject paths containing ".." after cleaning as an extra safety measure.
+	if strings.Contains(path, "..") {
+		r.jsonError(w, "invalid path: directory traversal not allowed", http.StatusBadRequest)
+		return
+	}
+
 	// Read the directory.
 	entries, err := os.ReadDir(path)
 	if err != nil {

@@ -133,7 +133,12 @@ func (s *Scanner) Scan() (*ScanResult, error) {
 		}
 	}
 
-	// 6. Detect deletions: active DB paths not found during the scan.
+	// 6. Compute hashes for Added and Modified files.
+	if err := s.ComputeHashes(result, nil); err != nil {
+		return nil, fmt.Errorf("compute hashes: %w", err)
+	}
+
+	// 7. Detect deletions: active DB paths not found during the scan.
 	for path, rec := range activeDBFiles {
 		if !scannedPaths[path] {
 			result.Changes = append(result.Changes, FileChange{
@@ -151,11 +156,11 @@ func (s *Scanner) Scan() (*ScanResult, error) {
 
 // getSizeLimits reads size constraints from the config_kv table.
 func (s *Scanner) getSizeLimits() (maxFileSize, minFileSize int64, err error) {
-	maxStr, err := s.configRepo.Get("size_limit.max_file_size")
+	maxStr, err := s.configRepo.Get("scanner.max_file_size")
 	if err != nil {
 		return 0, 0, fmt.Errorf("get max_file_size: %w", err)
 	}
-	minStr, err := s.configRepo.Get("size_limit.min_file_size")
+	minStr, err := s.configRepo.Get("scanner.min_file_size")
 	if err != nil {
 		return 0, 0, fmt.Errorf("get min_file_size: %w", err)
 	}
@@ -222,6 +227,22 @@ func (s *Scanner) walkRecursive(
 
 	for _, entry := range entries {
 		fullPath := filepath.Join(dir, entry.Name())
+
+		// Check if this entry is a symlink.
+		lstat, lerr := os.Lstat(fullPath)
+		if lerr != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("lstat %q: %v", fullPath, lerr))
+			continue
+		}
+
+		// Skip symlink files — only follow symlink directories.
+		if lstat.Mode()&os.ModeSymlink != 0 {
+			if !lstat.IsDir() {
+				// Symlink to a file: skip it.
+				continue
+			}
+			// Symlink to a directory: resolve and follow it.
+		}
 
 		// Follow symlinks by using os.Stat instead of os.Lstat.
 		info, err := os.Stat(fullPath)

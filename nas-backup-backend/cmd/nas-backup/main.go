@@ -65,7 +65,7 @@ func main() {
 	// Initialize components
 	sc := scanner.NewScanner(database.FileRepo, database.ConfigRepo)
 	dd := dedup.NewDeduplicator(database.HashRepo)
-	comp := compress.NewCompressor(cfg.Backup.Compression)
+	comp := compress.NewCompressor(cfg.ToModelsCompressionConfig())
 	enc, err := crypto.NewEncryptor(cfg.Backup.Encryption.KeyFilePath)
 	if err != nil {
 		logger.Error("Failed to initialize encryptor: %v", err)

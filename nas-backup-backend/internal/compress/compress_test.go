@@ -60,7 +60,7 @@ func TestNewCompressorSkipTypeNormalization(t *testing.T) {
 
 // TestShouldCompress 测试压缩决策逻辑
 func TestShouldCompress(t *testing.T) {
-	skipTypes := []string{".mp4", ".jpg", ".zip", ".gz"}
+	skipTypes := []string{".mp4", ".jpg", ".png", ".zip", ".gz"}
 	cfg := testConfig(true, 3, skipTypes)
 	c := NewCompressor(cfg)
 

@@ -179,6 +179,22 @@ func (r *LogRepository) List(filter *models.LogFilter) ([]*models.LogRecord, int
 	return records, totalCount, nil
 }
 
+// GetByID retrieves a single log entry by its primary key ID.
+// Returns nil without error if no record is found.
+func (r *LogRepository) GetByID(id int64) (*models.LogRecord, error) {
+	row := r.db.QueryRow(`
+		SELECT `+logColumns+` FROM backup_logs WHERE id = ?
+	`, id)
+	rec, err := scanLogRecord(row)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get log by id %d: %w", id, err)
+	}
+	return rec, nil
+}
+
 // GetByBackupID retrieves all log entries for a specific backup session,
 // ordered by created_at ascending.
 func (r *LogRepository) GetByBackupID(backupID int64) ([]*models.LogRecord, error) {

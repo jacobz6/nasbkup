@@ -1,7 +1,6 @@
 package api
 
 import (
-	"database/sql"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -69,51 +68,15 @@ func (r *Router) handleGetLog(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Fetch the log entry by ID using a direct query.
-	// A proper GetByID method should be added to LogRepository;
-	// this implementation queries the database directly as a workaround.
-	var rec models.LogRecord
-	var backupID sql.NullInt64
-	var createdAt string
-
-	row := r.db.DB().QueryRow(`
-		SELECT id, backup_id, level, message, detail, created_at
-		FROM backup_logs WHERE id = ?`, id)
-	if err := row.Scan(&rec.ID, &backupID, &rec.Level, &rec.Message, &rec.Detail, &createdAt); err != nil {
-		if err == sql.ErrNoRows {
-			r.jsonError(w, "log entry not found", http.StatusNotFound)
-		} else {
-			r.jsonError(w, fmt.Sprintf("query log: %v", err), http.StatusInternalServerError)
-		}
+	rec, err := r.db.LogRepo.GetByID(id)
+	if err != nil {
+		r.jsonError(w, fmt.Sprintf("query log: %v", err), http.StatusInternalServerError)
 		return
 	}
-
-	if backupID.Valid {
-		rec.BackupID = &backupID.Int64
+	if rec == nil {
+		r.jsonError(w, "log entry not found", http.StatusNotFound)
+		return
 	}
-	t, parseErr := time.Parse(time.RFC3339, createdAt)
-	if parseErr != nil {
-		// Try alternative SQLite datetime formats before failing.
-		altFormats := []string{
-			"2006-01-02 15:04:05",
-			"2006-01-02 15:04:05.999999999",
-			"2006-01-02 15:04:05Z07:00",
-			"2006-01-02T15:04:05",
-		}
-		parsed := false
-		for _, f := range altFormats {
-			if alt, altErr := time.Parse(f, createdAt); altErr == nil {
-				t = alt
-				parsed = true
-				break
-			}
-		}
-		if !parsed {
-			// Fall back to current time instead of returning an error.
-			t = time.Now().UTC()
-		}
-	}
-	rec.CreatedAt = t
 
 	r.jsonResponse(w, rec, http.StatusOK)
 }

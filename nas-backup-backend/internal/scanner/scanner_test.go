@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/nas-backup/internal/db"
-	"github.com/nas-backup/internal/models"
 )
 
 func setupTestDB(t *testing.T) (*db.FileRepository, *db.ConfigRepository, func()) {
@@ -14,7 +13,7 @@ func setupTestDB(t *testing.T) (*db.FileRepository, *db.ConfigRepository, func()
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.db")
 
-	database, err := db.NewDatabase(dbPath)
+	database, err := db.Open(dbPath)
 	if err != nil {
 		t.Skipf("SQLite not available: %v", err)
 	}
@@ -23,20 +22,12 @@ func setupTestDB(t *testing.T) (*db.FileRepository, *db.ConfigRepository, func()
 
 func enableDir(t *testing.T, configRepo *db.ConfigRepository, path string) {
 	t.Helper()
-	configRepo.AddBackupDirectory(models.BackupDirectory{
-		Path:      path,
-		Recursive: true,
-		Enabled:   true,
-	})
+	configRepo.AddDirectory(path, true, true, "")
 }
 
 func addExclusion(t *testing.T, configRepo *db.ConfigRepository, pattern, ruleType string) {
 	t.Helper()
-	configRepo.AddExclusionRule(models.ExclusionRule{
-		Pattern:  pattern,
-		RuleType: ruleType,
-		Enabled:  true,
-	})
+	configRepo.AddExclusionRule(pattern, ruleType, true)
 }
 
 func TestScanEmptyDirectory(t *testing.T) {
@@ -51,8 +42,8 @@ func TestScanEmptyDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scan failed: %v", err)
 	}
-	if len(result.Files) != 0 {
-		t.Errorf("expected 0 files, got %d", len(result.Files))
+	if len(result.Changes) != 0 {
+		t.Errorf("expected 0 files, got %d", len(result.Changes))
 	}
 }
 
@@ -71,18 +62,18 @@ func TestScanSingleFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scan failed: %v", err)
 	}
-	if len(result.Files) != 1 {
-		t.Fatalf("expected 1 file, got %d", len(result.Files))
+	if len(result.Changes) != 1 {
+		t.Fatalf("expected 1 file, got %d", len(result.Changes))
 	}
 
-	f := result.Files[0]
+	f := result.Changes[0]
 	if f.Path != testPath {
 		t.Errorf("expected path %q, got %q", testPath, f.Path)
 	}
 	if f.Size != int64(len(testContent)) {
 		t.Errorf("expected size %d, got %d", len(testContent), f.Size)
 	}
-	if f.Hash == "" {
+	if f.NewHash == "" {
 		t.Error("expected non-empty hash")
 	}
 }
@@ -104,8 +95,8 @@ func TestScanNestedDirectories(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scan failed: %v", err)
 	}
-	if len(result.Files) != 4 {
-		t.Errorf("expected 4 files, got %d", len(result.Files))
+	if len(result.Changes) != 4 {
+		t.Errorf("expected 4 files, got %d", len(result.Changes))
 	}
 }
 
@@ -126,8 +117,8 @@ func TestScanWithExcludedExtensions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scan failed: %v", err)
 	}
-	if len(result.Files) != 1 {
-		t.Errorf("expected 1 file (txt only), got %d", len(result.Files))
+	if len(result.Changes) != 1 {
+		t.Errorf("expected 1 file (txt only), got %d", len(result.Changes))
 	}
 }
 
@@ -149,7 +140,7 @@ func TestScanWithExcludedDirs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scan failed: %v", err)
 	}
-	for _, f := range result.Files {
+	for _, f := range result.Changes {
 		if filepath.Base(filepath.Dir(f.Path)) == "node_modules" {
 			t.Errorf("excluded file %q in results", f.Path)
 		}
@@ -172,7 +163,7 @@ func TestScanWithExcludedPatterns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scan failed: %v", err)
 	}
-	for _, f := range result.Files {
+	for _, f := range result.Changes {
 		if filepath.Base(f.Path) == "report_2024.pdf" {
 			t.Error("excluded *2024* file in results")
 		}
@@ -195,8 +186,8 @@ func TestScanMultipleDirectories(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scan failed: %v", err)
 	}
-	if len(result.Files) != 2 {
-		t.Errorf("expected 2 files, got %d", len(result.Files))
+	if len(result.Changes) != 2 {
+		t.Errorf("expected 2 files, got %d", len(result.Changes))
 	}
 }
 
@@ -234,8 +225,8 @@ func TestScanSymlink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scan failed: %v", err)
 	}
-	if len(result.Files) != 1 {
-		t.Errorf("expected 1 file (real only), got %d", len(result.Files))
+	if len(result.Changes) != 1 {
+		t.Errorf("expected 1 file (real only), got %d", len(result.Changes))
 	}
 }
 
@@ -272,8 +263,8 @@ func TestScanWithSizeFilters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scan failed: %v", err)
 	}
-	if len(result.Files) != 1 {
-		t.Errorf("expected 1 file (large.bin), got %d", len(result.Files))
+	if len(result.Changes) != 1 {
+		t.Errorf("expected 1 file (large.bin), got %d", len(result.Changes))
 	}
 }
 
@@ -292,12 +283,12 @@ func TestHashConsistency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scan failed: %v", err)
 	}
-	if len(result.Files) != 2 {
-		t.Fatalf("expected 2 files, got %d", len(result.Files))
+	if len(result.Changes) != 2 {
+		t.Fatalf("expected 2 files, got %d", len(result.Changes))
 	}
-	if result.Files[0].Hash != result.Files[1].Hash {
+	if result.Changes[0].NewHash != result.Changes[1].NewHash {
 		t.Errorf("same content different hashes: %q vs %q",
-			result.Files[0].Hash, result.Files[1].Hash)
+			result.Changes[0].NewHash, result.Changes[1].NewHash)
 	}
 }
 
@@ -315,8 +306,8 @@ func TestHashDifferentContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scan failed: %v", err)
 	}
-	if result.Files[0].Hash == result.Files[1].Hash {
-		t.Errorf("different content same hash: %q", result.Files[0].Hash)
+	if result.Changes[0].NewHash == result.Changes[1].NewHash {
+		t.Errorf("different content same hash: %q", result.Changes[0].NewHash)
 	}
 }
 
@@ -333,13 +324,13 @@ func TestScanEmptyFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scan failed: %v", err)
 	}
-	if len(result.Files) != 1 {
-		t.Fatalf("expected 1 file, got %d", len(result.Files))
+	if len(result.Changes) != 1 {
+		t.Fatalf("expected 1 file, got %d", len(result.Changes))
 	}
-	if result.Files[0].Size != 0 {
-		t.Errorf("expected size 0, got %d", result.Files[0].Size)
+	if result.Changes[0].Size != 0 {
+		t.Errorf("expected size 0, got %d", result.Changes[0].Size)
 	}
-	if result.Files[0].Hash == "" {
+	if result.Changes[0].NewHash == "" {
 		t.Error("empty file should have a valid hash")
 	}
 }
@@ -372,31 +363,29 @@ func TestScannerConstructor(t *testing.T) {
 
 func TestScanResultStruct(t *testing.T) {
 	result := ScanResult{
-		Files:         []FileRecord{{Path: "/data/file.txt", Size: 100}},
-		Errors:        []string{"error1"},
-		TotalFiles:    1,
-		TotalSize:     100,
-		ExcludedCount: 5,
+		Changes:      []FileChange{{Path: "/data/file.txt", Size: 100}},
+		Errors:       []string{"error1"},
+		TotalScanned: 1,
+		TotalActive:  1,
 	}
-	if len(result.Files) != 1 {
-		t.Errorf("expected 1 file, got %d", len(result.Files))
+	if len(result.Changes) != 1 {
+		t.Errorf("expected 1 change, got %d", len(result.Changes))
 	}
-	if result.ExcludedCount != 5 {
-		t.Errorf("expected ExcludedCount 5, got %d", result.ExcludedCount)
+	if result.TotalScanned != 1 {
+		t.Errorf("expected TotalScanned 1, got %d", result.TotalScanned)
 	}
 }
 
-func TestFileRecordStruct(t *testing.T) {
-	rec := FileRecord{
+func TestFileChangeStruct(t *testing.T) {
+	rec := FileChange{
 		Path:    "/data/file.txt",
 		Size:    1024,
-		ModTime: 1704067200,
-		Hash:    "abc123",
+		NewHash: "abc123",
 	}
 	if rec.Path != "/data/file.txt" {
 		t.Errorf("expected Path %q, got %q", "/data/file.txt", rec.Path)
 	}
-	if rec.Hash != "abc123" {
-		t.Errorf("expected Hash %q, got %q", "abc123", rec.Hash)
+	if rec.NewHash != "abc123" {
+		t.Errorf("expected NewHash %q, got %q", "abc123", rec.NewHash)
 	}
 }
