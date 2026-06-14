@@ -40,14 +40,13 @@ vendor/
 *.sqlite3
 
 # Data directory (runtime data)
-data/
+/data/
 
 # Configuration files with sensitive data
 config.yaml
 
 # Logs
 *.log
-logs/
 
 # Temporary files
 *.tmp
