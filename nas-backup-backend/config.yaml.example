@@ -1,0 +1,153 @@
+# NAS Backup Configuration
+# This file contains all settings for the NAS backup system.
+# Edit this file to match your environment before starting the service.
+
+# ---------------------------------------------------------------------------
+# Server settings (HTTP API)
+# ---------------------------------------------------------------------------
+server:
+  host: "0.0.0.0"
+  port: 8080
+  read_timeout_sec: 30
+  write_timeout_sec: 60
+
+# ---------------------------------------------------------------------------
+# Database settings
+# ---------------------------------------------------------------------------
+database:
+  path: "./data/nas-backup.db"
+
+# ---------------------------------------------------------------------------
+# Backup settings
+# ---------------------------------------------------------------------------
+backup:
+  # Directories to include in backups
+  directories:
+    - path: "/mnt/data/documents"
+      recursive: true
+      enabled: true
+      description: "Personal documents"
+    - path: "/mnt/data/photos"
+      recursive: true
+      enabled: true
+      description: "Photo library"
+    # Add more directories as needed:
+    # - path: "/mnt/data/videos"
+    #   recursive: true
+    #   enabled: true
+    #   description: "Video archive"
+
+  # File exclusion rules
+  exclusions:
+    - pattern: "*.tmp"
+      rule_type: "extension"
+      enabled: true
+    - pattern: "*.log"
+      rule_type: "extension"
+      enabled: true
+    - pattern: "*.bak"
+      rule_type: "extension"
+      enabled: true
+    - pattern: "*.swp"
+      rule_type: "extension"
+      enabled: true
+    - pattern: "node_modules"
+      rule_type: "directory"
+      enabled: true
+    - pattern: ".git"
+      rule_type: "directory"
+      enabled: true
+    - pattern: "__pycache__"
+      rule_type: "directory"
+      enabled: true
+    - pattern: ".DS_Store"
+      rule_type: "pattern"
+      enabled: true
+    - pattern: "Thumbs.db"
+      rule_type: "pattern"
+      enabled: true
+    - pattern: "desktop.ini"
+      rule_type: "pattern"
+      enabled: true
+
+  # File size limits (0 = no limit)
+  size_limit:
+    max_file_size: 0
+    min_file_size: 0
+
+  # Schedule configuration
+  schedule:
+    enabled: true
+    cron_expr: "0 3 1 * *"    # At 03:00 on the 1st of every month
+    timezone: "Asia/Shanghai"
+
+  # Compression settings
+  compression:
+    enabled: true
+    algorithm: "zstd"
+    level: 19                  # Maximum compression (slower but smaller)
+    skip_types:                # File types to skip (already compressed)
+      - ".mp4"
+      - ".mkv"
+      - ".mov"
+      - ".avi"
+      - ".wmv"
+      - ".jpg"
+      - ".jpeg"
+      - ".png"
+      - ".webp"
+      - ".gif"
+      - ".mp3"
+      - ".flac"
+      - ".aac"
+      - ".ogg"
+      - ".zip"
+      - ".7z"
+      - ".gz"
+      - ".rar"
+      - ".bz2"
+      - ".xz"
+      - ".docx"
+      - ".xlsx"
+      - ".pptx"
+      - ".pdf"
+
+  # Retention policy
+  retention:
+    version_keep_count: 1        # Keep only the latest version
+    orphan_grace_days: 180       # 6 months before cleaning orphan data
+    full_reset_interval_months: 6 # Full backup every 6 months
+    keep_deleted_days: 180       # 6 months before cleaning deleted file data
+
+  # Encryption settings
+  encryption:
+    algorithm: "AES-256-GCM"
+    key_file_path: "./data/master.key"
+
+# ---------------------------------------------------------------------------
+# Alibaba Cloud OSS settings
+# ---------------------------------------------------------------------------
+oss:
+  endpoint: "oss-cn-hangzhou.aliyuncs.com"
+  bucket: ""                    # TODO: Set your bucket name
+  access_key_id: ""             # TODO: Set your AccessKey ID
+  access_key_secret: ""         # TODO: Set your AccessKey Secret
+  storage_class: "ColdArchive"  # ColdArchive (cheapest) or Archive
+  region: "cn-hangzhou"
+
+# ---------------------------------------------------------------------------
+# Rclone settings
+# ---------------------------------------------------------------------------
+rclone:
+  binary_path: "rclone"         # Path to rclone binary
+  config_path: "./data/rclone.conf"
+  remote_name: "oss-crypt"      # Name of the crypt remote in rclone.conf
+
+# ---------------------------------------------------------------------------
+# Logging settings
+# ---------------------------------------------------------------------------
+logging:
+  level: "info"                 # debug, info, warn, error
+  file_path: "./data/logs/nas-backup.log"
+  max_size_mb: 50               # Max log file size before rotation
+  max_files: 10                 # Max number of rotated log files

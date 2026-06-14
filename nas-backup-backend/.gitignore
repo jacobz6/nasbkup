@@ -1,0 +1,35 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Go workspace file
+go.work
+
+# Dependency directories
+vendor/
+
+# Binary
+nas-backup
+
+# Data
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
+# Configuration files (keep only .example files in repo)
+config.yaml
+data/rclone.conf
+data/master.key
+
+# Allow example files
+!config.yaml.example
+!data/rclone.conf.example

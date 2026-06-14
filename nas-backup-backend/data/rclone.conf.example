@@ -1,0 +1,18 @@
+[oss]
+type = s3
+provider = Alibaba
+env_auth = false
+access_key_id =               # TODO: Set your AccessKey ID
+secret_access_key =           # TODO: Set your AccessKey Secret
+endpoint = oss-cn-hangzhou.aliyuncs.com
+acl = private
+storage_class = ColdArchive
+bucket =                      # TODO: Set your bucket name
+
+[oss-crypt]
+type = crypt
+remote = oss:
+filename_encryption = off
+directory_name_encryption = false
+password =                    # TODO: Set your encryption password
+password2 = -content-key      # TODO: Set your content key (keep the leading dash)
