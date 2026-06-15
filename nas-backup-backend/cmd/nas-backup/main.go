@@ -77,6 +77,12 @@ func main() {
 		log.Fatalf("Failed to initialize storage manager: %v", err)
 	}
 
+	// Ensure rclone config exists and has password for the crypt remote.
+	if err := stor.EnsureRcloneConfig(); err != nil {
+		logger.Error("Failed to ensure rclone config: %v", err)
+		log.Fatalf("Failed to ensure rclone config: %v", err)
+	}
+
 	// Initialize backup engine and restorer
 	engine := backup.NewEngine(database, sc, dd, comp, enc, stor, cfg)
 	restorer := backup.NewRestorer(database, enc, comp, stor, cfg)

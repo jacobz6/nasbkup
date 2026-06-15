@@ -1,0 +1,139 @@
+# =============================================================================
+# NAS Backup - 容器内配置
+# 所有持久化路径均指向 /app/data (挂载的 volume)
+# 备份源目录 (/mnt/nas/...) 需通过 docker-compose 的 bind mount 注入
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+server:
+  host: "0.0.0.0"
+  port: 8080
+  read_timeout_sec: 30
+  write_timeout_sec: 60
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+database:
+  path: "/app/data/nas-backup.db"
+
+# ---------------------------------------------------------------------------
+# Backup
+# ---------------------------------------------------------------------------
+backup:
+  # ⚠️ 容器内路径: 通过 docker-compose 的 bind mount 映射到宿主机
+  # 例: - /mnt/nas:/mnt/nas:ro  -> 容器内访问 /mnt/nas
+  directories:
+    - path: "/mnt/nas/documents"
+      recursive: true
+      enabled: true
+      description: "Documents (示例, 请通过 Web UI 修改)"
+    - path: "/mnt/nas/photos"
+      recursive: true
+      enabled: true
+      description: "Photos (示例, 请通过 Web UI 修改)"
+
+  exclusions:
+    - pattern: "*.tmp"
+      rule_type: "extension"
+      enabled: true
+    - pattern: "*.log"
+      rule_type: "extension"
+      enabled: true
+    - pattern: "*.bak"
+      rule_type: "extension"
+      enabled: true
+    - pattern: "node_modules"
+      rule_type: "directory"
+      enabled: true
+    - pattern: ".git"
+      rule_type: "directory"
+      enabled: true
+    - pattern: "__pycache__"
+      rule_type: "directory"
+      enabled: true
+    - pattern: ".DS_Store"
+      rule_type: "pattern"
+      enabled: true
+    - pattern: "Thumbs.db"
+      rule_type: "pattern"
+      enabled: true
+
+  size_limit:
+    max_file_size: 0
+    min_file_size: 0
+
+  schedule:
+    enabled: true
+    cron_expr: "0 3 1 * *"
+    timezone: "Asia/Shanghai"
+
+  compression:
+    enabled: true
+    algorithm: "zstd"
+    level: 19
+    skip_types:
+      - ".mp4"
+      - ".mkv"
+      - ".mov"
+      - ".avi"
+      - ".wmv"
+      - ".jpg"
+      - ".jpeg"
+      - ".png"
+      - ".webp"
+      - ".gif"
+      - ".mp3"
+      - ".flac"
+      - ".aac"
+      - ".ogg"
+      - ".zip"
+      - ".7z"
+      - ".gz"
+      - ".rar"
+      - ".bz2"
+      - ".xz"
+      - ".docx"
+      - ".xlsx"
+      - ".pptx"
+      - ".pdf"
+
+  retention:
+    version_keep_count: 1
+    orphan_grace_days: 180
+    full_reset_interval_months: 6
+    keep_deleted_days: 180
+
+  encryption:
+    algorithm: "AES-256-GCM"
+    key_file_path: "/app/data/master.key"
+
+# ---------------------------------------------------------------------------
+# Alibaba Cloud OSS (首次启动后请通过 Web UI 配置)
+# ---------------------------------------------------------------------------
+oss:
+  endpoint: "oss-cn-hangzhou.aliyuncs.com"
+  bucket: ""
+  access_key_id: ""
+  access_key_secret: ""
+  storage_class: "ColdArchive"
+  region: "cn-hangzhou"
+
+# ---------------------------------------------------------------------------
+# Rclone
+# ---------------------------------------------------------------------------
+rclone:
+  binary_path: "/usr/bin/rclone"
+  config_path: "/app/data/rclone.conf"
+  remote_name: "oss-crypt"
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging:
+  level: "info"
+  file_path: "/app/data/logs/nas-backup.log"
+  max_size_mb: 50
+  max_files: 10

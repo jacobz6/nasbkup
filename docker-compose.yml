@@ -1,0 +1,83 @@
+# =============================================================================
+# NAS Backup - Docker Compose
+# 用法:
+#   1. 根据实际环境修改 volumes 段中的备份源挂载路径
+#   2. 首次启动: docker compose up -d --build
+#   3. 查看日志: docker compose logs -f
+#   4. 停止:      docker compose down
+#   5. 更新镜像:  docker compose pull && docker compose up -d
+# =============================================================================
+
+services:
+  nas-backup:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: nas-backup:latest
+    container_name: nas-backup
+    restart: unless-stopped
+
+    # 端口映射:
+    #   80   - 统一入口 (Nginx: 前端 + API 反代)
+    #   8080 - 后端 API (可选直连, 便于调试)
+    ports:
+      - "8080:80"        # 宿主机:8080 -> 容器:80 (推荐)
+      # - "8081:8080"     # 可选: 直连后端 API
+
+    # 环境变量
+    environment:
+      - TZ=Asia/Shanghai
+      - DATA_DIR=/app/data
+      - KEY_FILE=/app/data/master.key
+      - RCLONE_CONF=/app/data/rclone.conf
+      - CONFIG_FILE=/app/config.yaml
+
+    # 卷挂载
+    volumes:
+      # ---- 持久化数据 (必须) ----
+      - ./data:/app/data
+
+      # ---- 备份源目录 (按需修改为你的 NAS 实际路径) ----
+      # 容器内访问路径应与 config.yaml 中 directories[].path 保持一致
+      # 推荐只读挂载避免误修改源文件
+      - /mnt/nas/documents:/mnt/nas/documents:ro
+      - /mnt/nas/photos:/mnt/nas/photos:ro
+      # - /mnt/nas/videos:/mnt/nas/videos:ro
+
+      # ---- 自定义配置覆盖 (可选) ----
+      # 若希望运行时改配置不重建镜像，可挂载自定义配置:
+      # - ./my-config.yaml:/app/config.yaml:ro
+
+    # 资源限制 (根据 NAS 规模调整)
+    # 注: mem_limit / cpus 适用于 docker compose (非 swarm)
+    mem_limit: 1g
+    mem_reservation: 256m
+    cpus: "2.0"
+
+    # 安全选项
+    security_opt:
+      - no-new-privileges:true
+
+    # 日志驱动
+    logging:
+      driver: json-file
+      max-size: "20m"
+      max-file: "5"
+
+    # 健康检查 (与 Dockerfile 中 HEALTHCHECK 协同)
+    # 探测 API 端点: 同时验证 nginx 与后端可用
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:80/api/dashboard/stats", "-o", "/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+# =============================================================================
+# 默认网络: 自动创建 bridge 网络
+# 如需加入现有网络，取消下面注释:
+# networks:
+#   default:
+#     name: my-nas-network
+#     external: true
+# =============================================================================
