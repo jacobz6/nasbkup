@@ -22,7 +22,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # 路径(可被环境变量 / 命令行参数覆盖)
 # ---------------------------------------------------------------------------
-APP_DIR="${APP_DIR:-/opt/nasbkup}"
+APP_DIR="${APP_DIR:-/opt/nasbkup/nas-backup-backend}"
 CONFIG_FILE="${CONFIG_FILE:-${APP_DIR}/config.yaml}"
 RCLONE_CONF="${RCLONE_CONF:-${APP_DIR}/data/rclone.conf}"
 RCLONE_BIN="${RCLONE_BIN:-$(command -v rclone 2>/dev/null || echo rclone)}"
