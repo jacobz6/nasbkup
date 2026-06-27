@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/nas-backup/internal/backup"
 	"github.com/nas-backup/internal/config"
 	"github.com/nas-backup/internal/db"
+	"github.com/nas-backup/internal/logger"
 	"github.com/nas-backup/internal/models"
 	"github.com/nas-backup/internal/scheduler"
 )
@@ -93,7 +95,36 @@ func (r *Router) Setup() http.Handler {
 	r.mux.HandleFunc("POST /api/restore", r.handleRestore)
 	r.mux.HandleFunc("POST /api/gc", r.handleGarbageCollection)
 
-	return r.corsMiddleware(r.mux)
+	return r.loggingMiddleware(r.corsMiddleware(r.mux))
+}
+
+// loggingMiddleware logs every HTTP request: method, path, status, and duration.
+func (r *Router) loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		start := time.Now()
+
+		// Wrap the ResponseWriter to capture the status code.
+		rw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rw, req)
+
+		duration := time.Since(start)
+		if rw.status >= 400 {
+			logger.Error("HTTP %d %s %s %s (%v)", rw.status, req.Method, req.URL.Path, req.URL.RawQuery, duration)
+		} else {
+			logger.Info("HTTP %d %s %s (%v)", rw.status, req.Method, req.URL.Path, duration)
+		}
+	})
+}
+
+// statusWriter wraps http.ResponseWriter to capture the response status code.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
 }
 
 // corsMiddleware adds CORS headers to all responses and handles preflight requests.
@@ -135,8 +166,9 @@ func (r *Router) jsonPaginatedResponse(w http.ResponseWriter, data interface{}, 
 	})
 }
 
-// jsonError writes an error JSON response with the given status code.
+// jsonError writes an error JSON response with the given status code and logs it.
 func (r *Router) jsonError(w http.ResponseWriter, message string, status int) {
+	logger.Error("API error %d: %s", status, message)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(models.APIResponse{

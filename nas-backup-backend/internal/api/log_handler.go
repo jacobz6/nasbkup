@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/nas-backup/internal/logger"
 	"github.com/nas-backup/internal/models"
 )
 
@@ -57,6 +58,7 @@ func (r *Router) handleListLogs(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	logger.Debug("ListLogs: page=%d size=%d total=%d returned=%d", filter.Page, filter.PageSize, total, len(records))
 	r.jsonPaginatedResponse(w, records, total, filter.Page, filter.PageSize)
 }
 

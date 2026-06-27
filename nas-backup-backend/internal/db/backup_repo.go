@@ -21,11 +21,11 @@ func NewBackupRepository(db *sql.DB) *BackupRepository {
 // scanBackupRecord scans a single backup row from a scanner into a BackupRecord.
 func scanBackupRecord(s scanner) (*models.BackupRecord, error) {
 	var (
-		rec         models.BackupRecord
+		rec          models.BackupRecord
 		baseBackupID sql.NullInt64
-		startedAt   sql.NullString
-		completedAt sql.NullString
-		createdAt   string
+		startedAt    sql.NullString
+		completedAt  sql.NullString
+		createdAt    string
 	)
 	if err := s.Scan(
 		&rec.ID, &rec.Type, &rec.Status, &baseBackupID,
@@ -185,7 +185,7 @@ func (r *BackupRepository) List(limit, offset int) ([]*models.BackupRecord, erro
 	}
 	defer rows.Close()
 
-	var records []*models.BackupRecord
+	records := make([]*models.BackupRecord, 0)
 	for rows.Next() {
 		rec, err := scanBackupRecord(rows)
 		if err != nil {
@@ -258,7 +258,7 @@ func (r *BackupRepository) GetIncrementalsSinceFull(fullBackupID int64) ([]*mode
 	}
 	defer rows.Close()
 
-	var records []*models.BackupRecord
+	records := make([]*models.BackupRecord, 0)
 	for rows.Next() {
 		rec, err := scanBackupRecord(rows)
 		if err != nil {
@@ -348,7 +348,7 @@ func (r *BackupRepository) GetBackupFiles(backupID int64) ([]*models.BackupFileR
 	}
 	defer rows.Close()
 
-	var records []*models.BackupFileRecord
+	records := make([]*models.BackupFileRecord, 0)
 	for rows.Next() {
 		rec, err := scanBackupFileRecord(rows)
 		if err != nil {

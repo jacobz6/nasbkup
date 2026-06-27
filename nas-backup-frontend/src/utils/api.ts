@@ -51,7 +51,9 @@ async function paginatedRequest<T>(
   if (!res.ok) {
     return { success: false, data: [], total: 0, page: 1, size: 0 };
   }
-  return res.json();
+  const json = await res.json();
+  // Ensure data is always an array (backend may return null for empty results)
+  return { ...json, data: json.data ?? [] };
 }
 
 // Dashboard

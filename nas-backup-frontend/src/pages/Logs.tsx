@@ -39,7 +39,7 @@ export function Logs() {
     try {
       const res = await logApi.list({ ...params, page_size: pageSize });
       if (res.success) {
-        setData(res.data);
+        setData(res.data ?? []);
         setTotal(res.total);
       } else {
         // Backend returned an error — show empty state gracefully

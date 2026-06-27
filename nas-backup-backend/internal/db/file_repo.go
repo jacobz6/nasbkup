@@ -125,7 +125,7 @@ func (r *FileRepository) GetByHash(hash string) ([]*models.FileRecord, error) {
         }
         defer rows.Close()
 
-        var records []*models.FileRecord
+        records := make([]*models.FileRecord, 0)
         for rows.Next() {
                 rec, err := scanFileRecord(rows)
                 if err != nil {
@@ -153,7 +153,7 @@ func (r *FileRepository) ListByStatus(status models.FileStatus, limit, offset in
         }
         defer rows.Close()
 
-        var records []*models.FileRecord
+        records := make([]*models.FileRecord, 0)
         for rows.Next() {
                 rec, err := scanFileRecord(rows)
                 if err != nil {
@@ -277,7 +277,7 @@ func (r *FileRepository) ListActiveByDirectory(dirPath string) ([]*models.FileRe
         }
         defer rows.Close()
 
-        var records []*models.FileRecord
+        records := make([]*models.FileRecord, 0)
         for rows.Next() {
                 rec, err := scanFileRecord(rows)
                 if err != nil {

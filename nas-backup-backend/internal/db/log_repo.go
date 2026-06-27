@@ -164,7 +164,7 @@ func (r *LogRepository) List(filter *models.LogFilter) ([]*models.LogRecord, int
 	}
 	defer rows.Close()
 
-	var records []*models.LogRecord
+	records := make([]*models.LogRecord, 0)
 	for rows.Next() {
 		rec, err := scanLogRecord(rows)
 		if err != nil {
@@ -208,7 +208,7 @@ func (r *LogRepository) GetByBackupID(backupID int64) ([]*models.LogRecord, erro
 	}
 	defer rows.Close()
 
-	var records []*models.LogRecord
+	records := make([]*models.LogRecord, 0)
 	for rows.Next() {
 		rec, err := scanLogRecord(rows)
 		if err != nil {

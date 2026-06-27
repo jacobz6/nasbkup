@@ -147,7 +147,7 @@ func (r *HashRepository) GetOrphans() ([]*models.HashIndexRecord, error) {
 	}
 	defer rows.Close()
 
-	var records []*models.HashIndexRecord
+	records := make([]*models.HashIndexRecord, 0)
 	for rows.Next() {
 		rec, err := scanHashIndexRecord(rows)
 		if err != nil {
@@ -175,7 +175,7 @@ func (r *HashRepository) GetOrphansOlderThan(days int) ([]*models.HashIndexRecor
 	}
 	defer rows.Close()
 
-	var records []*models.HashIndexRecord
+	records := make([]*models.HashIndexRecord, 0)
 	for rows.Next() {
 		rec, err := scanHashIndexRecord(rows)
 		if err != nil {
