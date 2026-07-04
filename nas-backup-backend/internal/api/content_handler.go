@@ -124,6 +124,8 @@ func (r *Router) handleAddExclusion(w http.ResponseWriter, req *http.Request) {
 }
 
 // handleUpdateExclusion updates an existing exclusion rule.
+// Supports partial updates (PATCH semantics): only fields provided in the
+// request body are updated; missing fields retain their existing values.
 func (r *Router) handleUpdateExclusion(w http.ResponseWriter, req *http.Request) {
 	id, err := strconv.ParseInt(req.PathValue("id"), 10, 64)
 	if err != nil {
@@ -131,22 +133,53 @@ func (r *Router) handleUpdateExclusion(w http.ResponseWriter, req *http.Request)
 		return
 	}
 
-	var rule models.ExclusionRule
-	if err := json.NewDecoder(req.Body).Decode(&rule); err != nil {
+	var patch struct {
+		Pattern  *string `json:"pattern"`
+		RuleType *string `json:"rule_type"`
+		Enabled  *bool   `json:"enabled"`
+	}
+	if err := json.NewDecoder(req.Body).Decode(&patch); err != nil {
 		r.jsonError(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
-	if rule.Pattern == "" {
-		r.jsonError(w, "pattern is required", http.StatusBadRequest)
+
+	existing, err := r.db.ConfigRepo.GetExclusionRuleByID(id)
+	if err != nil {
+		r.jsonError(w, fmt.Sprintf("lookup exclusion rule: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if existing == nil {
+		r.jsonError(w, "exclusion rule not found", http.StatusNotFound)
 		return
 	}
 
-	if err := r.db.ConfigRepo.UpdateExclusionRule(id, rule.Pattern, rule.RuleType, rule.Enabled); err != nil {
+	pattern := existing.Pattern
+	ruleType := existing.RuleType
+	enabled := existing.Enabled
+	if patch.Pattern != nil {
+		pattern = *patch.Pattern
+	}
+	if patch.RuleType != nil {
+		ruleType = *patch.RuleType
+	}
+	if patch.Enabled != nil {
+		enabled = *patch.Enabled
+	}
+	if pattern == "" {
+		r.jsonError(w, "pattern must not be empty", http.StatusBadRequest)
+		return
+	}
+
+	if err := r.db.ConfigRepo.UpdateExclusionRule(id, pattern, ruleType, enabled); err != nil {
 		r.jsonError(w, fmt.Sprintf("update exclusion rule: %v", err), http.StatusInternalServerError)
 		return
 	}
-	rule.ID = id
-	r.jsonResponse(w, rule, http.StatusOK)
+	r.jsonResponse(w, &models.ExclusionRule{
+		ID:       id,
+		Pattern:  pattern,
+		RuleType: ruleType,
+		Enabled:  enabled,
+	}, http.StatusOK)
 }
 
 // handleDeleteExclusion deletes an exclusion rule.

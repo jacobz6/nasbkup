@@ -19,16 +19,22 @@ func (r *Router) handleFSBrowse(w http.ResponseWriter, req *http.Request) {
 		path = "/"
 	}
 
-	// Clean the path to prevent directory traversal.
 	path = filepath.Clean(path)
-
-	// Reject paths containing ".." after cleaning as an extra safety measure.
-	if strings.Contains(path, "..") {
-		r.jsonError(w, "invalid path: directory traversal not allowed", http.StatusBadRequest)
+	if !filepath.IsAbs(path) {
+		r.jsonError(w, "path must be absolute", http.StatusBadRequest)
 		return
 	}
 
-	// Read the directory.
+	info, err := os.Stat(path)
+	if err != nil {
+		r.jsonError(w, fmt.Sprintf("stat path %q: %v", path, err), http.StatusBadRequest)
+		return
+	}
+	if !info.IsDir() {
+		r.jsonError(w, fmt.Sprintf("path %q is not a directory", path), http.StatusBadRequest)
+		return
+	}
+
 	entries, err := os.ReadDir(path)
 	if err != nil {
 		r.jsonError(w, fmt.Sprintf("read directory %q: %v", path, err), http.StatusBadRequest)
@@ -73,7 +79,7 @@ func (r *Router) handleFSBrowse(w http.ResponseWriter, req *http.Request) {
 		}
 
 		// Determine backup status.
-		fsEntry.InBackup = r.isPathInBackup(fullPath, entry.IsDir(), backupDirs)
+		fsEntry.InBackup, fsEntry.PartialBackup = r.computeBackupStatus(fullPath, entry.IsDir(), backupDirs)
 		fsEntry.WillBackup = r.willPathBeBackedUp(fullPath, entry.IsDir(), backupDirs, exclusionRules)
 
 		// For files, check if there's an update.
@@ -95,26 +101,33 @@ func (r *Router) handleFSBrowse(w http.ResponseWriter, req *http.Request) {
 	r.jsonResponse(w, result, http.StatusOK)
 }
 
-// isPathInBackup checks if a path is covered by any enabled backup directory.
-func (r *Router) isPathInBackup(path string, isDir bool, backupDirs []*models.BackupDirectory) bool {
+// computeBackupStatus evaluates the backup coverage of a path.
+// Returns (inBackup, partial):
+//   - inBackup=true, partial=false: path is fully covered (it is a backup target
+//     itself, or lives underneath one). Files are always in this state when covered.
+//   - inBackup=true, partial=true:  for a directory only — the directory itself is
+//     not a backup target and not under one, but at least one backup target lives
+//     inside it (i.e. only some descendants are backed up).
+//   - inBackup=false, partial=false: not covered at all.
+func (r *Router) computeBackupStatus(path string, isDir bool, backupDirs []*models.BackupDirectory) (inBackup bool, partial bool) {
 	for _, dir := range backupDirs {
 		if !dir.Enabled {
 			continue
 		}
-		// Exact match.
-		if path == dir.Path {
-			return true
+		// Exact match or path is under a backup directory → fully covered.
+		if path == dir.Path || strings.HasPrefix(path, dir.Path+"/") {
+			return true, false
 		}
-		// Path is under a backup directory.
-		if strings.HasPrefix(path, dir.Path+"/") {
-			return true
-		}
-		// For directories, check if a backup directory is under this path.
+		// For directories: a backup directory lives underneath this path → partial.
 		if isDir && strings.HasPrefix(dir.Path, path+"/") {
-			return true
+			partial = true
 		}
 	}
-	return false
+	// If we only saw descendant matches, treat as in-backup but partial.
+	if partial {
+		return true, true
+	}
+	return false, false
 }
 
 // willPathBeBackedUp checks if a path will actually be included in the next backup,

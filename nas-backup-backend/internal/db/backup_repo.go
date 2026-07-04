@@ -171,7 +171,13 @@ func (r *BackupRepository) GetByID(id int64) (*models.BackupRecord, error) {
 }
 
 // List retrieves backup records ordered by created_at descending with pagination.
-func (r *BackupRepository) List(limit, offset int) ([]*models.BackupRecord, error) {
+// Returns the records and the total count of all backups.
+func (r *BackupRepository) List(limit, offset int) ([]*models.BackupRecord, int64, error) {
+	var total int64
+	if err := r.db.QueryRow(`SELECT COUNT(*) FROM backups`).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count backups: %w", err)
+	}
+
 	rows, err := r.db.Query(`
 		SELECT id, type, status, base_backup_id,
 		       total_files, total_size, uploaded_size,
@@ -181,7 +187,7 @@ func (r *BackupRepository) List(limit, offset int) ([]*models.BackupRecord, erro
 		LIMIT ? OFFSET ?
 	`, limit, offset)
 	if err != nil {
-		return nil, fmt.Errorf("list backups: %w", err)
+		return nil, 0, fmt.Errorf("list backups: %w", err)
 	}
 	defer rows.Close()
 
@@ -189,14 +195,14 @@ func (r *BackupRepository) List(limit, offset int) ([]*models.BackupRecord, erro
 	for rows.Next() {
 		rec, err := scanBackupRecord(rows)
 		if err != nil {
-			return nil, fmt.Errorf("scan backup row: %w", err)
+			return nil, 0, fmt.Errorf("scan backup row: %w", err)
 		}
 		records = append(records, rec)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate backups: %w", err)
+		return nil, 0, fmt.Errorf("iterate backups: %w", err)
 	}
-	return records, nil
+	return records, total, nil
 }
 
 // GetLatestCompleted retrieves the most recent backup with status "completed".

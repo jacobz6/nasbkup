@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/nas-backup/internal/compress"
@@ -72,7 +73,14 @@ func (r *Restorer) Restore(ctx context.Context, req *models.RestoreRequest) (*mo
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// 2. Process each file.
+	// 2. Compute the common base directory to strip from output paths
+	// so that directory structure is preserved under outputDir.
+	stripPrefix := ""
+	if len(files) > 1 {
+		stripPrefix = longestCommonDirPrefix(files)
+	}
+
+	// 3. Process each file.
 	result := &models.RestoreResult{
 		TotalFiles: len(files),
 	}
@@ -97,7 +105,7 @@ func (r *Restorer) Restore(ctx context.Context, req *models.RestoreRequest) (*mo
 			continue
 		}
 
-		if err := r.restoreFile(ctx, fileRec, bfRec, req.OutputDir, req.Expedited, tmpDir); err != nil {
+		if err := r.restoreFile(ctx, fileRec, bfRec, req.OutputDir, stripPrefix, req.Expedited, tmpDir); err != nil {
 			slog.Error("restore file failed",
 				"path", fileRec.Path, "error", err)
 			result.FailedFiles = append(result.FailedFiles, fileRec.Path)
@@ -201,6 +209,7 @@ func (r *Restorer) restoreFile(
 	fileRec *models.FileRecord,
 	bfRec *models.BackupFileRecord,
 	outputDir string,
+	stripPrefix string,
 	expedited bool,
 	tmpDir string,
 ) error {
@@ -281,8 +290,15 @@ func (r *Restorer) restoreFile(
 		}
 	}
 
-	// Step 6: Move to output directory.
-	outputPath := filepath.Join(outputDir, filepath.Base(fileRec.Path))
+	// Step 6: Move to output directory, preserving relative directory structure.
+	relPath := fileRec.Path
+	if stripPrefix != "" {
+		relPath = strings.TrimPrefix(fileRec.Path, stripPrefix)
+		relPath = strings.TrimPrefix(relPath, string(filepath.Separator))
+	} else {
+		relPath = filepath.Base(fileRec.Path)
+	}
+	outputPath := filepath.Join(outputDir, relPath)
 	if err := moveFile(workingPath, outputPath); err != nil {
 		return fmt.Errorf("move file to output directory: %w", err)
 	}
@@ -309,6 +325,9 @@ func sha256File(path string) (string, error) {
 // moveFile moves a file from src to dst. Falls back to copy+delete
 // if the rename fails (e.g. cross-device).
 func moveFile(src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return fmt.Errorf("create output directory: %w", err)
+	}
 	if err := os.Rename(src, dst); err == nil {
 		return nil
 	}
@@ -319,10 +338,6 @@ func moveFile(src, dst string) error {
 		return fmt.Errorf("open source: %w", err)
 	}
 	defer in.Close()
-
-	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
-		return fmt.Errorf("create output directory: %w", err)
-	}
 
 	out, err := os.Create(dst)
 	if err != nil {
@@ -341,4 +356,22 @@ func moveFile(src, dst string) error {
 
 	os.Remove(src)
 	return nil
+}
+
+func longestCommonDirPrefix(files []*models.FileRecord) string {
+	if len(files) == 0 {
+		return ""
+	}
+	prefix := filepath.Dir(files[0].Path)
+	for _, f := range files[1:] {
+		dir := filepath.Dir(f.Path)
+		for !strings.HasPrefix(dir, prefix+string(filepath.Separator)) && prefix != dir {
+			parent := filepath.Dir(prefix)
+			if parent == prefix {
+				return ""
+			}
+			prefix = parent
+		}
+	}
+	return prefix
 }

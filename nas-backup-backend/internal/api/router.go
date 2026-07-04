@@ -187,6 +187,9 @@ func parsePagination(req *http.Request) (page, size int) {
 	if size < 1 {
 		size = 20
 	}
+	if size > 200 {
+		size = 200
+	}
 	return page, size
 }
 

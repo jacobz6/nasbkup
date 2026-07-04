@@ -40,31 +40,53 @@ func NewScheduler(engine *backup.Engine, database *db.Database, cfg *config.AppC
 // and starts the cron scheduler. Returns an error if the cron expression
 // is invalid or the scheduler is already running.
 func (s *Scheduler) Start() error {
-        s.mu.Lock()
-        defer s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-        if s.cron != nil {
-                return fmt.Errorf("scheduler already running")
-        }
+	if s.cron != nil {
+		return fmt.Errorf("scheduler already running")
+	}
 
-        cronExpr := s.config.Backup.Schedule.CronExpr
-        if cronExpr == "" {
-                return fmt.Errorf("cron expression is empty")
-        }
+	cronExpr := s.config.Backup.Schedule.CronExpr
+	if cronExpr == "" {
+		return fmt.Errorf("cron expression is empty")
+	}
 
-        s.cron = cron.New()
+	return s.startLocked(cronExpr)
+}
 
-        jobID, err := s.cron.AddFunc(cronExpr, s.runBackup)
-        if err != nil {
-                s.cron = nil
-                return fmt.Errorf("add cron job with expression %q: %w", cronExpr, err)
-        }
-        s.jobID = jobID
+// StartWithCron starts the scheduler with a specific cron expression,
+// bypassing the config file value. Used when the schedule is updated via API.
+func (s *Scheduler) StartWithCron(cronExpr string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-        s.cron.Start()
-        slog.Info("scheduler started", "cron_expr", cronExpr, "next_run", s.NextRunLocked())
+	if s.cron != nil {
+		return fmt.Errorf("scheduler already running")
+	}
+	if cronExpr == "" {
+		return fmt.Errorf("cron expression is empty")
+	}
 
-        return nil
+	return s.startLocked(cronExpr)
+}
+
+func (s *Scheduler) startLocked(cronExpr string) error {
+	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
+	if _, err := parser.Parse(cronExpr); err != nil {
+		return fmt.Errorf("invalid cron expression %q: %w", cronExpr, err)
+	}
+
+	s.cron = cron.New()
+	jobID, err := s.cron.AddFunc(cronExpr, s.runBackup)
+	if err != nil {
+		s.cron = nil
+		return fmt.Errorf("add cron job with expression %q: %w", cronExpr, err)
+	}
+	s.jobID = jobID
+	s.cron.Start()
+	slog.Info("scheduler started", "cron_expr", cronExpr, "next_run", s.NextRunLocked())
+	return nil
 }
 
 // runBackup is the cron job callback that determines the backup type

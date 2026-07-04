@@ -65,11 +65,25 @@ func (r *Router) handleUpdateSchedule(w http.ResponseWriter, req *http.Request) 
 		return
 	}
 
-	// Update the running scheduler if applicable.
-	if r.scheduler != nil && r.scheduler.IsEnabled() {
-		if err := r.scheduler.UpdateSchedule(cfg.CronExpr); err != nil {
-			r.jsonError(w, fmt.Sprintf("update scheduler: %v", err), http.StatusInternalServerError)
-			return
+	// Update the running scheduler: stop if disabling, start if enabling,
+	// update cron expression if already running.
+	if r.scheduler != nil {
+		if cfg.Enabled {
+			if r.scheduler.IsEnabled() {
+				if err := r.scheduler.UpdateSchedule(cfg.CronExpr); err != nil {
+					r.jsonError(w, fmt.Sprintf("update scheduler: %v", err), http.StatusInternalServerError)
+					return
+				}
+			} else {
+				if err := r.scheduler.StartWithCron(cfg.CronExpr); err != nil {
+					r.jsonError(w, fmt.Sprintf("start scheduler: %v", err), http.StatusInternalServerError)
+					return
+				}
+			}
+		} else {
+			if r.scheduler.IsEnabled() {
+				r.scheduler.Stop()
+			}
 		}
 	}
 

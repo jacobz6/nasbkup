@@ -100,7 +100,13 @@ func (r *HashRepository) IncrementRef(hash string) error {
 // DecrementRef decrements the ref_count for an existing hash record.
 // The ref_count will never go below 0. Returns the new ref_count value.
 func (r *HashRepository) DecrementRef(hash string) (int, error) {
-	result, err := r.db.Exec(`
+	tx, err := r.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("begin transaction for decrement ref %q: %w", hash, err)
+	}
+	defer tx.Rollback()
+
+	result, err := tx.Exec(`
 		UPDATE hash_index SET ref_count = ref_count - 1 WHERE hash = ? AND ref_count > 0
 	`, hash)
 	if err != nil {
@@ -111,25 +117,25 @@ func (r *HashRepository) DecrementRef(hash string) (int, error) {
 		return 0, fmt.Errorf("rows affected after decrement ref for hash %q: %w", hash, err)
 	}
 	if affected == 0 {
-		// Either hash doesn't exist or ref_count was already 0.
-		// Check if the hash exists to determine the correct error.
 		var count int
-		err := r.db.QueryRow(`SELECT ref_count FROM hash_index WHERE hash = ?`, hash).Scan(&count)
+		err := tx.QueryRow(`SELECT ref_count FROM hash_index WHERE hash = ?`, hash).Scan(&count)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return 0, fmt.Errorf("hash not found for decrement ref: %q", hash)
 			}
 			return 0, fmt.Errorf("check ref_count for hash %q: %w", hash, err)
 		}
-		// Hash exists but ref_count was already 0; return 0 without error.
+		tx.Commit()
 		return 0, nil
 	}
 
-	// Retrieve the new ref_count.
 	var newCount int
-	err = r.db.QueryRow(`SELECT ref_count FROM hash_index WHERE hash = ?`, hash).Scan(&newCount)
+	err = tx.QueryRow(`SELECT ref_count FROM hash_index WHERE hash = ?`, hash).Scan(&newCount)
 	if err != nil {
 		return 0, fmt.Errorf("get ref_count after decrement for hash %q: %w", hash, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit decrement ref for hash %q: %w", hash, err)
 	}
 	return newCount, nil
 }

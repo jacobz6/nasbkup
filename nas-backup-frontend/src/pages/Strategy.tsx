@@ -29,9 +29,13 @@ export function Strategy() {
       if (u.data) setUpload(u.data);
       if (r.data) setRetention(r.data);
       if (e.data) setEncryption(e.data);
+    }).catch((err) => {
+      console.error('Failed to load strategy config:', err);
+      addToast({ type: 'error', message: '加载配置失败' });
+    }).finally(() => {
       setLoading(false);
     });
-  }, []);
+  }, [addToast]);
 
   const save = useCallback(async <T,>(apiCall: () => Promise<{ success: boolean; error?: string }>, label: string) => {
     const res = await apiCall();

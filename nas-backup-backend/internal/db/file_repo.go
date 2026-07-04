@@ -142,29 +142,34 @@ func (r *FileRepository) GetByHash(hash string) ([]*models.FileRecord, error) {
 // ListByStatus retrieves file records filtered by status with pagination.
 // Use limit and offset to control pagination; pass 0 for limit to retrieve all records.
 func (r *FileRepository) ListByStatus(status models.FileStatus, limit, offset int) ([]*models.FileRecord, error) {
-        rows, err := r.db.Query(`
-                SELECT id, path, size, mod_time, hash, status, backup_id, inode, created_at, updated_at
-                FROM files WHERE status = ?
-                ORDER BY path
-                LIMIT ? OFFSET ?
-        `, status, limit, offset)
-        if err != nil {
-                return nil, fmt.Errorf("list files by status %q: %w", status, err)
-        }
-        defer rows.Close()
+	query := `SELECT id, path, size, mod_time, hash, status, backup_id, inode, created_at, updated_at
+		FROM files WHERE status = ?
+		ORDER BY path`
+	var args []interface{}
+	args = append(args, status)
+	if limit > 0 {
+		query += " LIMIT ? OFFSET ?"
+		args = append(args, limit, offset)
+	}
 
-        records := make([]*models.FileRecord, 0)
-        for rows.Next() {
-                rec, err := scanFileRecord(rows)
-                if err != nil {
-                        return nil, fmt.Errorf("scan file row by status: %w", err)
-                }
-                records = append(records, rec)
-        }
-        if err := rows.Err(); err != nil {
-                return nil, fmt.Errorf("iterate files by status: %w", err)
-        }
-        return records, nil
+	rows, err := r.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list files by status %q: %w", status, err)
+	}
+	defer rows.Close()
+
+	records := make([]*models.FileRecord, 0)
+	for rows.Next() {
+		rec, err := scanFileRecord(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan file row by status: %w", err)
+		}
+		records = append(records, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate files by status: %w", err)
+	}
+	return records, nil
 }
 
 // MarkDeleted sets the status of a file to "deleted" and updates the updated_at timestamp.

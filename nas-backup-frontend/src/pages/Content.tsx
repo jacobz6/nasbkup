@@ -47,14 +47,19 @@ function FileBrowser() {
   const fetchBrowse = useCallback(async (path: string) => {
     setLoading(true);
     setSelectedEntry(null);
-    const res = await fsApi.browse(path);
-    if (res.success && res.data) {
-      setResult(res.data);
-      setCurrentPath(res.data.path);
-    } else {
-      addToast({ type: 'error', message: res.error || '无法浏览目录' });
+    try {
+      const res = await fsApi.browse(path);
+      if (res.success && res.data) {
+        setResult(res.data);
+        setCurrentPath(res.data.path);
+      } else {
+        addToast({ type: 'error', message: res.error || '无法浏览目录' });
+      }
+    } catch (err) {
+      addToast({ type: 'error', message: '网络错误，无法浏览目录' });
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   }, [addToast]);
 
   const fetchDirs = useCallback(async () => {
@@ -174,9 +179,30 @@ function FileBrowser() {
           {loading ? (
             <div className="p-5"><LoadingSkeleton rows={10} /></div>
           ) : !result || result.entries.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-16 text-slate-500">
-              <Folder size={40} strokeWidth={1} className="mb-3 text-slate-600" />
-              <p>空目录</p>
+            <div>
+              {/* Parent directory link — keep navigation available in empty directories */}
+              {result?.parent_path && (
+                <table className="w-full text-sm">
+                  <tbody>
+                    <tr
+                      onClick={() => navigateTo(result.parent_path)}
+                      className="border-b border-surface-3/30 cursor-pointer hover:bg-surface-2/30 transition-colors"
+                    >
+                      <td className="py-2.5 px-5 flex items-center gap-2.5 text-slate-400">
+                        <ArrowUp size={16} className="shrink-0" />
+                        <span>..</span>
+                      </td>
+                      <td className="py-2.5 px-3 text-slate-500">—</td>
+                      <td className="py-2.5 px-3"></td>
+                      <td className="py-2.5 px-5"></td>
+                    </tr>
+                  </tbody>
+                </table>
+              )}
+              <div className="flex flex-col items-center justify-center py-16 text-slate-500">
+                <Folder size={40} strokeWidth={1} className="mb-3 text-slate-600" />
+                <p>空目录</p>
+              </div>
             </div>
           ) : (
             <table className="w-full text-sm">
@@ -227,7 +253,11 @@ function FileBrowser() {
                             {entry.name}
                           </span>
                           {entry.is_dir && entry.in_backup && (
-                            <span title="备份范围内"><ShieldCheck size={14} className="text-emerald-400 shrink-0" /></span>
+                            entry.partial_backup ? (
+                              <span title="部分备份范围内"><AlertCircle size={14} className="text-amber-400 shrink-0" /></span>
+                            ) : (
+                              <span title="备份范围内"><ShieldCheck size={14} className="text-emerald-400 shrink-0" /></span>
+                            )
                           )}
                         </div>
                       </td>
@@ -235,7 +265,11 @@ function FileBrowser() {
                         {entry.is_dir ? '—' : formatFileSize(entry.size)}
                       </td>
                       <td className="py-2.5 px-3">
-                        {entry.in_backup ? (
+                        {entry.in_backup && entry.partial_backup ? (
+                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs bg-amber-500/15 text-amber-400">
+                            <AlertCircle size={10} /> 部分已纳入
+                          </span>
+                        ) : entry.in_backup ? (
                           <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs bg-emerald-500/15 text-emerald-400">
                             <Check size={10} /> 已纳入
                           </span>
@@ -299,7 +333,9 @@ function FileBrowser() {
 
               <div className="flex items-center justify-between">
                 <span className="text-sm text-slate-400">备份范围内</span>
-                {selectedEntry.in_backup ? (
+                {selectedEntry.in_backup && selectedEntry.partial_backup ? (
+                  <span className="flex items-center gap-1 text-amber-400 text-sm"><AlertCircle size={14} /> 部分</span>
+                ) : selectedEntry.in_backup ? (
                   <span className="flex items-center gap-1 text-emerald-400 text-sm"><ShieldCheck size={14} /> 是</span>
                 ) : (
                   <span className="flex items-center gap-1 text-slate-500 text-sm"><ShieldOff size={14} /> 否</span>

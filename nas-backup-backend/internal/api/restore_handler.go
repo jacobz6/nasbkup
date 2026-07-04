@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 
@@ -37,7 +38,7 @@ func (r *Router) handleRestore(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	result, err := r.restorer.Restore(context.Background(), &restoreReq)
+	result, err := r.restorer.Restore(req.Context(), &restoreReq)
 	if err != nil {
 		r.jsonError(w, fmt.Sprintf("restore failed: %v", err), http.StatusInternalServerError)
 		return
@@ -50,9 +51,11 @@ func (r *Router) handleRestore(w http.ResponseWriter, req *http.Request) {
 func (r *Router) handleGarbageCollection(w http.ResponseWriter, req *http.Request) {
 	go func() {
 		if err := r.engine.RunGarbageCollection(context.Background()); err != nil {
+			slog.Error("garbage collection failed", "error", err)
 			_ = r.db.LogRepo.Insert(nil, models.LogLevelError,
 				"garbage collection failed", err.Error())
 		} else {
+			slog.Info("garbage collection completed")
 			_ = r.db.LogRepo.Insert(nil, models.LogLevelInfo,
 				"garbage collection completed", "")
 		}

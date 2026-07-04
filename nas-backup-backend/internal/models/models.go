@@ -300,7 +300,8 @@ type FSEntry struct {
 	IsDir     bool   `json:"is_dir"`
 	Size      int64  `json:"size"`
 	ModTime   string `json:"mod_time"`
-	InBackup  bool   `json:"in_backup"`   // Whether this path is covered by a backup directory
+	InBackup  bool   `json:"in_backup"`   // Whether this path is covered by a backup directory (full or partial)
+	PartialBackup bool `json:"partial_backup"` // For directories: only some sub-paths are backup targets
 	HasUpdate bool   `json:"has_update"`  // Whether the file has been modified since last backup
 	WillBackup bool  `json:"will_backup"` // Whether this will be included in next backup
 }

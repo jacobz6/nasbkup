@@ -291,6 +291,21 @@ func (r *ConfigRepository) UpdateExclusionRule(id int64, pattern, ruleType strin
 	return nil
 }
 
+func (r *ConfigRepository) GetExclusionRuleByID(id int64) (*models.ExclusionRule, error) {
+	row := r.db.QueryRow(`
+		SELECT id, pattern, rule_type, enabled
+		FROM exclusion_rules WHERE id = ?
+	`, id)
+	rule, err := scanExclusionRule(row)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get exclusion rule %d: %w", id, err)
+	}
+	return rule, nil
+}
+
 // DeleteExclusionRule removes an exclusion rule by ID.
 func (r *ConfigRepository) DeleteExclusionRule(id int64) error {
 	result, err := r.db.Exec(`DELETE FROM exclusion_rules WHERE id = ?`, id)

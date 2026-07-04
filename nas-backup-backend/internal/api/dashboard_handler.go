@@ -51,11 +51,11 @@ func (r *Router) handleDashboardHistory(w http.ResponseWriter, req *http.Request
 	page, size := parsePagination(req)
 	offset := (page - 1) * size
 
-	records, err := r.db.BackupRepo.List(size, offset)
+	records, total, err := r.db.BackupRepo.List(size, offset)
 	if err != nil {
 		r.jsonError(w, fmt.Sprintf("list backups: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	r.jsonPaginatedResponse(w, records, int64(len(records)), page, size)
+	r.jsonPaginatedResponse(w, records, total, page, size)
 }

@@ -330,7 +330,7 @@ func TestBackupHistoryList(t *testing.T) {
 		}
 	}
 
-	all, err := database.BackupRepo.List(100, 0)
+	all, _, err := database.BackupRepo.List(100, 0)
 	if err != nil {
 		t.Fatalf("List failed: %v", err)
 	}

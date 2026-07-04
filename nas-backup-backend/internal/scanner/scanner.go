@@ -434,6 +434,9 @@ func (s *Scanner) ComputeHashes(result *ScanResult, progress func(int)) error {
 
 		switch change.ChangeType {
 		case Added, Modified:
+			if change.NewHash != "" {
+				continue
+			}
 			hash, err := sha256File(change.Path)
 			if err != nil {
 				result.Errors = append(result.Errors, fmt.Sprintf("hash %q: %v", change.Path, err))
@@ -441,14 +444,11 @@ func (s *Scanner) ComputeHashes(result *ScanResult, progress func(int)) error {
 			}
 			change.NewHash = hash
 
-			// If the hash matches the old hash, this was a false positive
-			// caused by a metadata-only change (e.g. touch).
 			if change.ChangeType == Modified && change.OldHash == hash {
 				change.ChangeType = Unchanged
 			}
 
 		case Deleted, Unchanged, Renamed:
-			// No hashing needed.
 			continue
 		}
 

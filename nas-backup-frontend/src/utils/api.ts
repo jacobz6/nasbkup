@@ -280,6 +280,7 @@ export interface FSEntry {
   size: number;
   mod_time: string;
   in_backup: boolean;
+  partial_backup: boolean;
   has_update: boolean;
   will_backup: boolean;
 }
