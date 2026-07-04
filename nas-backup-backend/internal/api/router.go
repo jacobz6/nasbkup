@@ -108,8 +108,10 @@ func (r *Router) loggingMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(rw, req)
 
 		duration := time.Since(start)
-		if rw.status >= 400 {
-			logger.Error("HTTP %d %s %s %s (%v)", rw.status, req.Method, req.URL.Path, req.URL.RawQuery, duration)
+		if rw.status >= 500 {
+			logger.Error("HTTP %d %s %s (%v)", rw.status, req.Method, req.URL.Path, duration)
+		} else if rw.status >= 400 {
+			logger.Warn("HTTP %d %s %s (%v)", rw.status, req.Method, req.URL.Path, duration)
 		} else {
 			logger.Info("HTTP %d %s %s (%v)", rw.status, req.Method, req.URL.Path, duration)
 		}
@@ -167,8 +169,13 @@ func (r *Router) jsonPaginatedResponse(w http.ResponseWriter, data interface{}, 
 }
 
 // jsonError writes an error JSON response with the given status code and logs it.
+// 4xx client errors are logged as warnings; 5xx server errors as errors.
 func (r *Router) jsonError(w http.ResponseWriter, message string, status int) {
-	logger.Error("API error %d: %s", status, message)
+	if status >= 500 {
+		logger.Error("API error %d: %s", status, message)
+	} else {
+		logger.Warn("API client error %d: %s", status, message)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(models.APIResponse{

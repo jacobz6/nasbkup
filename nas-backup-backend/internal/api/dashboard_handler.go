@@ -14,7 +14,9 @@ func (r *Router) handleDashboardStats(w http.ResponseWriter, req *http.Request) 
 	activeSize, _ := r.db.FileRepo.TotalSizeByStatus(models.FileStatusActive)
 	dedupSaved, _ := r.db.HashRepo.TotalDedupSaved()
 	latestBackup, _ := r.db.BackupRepo.GetLatestCompleted()
-	isRunning, _ := r.db.BackupRepo.IsRunning()
+	dbRunning, _ := r.db.BackupRepo.IsRunning()
+	_, memRunning := r.engine.RunningBackupID()
+	isRunning := dbRunning || memRunning
 
 	var lastBackupTime *time.Time
 	var lastBackupStatus models.BackupStatus

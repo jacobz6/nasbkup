@@ -57,45 +57,65 @@ func NewEngine(database *db.Database, sc *scanner.Scanner, dd *dedup.Deduplicato
 
 // RunFullBackup executes a full backup synchronously.
 func (e *Engine) RunFullBackup(ctx context.Context) error {
+	e.mu.Lock()
+	if e.runningBackupID > 0 {
+		e.mu.Unlock()
+		return fmt.Errorf("a backup is already running")
+	}
 	running, err := e.db.BackupRepo.IsRunning()
 	if err != nil {
+		e.mu.Unlock()
 		return fmt.Errorf("check running backup: %w", err)
 	}
 	if running {
+		e.mu.Unlock()
 		return fmt.Errorf("a backup is already running")
 	}
 
 	backupID, err := e.db.BackupRepo.Create(models.BackupTypeFull, nil)
 	if err != nil {
+		e.mu.Unlock()
 		return fmt.Errorf("create backup record: %w", err)
 	}
+	e.mu.Unlock()
 
 	return e.executeBackup(ctx, backupID, models.BackupTypeFull, nil)
 }
 
 // RunIncrementalBackup executes an incremental backup synchronously.
 func (e *Engine) RunIncrementalBackup(ctx context.Context) error {
+	e.mu.Lock()
+	if e.runningBackupID > 0 {
+		e.mu.Unlock()
+		return fmt.Errorf("a backup is already running")
+	}
 	running, err := e.db.BackupRepo.IsRunning()
 	if err != nil {
+		e.mu.Unlock()
 		return fmt.Errorf("check running backup: %w", err)
 	}
 	if running {
+		e.mu.Unlock()
 		return fmt.Errorf("a backup is already running")
 	}
 
 	latestFull, err := e.db.BackupRepo.GetLatestFull()
 	if err != nil {
+		e.mu.Unlock()
 		return fmt.Errorf("get latest full backup: %w", err)
 	}
 	if latestFull == nil {
+		e.mu.Unlock()
 		return fmt.Errorf("no full backup found; run a full backup first")
 	}
 	baseBackupID := latestFull.ID
 
 	backupID, err := e.db.BackupRepo.Create(models.BackupTypeIncremental, &baseBackupID)
 	if err != nil {
+		e.mu.Unlock()
 		return fmt.Errorf("create backup record: %w", err)
 	}
+	e.mu.Unlock()
 
 	return e.executeBackup(ctx, backupID, models.BackupTypeIncremental, &baseBackupID)
 }
@@ -103,11 +123,19 @@ func (e *Engine) RunIncrementalBackup(ctx context.Context) error {
 // StartBackup creates a backup record and starts the backup asynchronously.
 // Returns the backup ID immediately so callers can track progress via the API.
 func (e *Engine) StartBackup(backupType models.BackupType) (int64, error) {
+	e.mu.Lock()
+	if e.runningBackupID > 0 {
+		e.mu.Unlock()
+		return 0, fmt.Errorf("a backup is already running")
+	}
+
 	running, err := e.db.BackupRepo.IsRunning()
 	if err != nil {
+		e.mu.Unlock()
 		return 0, fmt.Errorf("check running backup: %w", err)
 	}
 	if running {
+		e.mu.Unlock()
 		return 0, fmt.Errorf("a backup is already running")
 	}
 
@@ -115,9 +143,11 @@ func (e *Engine) StartBackup(backupType models.BackupType) (int64, error) {
 	if backupType == models.BackupTypeIncremental {
 		latestFull, err := e.db.BackupRepo.GetLatestFull()
 		if err != nil {
+			e.mu.Unlock()
 			return 0, fmt.Errorf("get latest full backup: %w", err)
 		}
 		if latestFull == nil {
+			e.mu.Unlock()
 			return 0, fmt.Errorf("no full backup found; run a full backup first")
 		}
 		id := latestFull.ID
@@ -126,8 +156,10 @@ func (e *Engine) StartBackup(backupType models.BackupType) (int64, error) {
 
 	backupID, err := e.db.BackupRepo.Create(backupType, baseBackupID)
 	if err != nil {
+		e.mu.Unlock()
 		return 0, fmt.Errorf("create backup record: %w", err)
 	}
+	e.mu.Unlock()
 
 	go func() {
 		ctx := context.Background()

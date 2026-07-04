@@ -62,6 +62,14 @@ func main() {
 	defer database.Close()
 	logger.Info("Database opened at: %s", cfg.Database.Path)
 
+	// Clean up stale "running"/"pending" backup records left over from a
+	// previous crash, so the new instance can start backups immediately.
+	if cleaned, err := database.BackupRepo.CleanupStaleRunning(); err != nil {
+		logger.Error("Failed to cleanup stale running backups: %v", err)
+	} else if cleaned > 0 {
+		logger.Info("Cleaned up %d stale running/pending backup record(s)", cleaned)
+	}
+
 	// Initialize components
 	sc := scanner.NewScanner(database.FileRepo, database.ConfigRepo)
 	dd := dedup.NewDeduplicator(database.HashRepo)

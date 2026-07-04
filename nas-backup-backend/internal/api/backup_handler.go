@@ -43,6 +43,9 @@ func (r *Router) handleBackupCancel(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		if err := r.engine.Cancel(backupID); err != nil {
+			// If the backup is not in memory (e.g. process restarted), try to
+			// mark it as failed in the DB so the user can start a new backup.
+			_ = r.db.BackupRepo.UpdateStatus(backupID, models.BackupStatusFailed, "cancelled (process restarted)")
 			r.jsonError(w, err.Error(), http.StatusNotFound)
 			return
 		}
@@ -50,27 +53,40 @@ func (r *Router) handleBackupCancel(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Try to find the running backup automatically.
+	// Try to find the running backup from in-memory state first.
 	runningID, ok := r.engine.RunningBackupID()
-	if !ok {
-		r.jsonError(w, "no backup is currently running", http.StatusNotFound)
+	if ok {
+		if err := r.engine.Cancel(runningID); err != nil {
+			r.jsonError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		r.jsonResponse(w, map[string]string{"status": "cancelled"}, http.StatusOK)
 		return
 	}
-	if err := r.engine.Cancel(runningID); err != nil {
-		r.jsonError(w, err.Error(), http.StatusNotFound)
+
+	// No in-memory running backup — check DB for stale "running" records (e.g.
+	// left over from a process crash) and clean them up.
+	runningDB, err := r.db.BackupRepo.GetRunning()
+	if err == nil && runningDB != nil {
+		_ = r.db.BackupRepo.UpdateStatus(runningDB.ID, models.BackupStatusFailed, "cancelled (stale record)")
+		r.jsonResponse(w, map[string]string{"status": "cancelled", "note": "cleared stale running record"}, http.StatusOK)
 		return
 	}
-	r.jsonResponse(w, map[string]string{"status": "cancelled"}, http.StatusOK)
+
+	r.jsonError(w, "no backup is currently running", http.StatusNotFound)
 }
 
 // handleBackupStatus returns current backup status.
 func (r *Router) handleBackupStatus(w http.ResponseWriter, req *http.Request) {
-	isRunning, _ := r.db.BackupRepo.IsRunning()
-	runningID, _ := r.engine.RunningBackupID()
+	dbRunning, _ := r.db.BackupRepo.IsRunning()
+	runningID, memRunning := r.engine.RunningBackupID()
+	isRunning := dbRunning || memRunning
 
 	var runningBackup *models.BackupRecord
 	if runningID > 0 {
 		runningBackup, _ = r.db.BackupRepo.GetByID(runningID)
+	} else if dbRunning {
+		runningBackup, _ = r.db.BackupRepo.GetRunning()
 	}
 
 	r.jsonResponse(w, map[string]interface{}{

@@ -396,3 +396,32 @@ func (r *BackupRepository) IsRunning() (bool, error) {
 	}
 	return count > 0, nil
 }
+
+// GetRunning returns the currently running backup record, or nil if none.
+func (r *BackupRepository) GetRunning() (*models.BackupRecord, error) {
+	row := r.db.QueryRow(`SELECT id, type, status, base_backup_id, created_at, started_at, completed_at,
+		total_files, total_size, uploaded_size, dedup_skipped, inc_skipped, compress_saved, error_message
+		FROM backups WHERE status = 'running' LIMIT 1`)
+	rec, err := scanBackupRecord(row)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get running backup: %w", err)
+	}
+	return rec, nil
+}
+
+// CleanupStaleRunning marks any "running" or "pending" backups as failed.
+// This should be called at startup to recover from a previous process crash.
+func (r *BackupRepository) CleanupStaleRunning() (int64, error) {
+	now := Now()
+	res, err := r.db.Exec(`
+		UPDATE backups SET status = 'failed', completed_at = ?, error_message = 'process interrupted'
+		WHERE status IN ('running', 'pending')
+	`, now)
+	if err != nil {
+		return 0, fmt.Errorf("cleanup stale running backups: %w", err)
+	}
+	return res.RowsAffected()
+}
