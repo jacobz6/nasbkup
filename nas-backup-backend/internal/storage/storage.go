@@ -38,15 +38,38 @@ type StorageManager struct {
 	ossAKSecret  string
 }
 
+// validS3StorageClasses lists the storage class values accepted by rclone's
+// S3 backend. OSS-native names (ColdArchive, Archive, IA, DeepColdArchive) are
+// NOT accepted by the S3-compatible endpoint and trigger InvalidStorageClass.
+var validS3StorageClasses = map[string]bool{
+	"":                    true, // default — use bucket's storage class
+	"STANDARD":            true,
+	"REDUCED_REDUNDANCY":  true,
+	"STANDARD_IA":         true,
+	"ONEZONE_IA":          true,
+	"GLACIER":             true,
+	"DEEP_ARCHIVE":        true,
+	"INTELLIGENT_TIERING": true,
+	"GLACIER_IR":          true,
+}
+
 // NewStorageManager creates a StorageManager from the application configuration.
 // It locates the rclone binary at init time but does not fail if rclone is not found.
 // Operations requiring rclone will fail gracefully when invoked.
 func NewStorageManager(cfg *config.AppConfig) (*StorageManager, error) {
+	storageClass := cfg.OSS.StorageClass
+	if storageClass != "" && !validS3StorageClasses[storageClass] {
+		fmt.Printf("WARNING: storage_class %q is not a valid S3 storage class and will be ignored. "+
+			"Set the storage class on the OSS bucket instead. Valid values: STANDARD, STANDARD_IA, "+
+			"GLACIER, DEEP_ARCHIVE, etc.\n", storageClass)
+		storageClass = ""
+	}
+
 	sm := &StorageManager{
 		rcloneBinCfg: cfg.Rclone.BinaryPath,
 		rcloneConf:   cfg.Rclone.ConfigPath,
 		remoteName:   cfg.Rclone.RemoteName,
-		storageClass: cfg.OSS.StorageClass,
+		storageClass: storageClass,
 		ossEndpoint:  cfg.OSS.Endpoint,
 		ossBucket:    cfg.OSS.Bucket,
 		ossAKID:      cfg.OSS.AccessKeyID,

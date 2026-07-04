@@ -132,7 +132,12 @@ oss:
   bucket: ""                    # TODO: Set your bucket name
   access_key_id: ""             # TODO: Set your AccessKey ID
   access_key_secret: ""         # TODO: Set your AccessKey Secret
-  storage_class: "ColdArchive"  # ColdArchive (cheapest) or Archive
+  # storage_class: ""  # Leave empty to use the bucket's default storage class.
+                        # Set the desired storage class (e.g. ColdArchive) on the
+                        # bucket in the OSS console instead. rclone's S3 backend
+                        # only accepts S3 names (STANDARD, STANDARD_IA, GLACIER,
+                        # DEEP_ARCHIVE, ...); OSS-native names like ColdArchive
+                        # or Archive are rejected with InvalidStorageClass.
   region: "cn-hangzhou"
 
 # ---------------------------------------------------------------------------
