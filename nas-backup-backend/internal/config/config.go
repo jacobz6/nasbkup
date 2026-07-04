@@ -179,7 +179,7 @@ func DefaultConfig() *AppConfig {
 		},
 		OSS: OSSConfig{
 			Endpoint:     "oss-cn-hangzhou.aliyuncs.com",
-			StorageClass: "ColdArchive",
+			StorageClass: "",
 			Region:       "cn-hangzhou",
 		},
 		Rclone: RcloneConfig{

@@ -172,9 +172,6 @@ func TestDefaultConfigFn(t *testing.T) {
 	if len(cfg.Backup.Compression.SkipTypes) == 0 {
 		t.Error("expected default SkipTypes to be populated")
 	}
-	if cfg.OSS.StorageClass == "" {
-		t.Error("expected default StorageClass to be set")
-	}
 }
 
 // TestToModelsScheduleConfig 测试调度配置转换
