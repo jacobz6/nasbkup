@@ -3,6 +3,18 @@ import react from '@vitejs/plugin-react'
 import tsconfigPaths from "vite-tsconfig-paths";
 import { traeBadgePlugin } from 'vite-plugin-trae-solo-badge';
 
+function customFaviconPlugin() {
+  return {
+    name: 'custom-favicon',
+    configureServer(server) {
+      server.middlewares.use('/favicon.ico', (req, res) => {
+        res.writeHead(301, { 'Location': '/favicon.svg' });
+        res.end();
+      });
+    },
+  };
+}
+
 // https://vite.dev/config/
 export default defineConfig({
   build: {
@@ -33,6 +45,7 @@ export default defineConfig({
       autoTheme: true,
       autoThemeTarget: '#root'
     }), 
-    tsconfigPaths()
+    tsconfigPaths(),
+    customFaviconPlugin(),
   ],
 })

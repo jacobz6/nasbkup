@@ -22,7 +22,7 @@ export function Sidebar() {
       )}
     >
       <div className={cn('flex items-center h-16 px-4 border-b border-surface-3', sidebarCollapsed ? 'justify-center' : 'gap-3')}>
-        <img src="/favicon.png" alt="NAS Backup Logo" className="w-7 h-7 shrink-0 rounded" />
+        <img src="/favicon.svg" alt="NAS Backup Logo" className="w-7 h-7 shrink-0 rounded" />
         {!sidebarCollapsed && (
           <div className="overflow-hidden">
             <h1 className="text-base font-mono font-bold text-white whitespace-nowrap">NAS Backup</h1>
