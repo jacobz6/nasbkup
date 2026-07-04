@@ -268,6 +268,17 @@ func (r *FileRepository) TotalSizeByStatus(status models.FileStatus) (int64, err
         return total.Int64, nil
 }
 
+// CountBackedUp returns the number of distinct file IDs that have at least one
+// entry in backup_files (i.e. their content has been uploaded to OSS).
+func (r *FileRepository) CountBackedUp() (int64, error) {
+        var count int64
+        err := r.db.QueryRow(`SELECT COUNT(DISTINCT file_id) FROM backup_files`).Scan(&count)
+        if err != nil {
+                return 0, fmt.Errorf("count backed up files: %w", err)
+        }
+        return count, nil
+}
+
 // ListActiveByDirectory retrieves all active file records whose path starts with
 // the given directory path (i.e., files under that directory).
 func (r *FileRepository) ListActiveByDirectory(dirPath string) ([]*models.FileRecord, error) {

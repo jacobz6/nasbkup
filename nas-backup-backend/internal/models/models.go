@@ -15,9 +15,8 @@ import (
 type FileStatus string
 
 const (
-	FileStatusActive   FileStatus = "active"
-	FileStatusDeleted  FileStatus = "deleted"
-	FileStatusModified FileStatus = "modified"
+	FileStatusActive  FileStatus = "active"
+	FileStatusDeleted FileStatus = "deleted"
 )
 
 // FileRecord represents a single tracked file in the backup index.
@@ -311,6 +310,39 @@ type FSBrowseResult struct {
 	Path       string     `json:"path"`
 	ParentPath string     `json:"parent_path,omitempty"`
 	Entries    []FSEntry  `json:"entries"`
+}
+
+// --- Backup Progress (SSE) ---
+
+// BackupPhase represents the current phase of a running backup.
+type BackupPhase string
+
+const (
+	PhaseScanning     BackupPhase = "scanning"
+	PhaseHashing      BackupPhase = "hashing"
+	PhaseDeduplicating BackupPhase = "deduplicating"
+	PhaseUploading    BackupPhase = "uploading"
+	PhaseFinalizing   BackupPhase = "finalizing"
+	PhaseCompleted    BackupPhase = "completed"
+	PhaseFailed       BackupPhase = "failed"
+	PhaseCancelled    BackupPhase = "cancelled"
+)
+
+// ProgressEvent is sent via SSE to notify clients of backup progress.
+type ProgressEvent struct {
+	Type      string      `json:"type"`                // "phase", "progress", "log", "file"
+	BackupID  int64       `json:"backup_id"`
+	Phase     BackupPhase `json:"phase,omitempty"`
+	PhaseName string      `json:"phase_name,omitempty"`
+	Current   int         `json:"current,omitempty"`   // files processed in current phase
+	Total     int         `json:"total,omitempty"`     // total files in current phase
+	Percent   float64     `json:"percent,omitempty"`   // 0-100 overall
+	Message   string      `json:"message,omitempty"`
+	Detail    string      `json:"detail,omitempty"`
+	Level     string      `json:"level,omitempty"`     // for log events: info/warn/error
+	FilePath  string      `json:"file_path,omitempty"` // for file events
+	FileSize  int64       `json:"file_size,omitempty"`
+	Timestamp time.Time   `json:"timestamp"`
 }
 
 // --- Generic API response ---

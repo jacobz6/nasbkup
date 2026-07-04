@@ -45,6 +45,8 @@ func (r *Router) handleAddDirectory(w http.ResponseWriter, req *http.Request) {
 }
 
 // handleUpdateDirectory updates an existing backup directory.
+// Supports partial updates (PATCH semantics): only fields provided in the
+// request body are updated; missing fields retain their existing values.
 func (r *Router) handleUpdateDirectory(w http.ResponseWriter, req *http.Request) {
 	id, err := strconv.ParseInt(req.PathValue("id"), 10, 64)
 	if err != nil {
@@ -52,37 +54,59 @@ func (r *Router) handleUpdateDirectory(w http.ResponseWriter, req *http.Request)
 		return
 	}
 
-	var dir models.BackupDirectory
-	if err := json.NewDecoder(req.Body).Decode(&dir); err != nil {
+	var patch struct {
+		Path        *string `json:"path"`
+		Recursive   *bool   `json:"recursive"`
+		Enabled     *bool   `json:"enabled"`
+		Description *string `json:"description"`
+	}
+	if err := json.NewDecoder(req.Body).Decode(&patch); err != nil {
 		r.jsonError(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
-	if dir.Path == "" {
-		r.jsonError(w, "path is required", http.StatusBadRequest)
+
+	existing, err := r.db.ConfigRepo.GetDirectoryByID(id)
+	if err != nil {
+		r.jsonError(w, fmt.Sprintf("lookup directory: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if existing == nil {
+		r.jsonError(w, "directory not found", http.StatusNotFound)
 		return
 	}
 
-	if err := r.db.ConfigRepo.UpdateDirectory(id, dir.Path, dir.Recursive, dir.Enabled, dir.Description); err != nil {
+	path := existing.Path
+	recursive := existing.Recursive
+	enabled := existing.Enabled
+	description := existing.Description
+	if patch.Path != nil {
+		path = *patch.Path
+	}
+	if patch.Recursive != nil {
+		recursive = *patch.Recursive
+	}
+	if patch.Enabled != nil {
+		enabled = *patch.Enabled
+	}
+	if patch.Description != nil {
+		description = *patch.Description
+	}
+	if path == "" {
+		r.jsonError(w, "path must not be empty", http.StatusBadRequest)
+		return
+	}
+
+	if err := r.db.ConfigRepo.UpdateDirectory(id, path, recursive, enabled, description); err != nil {
 		r.jsonError(w, fmt.Sprintf("update directory: %v", err), http.StatusInternalServerError)
 		return
 	}
-	dir.ID = id
-	r.jsonResponse(w, dir, http.StatusOK)
-}
-
-// handleDeleteDirectory deletes a backup directory.
-func (r *Router) handleDeleteDirectory(w http.ResponseWriter, req *http.Request) {
-	id, err := strconv.ParseInt(req.PathValue("id"), 10, 64)
-	if err != nil {
-		r.jsonError(w, "invalid directory ID", http.StatusBadRequest)
-		return
-	}
-
-	if err := r.db.ConfigRepo.DeleteDirectory(id); err != nil {
-		r.jsonError(w, fmt.Sprintf("delete directory: %v", err), http.StatusNotFound)
-		return
-	}
-	r.jsonResponse(w, map[string]string{"status": "deleted"}, http.StatusOK)
+	r.jsonResponse(w, &models.BackupDirectory{
+		ID:          id,
+		Path:        path,
+		Recursive:   recursive,
+		Enabled:     enabled,
+		Description: description,
+	}, http.StatusOK)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

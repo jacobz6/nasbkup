@@ -13,9 +13,6 @@ func TestFileStatusConstants(t *testing.T) {
 	if FileStatusDeleted != "deleted" {
 		t.Errorf("expected FileStatusDeleted %q, got %q", "deleted", FileStatusDeleted)
 	}
-	if FileStatusModified != "modified" {
-		t.Errorf("expected FileStatusModified %q, got %q", "modified", FileStatusModified)
-	}
 }
 
 // TestBackupTypeConstants 测试 BackupType 常量值

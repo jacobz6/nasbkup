@@ -170,20 +170,21 @@ func (r *ConfigRepository) UpdateDirectory(id int64, path string, recursive, ena
 	return nil
 }
 
-// DeleteDirectory removes a backup directory entry by ID.
-func (r *ConfigRepository) DeleteDirectory(id int64) error {
-	result, err := r.db.Exec(`DELETE FROM backup_directories WHERE id = ?`, id)
+// GetDirectoryByID retrieves a single backup directory by its ID.
+// Returns (nil, nil) if the directory does not exist.
+func (r *ConfigRepository) GetDirectoryByID(id int64) (*models.BackupDirectory, error) {
+	row := r.db.QueryRow(`
+		SELECT id, path, recursive, enabled, description
+		FROM backup_directories WHERE id = ?
+	`, id)
+	d, err := scanBackupDirectory(row)
 	if err != nil {
-		return fmt.Errorf("delete backup directory %d: %w", id, err)
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get backup directory %d: %w", id, err)
 	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("rows affected after delete directory %d: %w", id, err)
-	}
-	if affected == 0 {
-		return fmt.Errorf("backup directory not found for delete: %d", id)
-	}
-	return nil
+	return d, nil
 }
 
 // GetEnabledDirectories retrieves only backup directories that are enabled.

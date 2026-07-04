@@ -96,25 +96,12 @@ function FileBrowser() {
     }
   };
 
-  // Remove directory from backup targets
-  const handleRemoveBackupDir = async (entry: FSEntry) => {
-    const dir = backupDirs.find(d => d.path === entry.path);
-    if (!dir) return;
-    const res = await directoryApi.delete(dir.id);
-    if (res.success) {
-      addToast({ type: 'success', message: `已将 ${entry.path} 从备份目录移除` });
-      fetchDirs();
-      fetchBrowse(currentPath);
-    } else {
-      addToast({ type: 'error', message: res.error || '移除失败' });
-    }
-  };
-
-  // Toggle backup directory enabled
+  // Toggle backup directory enabled. PATCH semantics: only send the changed
+  // field so we don't accidentally overwrite other fields with stale data.
   const handleToggleBackupDir = async (entry: FSEntry) => {
     const dir = backupDirs.find(d => d.path === entry.path);
     if (!dir) return;
-    const res = await directoryApi.update(dir.id, { ...dir, enabled: !dir.enabled });
+    const res = await directoryApi.update(dir.id, { enabled: !dir.enabled });
     if (res.success) {
       addToast({ type: 'success', message: dir.enabled ? '已禁用备份' : '已启用备份' });
       fetchDirs();
@@ -210,7 +197,7 @@ function FileBrowser() {
                 <tr className="border-b border-surface-3/50 text-xs text-slate-500 uppercase tracking-wider">
                   <th className="text-left py-2.5 px-5 font-medium">名称</th>
                   <th className="text-left py-2.5 px-3 font-medium w-24">大小</th>
-                  <th className="text-left py-2.5 px-3 font-medium w-20">状态</th>
+                  <th className="text-left py-2.5 px-3 font-medium w-28">状态</th>
                   <th className="text-right py-2.5 px-5 font-medium w-10"></th>
                 </tr>
               </thead>
@@ -266,15 +253,15 @@ function FileBrowser() {
                       </td>
                       <td className="py-2.5 px-3">
                         {entry.in_backup && entry.partial_backup ? (
-                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs bg-amber-500/15 text-amber-400">
-                            <AlertCircle size={10} /> 部分已纳入
+                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs bg-amber-500/15 text-amber-400 whitespace-nowrap">
+                            <AlertCircle size={10} /> 部分纳入
                           </span>
                         ) : entry.in_backup ? (
-                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs bg-emerald-500/15 text-emerald-400">
+                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs bg-emerald-500/15 text-emerald-400 whitespace-nowrap">
                             <Check size={10} /> 已纳入
                           </span>
                         ) : (
-                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs bg-slate-500/15 text-slate-500">
+                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs bg-slate-500/15 text-slate-500 whitespace-nowrap">
                             未纳入
                           </span>
                         )}
@@ -369,29 +356,21 @@ function FileBrowser() {
                 <h5 className="text-xs font-medium text-slate-500 uppercase tracking-wider">操作</h5>
 
                 {isDirectBackupTarget(selectedEntry) ? (
-                  <>
-                    <button
-                      onClick={() => handleToggleBackupDir(selectedEntry)}
-                      className={cn(
-                        'w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all',
-                        getBackupDirForEntry(selectedEntry)?.enabled
-                          ? 'btn-secondary'
-                          : 'btn-primary'
-                      )}
-                    >
-                      {getBackupDirForEntry(selectedEntry)?.enabled ? (
-                        <><ToggleLeft size={16} /> 禁用备份</>
-                      ) : (
-                        <><ToggleRight size={16} /> 启用备份</>
-                      )}
-                    </button>
-                    <button
-                      onClick={() => handleRemoveBackupDir(selectedEntry)}
-                      className="btn-danger w-full flex items-center justify-center gap-2"
-                    >
-                      <Trash2 size={16} /> 移除备份目录
-                    </button>
-                  </>
+                  <button
+                    onClick={() => handleToggleBackupDir(selectedEntry)}
+                    className={cn(
+                      'w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all',
+                      getBackupDirForEntry(selectedEntry)?.enabled
+                        ? 'btn-secondary'
+                        : 'btn-primary'
+                    )}
+                  >
+                    {getBackupDirForEntry(selectedEntry)?.enabled ? (
+                      <><ToggleLeft size={16} /> 禁用备份</>
+                    ) : (
+                      <><ToggleRight size={16} /> 启用备份</>
+                    )}
+                  </button>
                 ) : (
                   <button
                     onClick={() => handleAddBackupDir(selectedEntry)}

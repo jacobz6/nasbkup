@@ -83,8 +83,24 @@ func NewScanner(fileRepo *db.FileRepository, configRepo *db.ConfigRepository) *S
 }
 
 // Scan performs a full scan of all enabled backup directories and returns
-// a ScanResult describing every detected change.
+// a ScanResult describing every detected change. Hashes for Added/Modified
+// files are computed before returning.
 func (s *Scanner) Scan() (*ScanResult, error) {
+	result, err := s.ScanWithProgress(nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.ComputeHashes(result, nil); err != nil {
+		return nil, fmt.Errorf("compute hashes: %w", err)
+	}
+	return result, nil
+}
+
+// ScanWithProgress performs a full scan with a progress callback that is
+// invoked with the total count of files scanned so far. The callback may be
+// nil. Note: hash computation is NOT performed here — the caller must call
+// ComputeHashes separately (useful when you want progress on hashing too).
+func (s *Scanner) ScanWithProgress(progress func(scanned int)) (*ScanResult, error) {
 	// 1. Get enabled directories.
 	dirs, err := s.configRepo.GetEnabledDirectories()
 	if err != nil {
@@ -107,9 +123,6 @@ func (s *Scanner) Scan() (*ScanResult, error) {
 	}
 
 	// 4. Pre-load all active file records for enabled directories.
-	//    Using ListActiveByDirectory per directory gives us only the active
-	//    records we need for comparison, serving the same purpose as
-	//    ListAllPaths but filtered to active status and relevant directories.
 	activeDBFiles := make(map[string]*models.FileRecord)
 	for _, dir := range dirs {
 		records, err := s.fileRepo.ListActiveByDirectory(dir.Path)
@@ -128,17 +141,14 @@ func (s *Scanner) Scan() (*ScanResult, error) {
 	scannedPaths := make(map[string]bool)
 
 	for _, dir := range dirs {
-		if err := s.walkDirectory(dir.Path, dir.Recursive, exclusions, maxFileSize, minFileSize, activeDBFiles, scannedPaths, result); err != nil {
+		if err := s.walkDirectory(dir.Path, dir.Recursive, exclusions, maxFileSize, minFileSize, activeDBFiles, scannedPaths, result, progress); err != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("walk directory %q: %v", dir.Path, err))
 		}
 	}
 
-	// 6. Compute hashes for Added and Modified files.
-	if err := s.ComputeHashes(result, nil); err != nil {
-		return nil, fmt.Errorf("compute hashes: %w", err)
-	}
-
-	// 7. Detect deletions: active DB paths not found during the scan.
+	// 6. Detect deletions: active DB paths not found during the scan.
+	// Note: hash computation is NOT done here; the caller is responsible for
+	// calling ComputeHashes separately (with optional progress callback).
 	for path, rec := range activeDBFiles {
 		if !scannedPaths[path] {
 			result.Changes = append(result.Changes, FileChange{
@@ -190,6 +200,7 @@ func (s *Scanner) walkDirectory(
 	activeDBFiles map[string]*models.FileRecord,
 	scannedPaths map[string]bool,
 	result *ScanResult,
+	progress func(scanned int),
 ) error {
 	// Resolve the root path to follow any top-level symlink.
 	resolved, err := filepath.EvalSymlinks(root)
@@ -198,7 +209,7 @@ func (s *Scanner) walkDirectory(
 	}
 
 	visited := make(map[devIno]bool)
-	return s.walkRecursive(resolved, root, recursive, exclusions, maxFileSize, minFileSize, activeDBFiles, scannedPaths, result, visited)
+	return s.walkRecursive(resolved, root, recursive, exclusions, maxFileSize, minFileSize, activeDBFiles, scannedPaths, result, visited, progress)
 }
 
 // devIno uniquely identifies a filesystem entry by device and inode.
@@ -219,6 +230,7 @@ func (s *Scanner) walkRecursive(
 	scannedPaths map[string]bool,
 	result *ScanResult,
 	visited map[devIno]bool,
+	progress func(scanned int),
 ) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -238,10 +250,8 @@ func (s *Scanner) walkRecursive(
 		// Skip symlink files — only follow symlink directories.
 		if lstat.Mode()&os.ModeSymlink != 0 {
 			if !lstat.IsDir() {
-				// Symlink to a file: skip it.
 				continue
 			}
-			// Symlink to a directory: resolve and follow it.
 		}
 
 		// Follow symlinks by using os.Stat instead of os.Lstat.
@@ -254,7 +264,6 @@ func (s *Scanner) walkRecursive(
 		// Compute display path relative to logical root.
 		displayPath := fullPath
 		if dir != logicalRoot {
-			// Replace the resolved prefix with the logical root.
 			resolvedRoot, _ := filepath.EvalSymlinks(logicalRoot)
 			if resolvedRoot != "" && strings.HasPrefix(fullPath, resolvedRoot) {
 				displayPath = filepath.Join(logicalRoot, strings.TrimPrefix(fullPath, resolvedRoot))
@@ -266,22 +275,19 @@ func (s *Scanner) walkRecursive(
 				continue
 			}
 
-			// Cycle detection for directories (including symlinked dirs).
 			stat, ok := info.Sys().(*syscall.Stat_t)
 			if ok {
 				di := devIno{dev: uint64(stat.Dev), ino: stat.Ino}
 				if visited[di] {
-					continue // Cycle detected; skip.
+					continue
 				}
 				visited[di] = true
 			}
 
-			if err := s.walkRecursive(fullPath, logicalRoot, recursive, exclusions, maxFileSize, minFileSize, activeDBFiles, scannedPaths, result, visited); err != nil {
+			if err := s.walkRecursive(fullPath, logicalRoot, recursive, exclusions, maxFileSize, minFileSize, activeDBFiles, scannedPaths, result, visited, progress); err != nil {
 				result.Errors = append(result.Errors, fmt.Sprintf("walk subdir %q: %v", fullPath, err))
 			}
 
-			// Remove from visited after returning so the same dir can be
-			// reached via a different path (DAG support).
 			if ok {
 				stat2, _ := info.Sys().(*syscall.Stat_t)
 				if stat2 != nil {
@@ -291,8 +297,7 @@ func (s *Scanner) walkRecursive(
 			continue
 		}
 
-		// It's a regular file (or other non-directory). Process it.
-		s.processFile(displayPath, info, exclusions, maxFileSize, minFileSize, activeDBFiles, scannedPaths, result)
+		s.processFile(displayPath, info, exclusions, maxFileSize, minFileSize, activeDBFiles, scannedPaths, result, progress)
 	}
 
 	return nil
@@ -308,9 +313,14 @@ func (s *Scanner) processFile(
 	activeDBFiles map[string]*models.FileRecord,
 	scannedPaths map[string]bool,
 	result *ScanResult,
+	progress func(scanned int),
 ) {
 	result.TotalScanned++
 	scannedPaths[path] = true
+
+	if progress != nil {
+		progress(result.TotalScanned)
+	}
 
 	// Check exclusion rules.
 	if s.shouldExclude(path, exclusions) {
@@ -368,7 +378,7 @@ func (s *Scanner) processFile(
 		Size:       size,
 		ModTime:    info.ModTime(),
 		OldHash:    dbRec.Hash,
-		NewHash:    dbRec.Hash, // Already known.
+		NewHash:    dbRec.Hash,
 		Inode:      inode,
 	})
 }

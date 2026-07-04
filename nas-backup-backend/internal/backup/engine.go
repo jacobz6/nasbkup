@@ -32,6 +32,7 @@ type Engine struct {
 	storage    *storage.StorageManager
 	config     *config.AppConfig
 	logger     *slog.Logger
+	progress   *ProgressBroker
 
 	mu              sync.Mutex
 	runningBackupID int64
@@ -41,7 +42,7 @@ type Engine struct {
 // NewEngine creates a new backup Engine with all required dependencies.
 func NewEngine(database *db.Database, sc *scanner.Scanner, dd *dedup.Deduplicator,
 	comp *compress.Compressor, enc *crypto.Encryptor, stor *storage.StorageManager,
-	cfg *config.AppConfig) *Engine {
+	cfg *config.AppConfig, pb *ProgressBroker) *Engine {
 	return &Engine{
 		db:          database,
 		scanner:     sc,
@@ -51,8 +52,14 @@ func NewEngine(database *db.Database, sc *scanner.Scanner, dd *dedup.Deduplicato
 		storage:     stor,
 		config:      cfg,
 		logger:      slog.Default(),
+		progress:    pb,
 		cancelFuncs: make(map[int64]context.CancelFunc),
 	}
+}
+
+// ProgressBroker returns the progress broker for SSE subscriptions.
+func (e *Engine) ProgressBroker() *ProgressBroker {
+	return e.progress
 }
 
 // RunFullBackup executes a full backup synchronously.
@@ -254,6 +261,9 @@ func (e *Engine) logEvent(backupID int64, level models.LogLevel, message, detail
 		e.logger.Error("write backup log to db",
 			"backup_id", backupID, "level", string(level), "error", err)
 	}
+	if e.progress != nil {
+		e.progress.PublishLog(backupID, string(level), message, detail)
+	}
 }
 
 // executeBackup runs the core backup pipeline for a given backup record.
@@ -279,14 +289,23 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 			if ctx.Err() != nil {
 				_ = e.db.BackupRepo.UpdateStatus(backupID, models.BackupStatusCancelled, "cancelled")
 				e.logEvent(backupID, models.LogLevelWarn, "backup cancelled", retErr.Error())
+				if e.progress != nil {
+					e.progress.PublishPhase(backupID, models.PhaseCancelled, "备份已取消")
+				}
 				retErr = ctx.Err()
 			} else {
 				_ = e.db.BackupRepo.UpdateStatus(backupID, models.BackupStatusFailed, retErr.Error())
 				e.logEvent(backupID, models.LogLevelError, "backup failed", retErr.Error())
+				if e.progress != nil {
+					e.progress.PublishPhase(backupID, models.PhaseFailed, fmt.Sprintf("备份失败: %v", retErr))
+				}
 			}
 		} else {
 			_ = e.db.BackupRepo.UpdateStatus(backupID, models.BackupStatusCompleted, "")
 			e.logEvent(backupID, models.LogLevelInfo, "backup completed", "")
+			if e.progress != nil {
+				e.progress.PublishPhase(backupID, models.PhaseCompleted, "备份完成")
+			}
 		}
 	}()
 
@@ -297,10 +316,20 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 	e.logger.Info("backup started", "backup_id", backupID, "type", backupType)
 	e.logEvent(backupID, models.LogLevelInfo, "backup started",
 		fmt.Sprintf("type=%s", backupType))
+	if e.progress != nil {
+		e.progress.PublishPhase(backupID, models.PhaseScanning, "正在扫描文件...")
+	}
 
 	// ── Phase 2: Scan directories ──────────────────────────────────────
 	scanStart := time.Now()
-	scanResult, err := e.scanner.Scan()
+	scanResult, err := e.scanner.ScanWithProgress(func(scanned int) {
+		if e.progress != nil && scanned%200 == 0 {
+			// 扫描阶段无法预知总文件数，用对数曲线估算 0-5% 的进度，
+			// 让进度条有视觉反馈而非卡在 0%。
+			pct := 5.0 * (1.0 - 1.0/float64(scanned/100+1))
+			e.progress.PublishProgress(backupID, models.PhaseScanning, scanned, 0, pct)
+		}
+	})
 	if err != nil {
 		return fmt.Errorf("scan directories: %w", err)
 	}
@@ -313,19 +342,44 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 		fmt.Sprintf("changes=%d scanned=%d errors=%d duration=%s",
 			len(scanResult.Changes), scanResult.TotalScanned,
 			len(scanResult.Errors), time.Since(scanStart)))
+	if e.progress != nil {
+		e.progress.PublishProgress(backupID, models.PhaseScanning, scanResult.TotalScanned, scanResult.TotalScanned, 5)
+	}
 
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 
+	// Count files needing hashing
+	var filesToHash int
+	for _, ch := range scanResult.Changes {
+		if ch.ChangeType == scanner.Added || ch.ChangeType == scanner.Modified {
+			filesToHash++
+		}
+	}
+
 	// ── Phase 3: Compute hashes ────────────────────────────────────────
 	hashStart := time.Now()
-	if err := e.scanner.ComputeHashes(scanResult, func(int) {}); err != nil {
+	if e.progress != nil {
+		e.progress.PublishPhase(backupID, models.PhaseHashing, fmt.Sprintf("正在计算 %d 个文件的哈希...", filesToHash))
+	}
+	hashedCount := 0
+	if err := e.scanner.ComputeHashes(scanResult, func(done int) {
+		hashedCount = done
+		if e.progress != nil {
+			pct := 5.0
+			if filesToHash > 0 {
+				// 哈希阶段占 5%-30%（25% 权重，从扫描结束的 5% 开始）
+				pct = 5.0 + float64(done)/float64(filesToHash)*25
+			}
+			e.progress.PublishProgress(backupID, models.PhaseHashing, done, filesToHash, pct)
+		}
+	}); err != nil {
 		return fmt.Errorf("compute hashes: %w", err)
 	}
 	e.logger.Info("hash computation completed", "duration", time.Since(hashStart))
 	e.logEvent(backupID, models.LogLevelInfo, "hash computation completed",
-		fmt.Sprintf("duration=%s", time.Since(hashStart)))
+		fmt.Sprintf("files_hashed=%d duration=%s", hashedCount, time.Since(hashStart)))
 
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -366,6 +420,9 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 
 	// ── Phase 5: Deduplicate ───────────────────────────────────────────
 	dedupStart := time.Now()
+	if e.progress != nil {
+		e.progress.PublishPhase(backupID, models.PhaseDeduplicating, "正在进行去重分析...")
+	}
 	dedupResult, err := e.dedup.Deduplicate(changedFiles)
 	if err != nil {
 		return fmt.Errorf("deduplicate: %w", err)
@@ -379,6 +436,9 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 		fmt.Sprintf("to_upload=%d skipped_dedup=%d dedup_saved_bytes=%d duration=%s",
 			len(dedupResult.ToUpload), len(dedupResult.Skipped),
 			dedupResult.TotalSaved, time.Since(dedupStart)))
+	if e.progress != nil {
+		e.progress.PublishProgress(backupID, models.PhaseDeduplicating, len(changedFiles), len(changedFiles), 35)
+	}
 
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -386,6 +446,14 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 
 	// ── Phase 6: Process files to upload (compress → encrypt → upload) ─
 	processStart := time.Now()
+	if e.progress != nil {
+		totalFiles := len(dedupResult.ToUpload) + len(dedupResult.Skipped)
+		if totalFiles > 0 {
+			e.progress.PublishPhase(backupID, models.PhaseUploading, fmt.Sprintf("正在上传 %d 个文件（%d 个去重跳过）...", len(dedupResult.ToUpload), len(dedupResult.Skipped)))
+		} else {
+			e.progress.PublishPhase(backupID, models.PhaseUploading, "没有文件需要上传")
+		}
+	}
 
 	tmpDir, err := os.MkdirTemp("", "nas-backup-*")
 	if err != nil {
@@ -400,15 +468,24 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 		backupFiles       []*models.BackupFileRecord
 	)
 
+	totalToProcess := len(dedupResult.ToUpload) + len(dedupResult.Skipped)
 	for i := range dedupResult.ToUpload {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		entry := &dedupResult.ToUpload[i]
 
+		// 降频发布 file 事件：首个文件立即发布，之后每 50 个发布一次，
+		// 避免大量小文件时事件洪流导致前端频繁 re-render。
+		if e.progress != nil && (i == 0 || i%50 == 0) {
+			e.progress.PublishFile(backupID, models.PhaseUploading, entry.Path, entry.Size)
+		}
+
 		fileID, origSize, storedSize, compressType, storageKey, encIV, err := e.processAndUploadFile(
 			entry, backupType, tmpDir)
 		if err != nil {
+			e.logEvent(backupID, models.LogLevelError, "file upload failed",
+				fmt.Sprintf("path=%s error=%v", entry.Path, err))
 			return fmt.Errorf("process file %q: %w", entry.Path, err)
 		}
 
@@ -416,11 +493,6 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 		totalUploadedSize += storedSize
 
 		if compressType == "zstd" && origSize > 0 {
-			// The compressed size is storedSize minus encryption overhead.
-			// We approximate compression savings as original - (stored - 60),
-			// where 60 bytes ≈ salt(32) + nonce(12) + tag(16) overhead.
-			// A more precise calculation would require tracking compressedSize
-			// separately, but this gives a reasonable estimate.
 			compressSaved += origSize - storedSize
 			if compressSaved < 0 {
 				compressSaved = 0
@@ -432,7 +504,7 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 			FileID:       fileID,
 			StorageKey:   storageKey,
 			EncryptedIV:  encIV,
-			AuthTag:      "", // Auth tag is embedded in AES-GCM ciphertext.
+			AuthTag:      "",
 			CompressType: compressType,
 			OriginalSize: origSize,
 			StoredSize:   storedSize,
@@ -444,28 +516,34 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 			"original_size", origSize,
 			"stored_size", storedSize,
 			"compress_type", compressType)
+		e.logEvent(backupID, models.LogLevelInfo, "file uploaded",
+			fmt.Sprintf("path=%s size=%d stored=%d", entry.Path, origSize, storedSize))
+
+		if e.progress != nil {
+			processed := i + 1
+			pct := 35.0
+			if totalToProcess > 0 {
+				// 上传阶段占 35%-95%（60% 权重）
+				pct = 35.0 + float64(processed)/float64(totalToProcess)*60.0
+			}
+			e.progress.PublishProgress(backupID, models.PhaseUploading, processed, totalToProcess, pct)
+		}
 	}
 
-	e.logger.Info("file processing completed",
-		"files_uploaded", len(dedupResult.ToUpload),
-		"total_uploaded_size", totalUploadedSize,
-		"compress_saved", compressSaved,
-		"duration", time.Since(processStart))
-	e.logEvent(backupID, models.LogLevelInfo, "file processing completed",
-		fmt.Sprintf("files_uploaded=%d total_uploaded_size=%d compress_saved=%d duration=%s",
-			len(dedupResult.ToUpload), totalUploadedSize, compressSaved, time.Since(processStart)))
-
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-
-	// ── Phase 7: Handle dedup-only files (no upload needed) ────────────
-	for _, skipped := range dedupResult.Skipped {
+	// Process dedup-skipped files
+	for i, skipped := range dedupResult.Skipped {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		if e.progress != nil && i%50 == 0 {
+			processed := len(dedupResult.ToUpload) + i + 1
+			pct := 35.0
+			if totalToProcess > 0 {
+				pct = 35.0 + float64(processed)/float64(totalToProcess)*60.0
+			}
+			e.progress.PublishProgress(backupID, models.PhaseUploading, processed, totalToProcess, pct)
+		}
 
-		// Look up file metadata from the scan result.
 		var fileID int64
 		fc, hasFC := fileChangeMap[skipped.Path]
 		if hasFC {
@@ -476,7 +554,6 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 				continue
 			}
 		} else {
-			// Fallback: check if the file already exists in the DB.
 			existingRec, dbErr := e.db.FileRepo.GetByPath(skipped.Path)
 			if dbErr != nil {
 				e.logger.Error("get file record for dedup'd file",
@@ -491,7 +568,6 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 			fileID = existingRec.ID
 		}
 
-		// Look up encryption metadata from an existing file with the same hash.
 		var encIV, compressType string
 		var storedSize int64
 		existingFiles, err := e.db.FileRepo.GetByHash(skipped.Hash)
@@ -523,7 +599,26 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 		totalOriginalSize += origSize
 	}
 
+	e.logger.Info("file processing completed",
+		"files_uploaded", len(dedupResult.ToUpload),
+		"total_uploaded_size", totalUploadedSize,
+		"compress_saved", compressSaved,
+		"duration", time.Since(processStart))
+	e.logEvent(backupID, models.LogLevelInfo, "file processing completed",
+		fmt.Sprintf("files_uploaded=%d total_uploaded_size=%d compress_saved=%d duration=%s",
+			len(dedupResult.ToUpload), totalUploadedSize, compressSaved, time.Since(processStart)))
+
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	// ── Phase 7: Handle dedup-only files already done above ────────────
+
 	// ── Phase 8: Add all backup_files entries ──────────────────────────
+	if e.progress != nil {
+		e.progress.PublishPhase(backupID, models.PhaseFinalizing, "正在更新备份索引...")
+		e.progress.PublishProgress(backupID, models.PhaseFinalizing, 0, 1, 95)
+	}
 	if len(backupFiles) > 0 {
 		if err := e.db.BackupRepo.AddBackupFilesBatch(backupFiles); err != nil {
 			return fmt.Errorf("add backup files: %w", err)
@@ -568,6 +663,9 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 	); err != nil {
 		return fmt.Errorf("update backup stats: %w", err)
 	}
+	if e.progress != nil {
+		e.progress.PublishProgress(backupID, models.PhaseFinalizing, 1, 1, 100)
+	}
 
 	e.logger.Info("backup completed successfully",
 		"backup_id", backupID,
@@ -579,15 +677,11 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 		"skipped_inc", skippedInc,
 		"compress_saved", compressSaved,
 		"deleted", len(deletedPaths))
-	// Note: the "backup completed" entry is also written by the status-update
-	// defer on successful return, so we don't write a duplicate here.
 
 	return nil
 }
 
 // processAndUploadFile handles compress → encrypt → upload → verify for a single file.
-// Returns the file ID, original size, stored size, compress type, storage key, and
-// encryption IV.
 func (e *Engine) processAndUploadFile(
 	entry *dedup.DedupFileEntry,
 	backupType models.BackupType,
@@ -607,7 +701,6 @@ func (e *Engine) processAndUploadFile(
 	compressedPath := filepath.Join(tmpDir, fmt.Sprintf("%d_compressed", fileID))
 	encryptedPath := filepath.Join(tmpDir, fmt.Sprintf("%d_encrypted.enc", fileID))
 
-	// Clean up temp files when done.
 	defer func() {
 		os.Remove(compressedPath)
 		os.Remove(encryptedPath)
@@ -621,7 +714,7 @@ func (e *Engine) processAndUploadFile(
 		}
 		workingPath = compressedPath
 		compressType = "zstd"
-		_ = compressedSize // tracked via storedSize after encryption
+		_ = compressedSize
 	}
 
 	// Encrypt.
@@ -663,7 +756,6 @@ func (e *Engine) processAndUploadFile(
 }
 
 // generateStorageKey builds the OSS object key for a file.
-// Format: data/{YYYYMMDD}-{type}/{hash_prefix_2}/{hash}.enc
 func (e *Engine) generateStorageKey(backupType models.BackupType, hash string) string {
 	dateStr := time.Now().Format("20060102")
 	typeStr := string(backupType)

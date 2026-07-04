@@ -91,8 +91,11 @@ func main() {
 		log.Fatalf("Failed to ensure rclone config: %v", err)
 	}
 
+	// Initialize progress broker for real-time backup progress
+	pb := backup.NewProgressBroker()
+
 	// Initialize backup engine and restorer
-	engine := backup.NewEngine(database, sc, dd, comp, enc, stor, cfg)
+	engine := backup.NewEngine(database, sc, dd, comp, enc, stor, cfg, pb)
 	restorer := backup.NewRestorer(database, enc, comp, stor, cfg)
 
 	// Initialize scheduler

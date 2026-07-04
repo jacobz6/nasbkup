@@ -259,6 +259,26 @@ func (r *HashRepository) TotalDedupSaved() (int64, error) {
 	return total.Int64, nil
 }
 
+// OSSStorageUsed returns the total bytes actually stored in OSS (compressed +
+// encrypted). Deduplicates by storage_key so the same object referenced by
+// multiple files is counted only once.
+func (r *HashRepository) OSSStorageUsed() (int64, error) {
+	var total sql.NullInt64
+	err := r.db.QueryRow(`
+		SELECT COALESCE(SUM(stored_size), 0) FROM (
+			SELECT DISTINCT storage_key, stored_size FROM backup_files
+			WHERE storage_key <> '' AND stored_size > 0
+		)
+	`).Scan(&total)
+	if err != nil {
+		return 0, fmt.Errorf("calculate OSS storage used: %w", err)
+	}
+	if !total.Valid {
+		return 0, nil
+	}
+	return total.Int64, nil
+}
+
 // GetAllStorageKeys retrieves all storage_key values from the hash index.
 // This is used for garbage collection to compare against objects in OSS storage.
 func (r *HashRepository) GetAllStorageKeys() ([]string, error) {

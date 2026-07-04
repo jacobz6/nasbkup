@@ -92,14 +92,12 @@ export const directoryApi = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
+  // PATCH semantics: pass only the fields to update.
+  // To enable/disable a directory, pass { enabled: true/false }.
   update: (id: number, data: Partial<BackupDirectory>) =>
     request<BackupDirectory>(`/content/directories/${id}`, {
-      method: 'PUT',
+      method: 'PATCH',
       body: JSON.stringify(data),
-    }),
-  delete: (id: number) =>
-    request<{ status: string }>(`/content/directories/${id}`, {
-      method: 'DELETE',
     }),
 };
 
@@ -289,4 +287,90 @@ export interface FSBrowseResult {
   path: string;
   parent_path: string;
   entries: FSEntry[];
+}
+
+// Backup Progress SSE types
+export type ProgressPhase =
+  | 'scanning'
+  | 'hashing'
+  | 'deduplicating'
+  | 'uploading'
+  | 'finalizing'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+export interface ProgressEvent {
+  type: 'phase' | 'progress' | 'log' | 'file' | 'connected';
+  backup_id: number;
+  phase?: ProgressPhase;
+  phase_name?: string;
+  current?: number;
+  total?: number;
+  percent?: number;
+  message?: string;
+  detail?: string;
+  level?: 'debug' | 'info' | 'warn' | 'error';
+  file_path?: string;
+  file_size?: number;
+  timestamp: string;
+}
+
+export interface BackupProgress {
+  isRunning: boolean;
+  backupId: number | null;
+  phase: ProgressPhase | null;
+  phaseName: string;
+  message: string;
+  current: number;
+  total: number;
+  percent: number;
+  currentFile: string;
+  logs: Array<{
+    id: number;
+    level: 'debug' | 'info' | 'warn' | 'error';
+    message: string;
+    detail?: string;
+    timestamp: string;
+  }>;
+}
+
+export function createProgressStream(
+  onEvent: (event: ProgressEvent) => void,
+  onError?: (error: Event) => void
+): () => void {
+  if (typeof window === 'undefined') {
+    return () => {};
+  }
+
+  const es = new EventSource(`${API_BASE}/backup/progress/stream`);
+
+  const handleMessage = (e: MessageEvent) => {
+    try {
+      const event: ProgressEvent = JSON.parse(e.data);
+      onEvent(event);
+    } catch (err) {
+      console.error('Failed to parse progress event:', err);
+    }
+  };
+
+  es.addEventListener('phase', handleMessage);
+  es.addEventListener('progress', handleMessage);
+  es.addEventListener('log', handleMessage);
+  es.addEventListener('file', handleMessage);
+  es.addEventListener('connected', handleMessage);
+
+  es.onerror = (e) => {
+    console.error('Progress stream error:', e);
+    if (onError) onError(e);
+  };
+
+  return () => {
+    es.removeEventListener('phase', handleMessage);
+    es.removeEventListener('progress', handleMessage);
+    es.removeEventListener('log', handleMessage);
+    es.removeEventListener('file', handleMessage);
+    es.removeEventListener('connected', handleMessage);
+    es.close();
+  };
 }

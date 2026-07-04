@@ -13,6 +13,10 @@ func (r *Router) handleDashboardStats(w http.ResponseWriter, req *http.Request) 
 	activeFiles, _ := r.db.FileRepo.CountByStatus(models.FileStatusActive)
 	activeSize, _ := r.db.FileRepo.TotalSizeByStatus(models.FileStatusActive)
 	dedupSaved, _ := r.db.HashRepo.TotalDedupSaved()
+	ossUsed, _ := r.db.HashRepo.OSSStorageUsed()
+	// Backed-up files = distinct files that have a corresponding backup_files
+	// entry (i.e. their content has been uploaded to OSS at least once).
+	backedUpFiles, _ := r.db.FileRepo.CountBackedUp()
 	latestBackup, _ := r.db.BackupRepo.GetLatestCompleted()
 	dbRunning, _ := r.db.BackupRepo.IsRunning()
 	_, memRunning := r.engine.RunningBackupID()
@@ -36,13 +40,14 @@ func (r *Router) handleDashboardStats(w http.ResponseWriter, req *http.Request) 
 	stats := &models.DashboardStats{
 		TotalFiles:          activeFiles,
 		TotalSize:           activeSize,
-		BackedUpFiles:       activeFiles,
-		BackedUpSize:        activeSize,
+		BackedUpFiles:       backedUpFiles,
+		BackedUpSize:        ossUsed,
 		LastBackupTime:      lastBackupTime,
 		LastBackupStatus:    lastBackupStatus,
 		NextBackupTime:      nextBackupTime,
 		SavedByDedup:        dedupSaved,
 		ActiveBackupRunning: isRunning,
+		OSSStorageUsed:      ossUsed,
 	}
 
 	r.jsonResponse(w, stats, http.StatusOK)

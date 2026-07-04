@@ -51,6 +51,7 @@ func (r *Router) Setup() http.Handler {
 	r.mux.HandleFunc("POST /api/backup/trigger", r.handleBackupTrigger)
 	r.mux.HandleFunc("POST /api/backup/cancel", r.handleBackupCancel)
 	r.mux.HandleFunc("GET /api/backup/status", r.handleBackupStatus)
+	r.mux.HandleFunc("GET /api/backup/progress/stream", r.handleBackupProgressStream)
 
 	// Content — File System Browse
 	r.mux.HandleFunc("GET /api/fs/browse", r.handleFSBrowse)
@@ -58,8 +59,7 @@ func (r *Router) Setup() http.Handler {
 	// Content — Directories
 	r.mux.HandleFunc("GET /api/content/directories", r.handleListDirectories)
 	r.mux.HandleFunc("POST /api/content/directories", r.handleAddDirectory)
-	r.mux.HandleFunc("PUT /api/content/directories/{id}", r.handleUpdateDirectory)
-	r.mux.HandleFunc("DELETE /api/content/directories/{id}", r.handleDeleteDirectory)
+	r.mux.HandleFunc("PATCH /api/content/directories/{id}", r.handleUpdateDirectory)
 
 	// Content — Exclusions
 	r.mux.HandleFunc("GET /api/content/exclusions", r.handleListExclusions)
@@ -134,7 +134,8 @@ func (r *Router) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Cache-Control")
+		w.Header().Set("Access-Control-Expose-Headers", "Content-Type")
 
 		if req.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)

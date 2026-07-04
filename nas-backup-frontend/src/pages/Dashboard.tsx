@@ -1,9 +1,13 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import {
   Play, FastForward, Square, Trash2, Files, HardDrive,
   FileCheck, ArrowDownToLine, RefreshCw, CheckCircle, Clock,
+  Activity, Terminal, XCircle, AlertCircle, Info,
 } from 'lucide-react';
-import { dashboardApi, backupApi, gcApi, type DashboardStats, type BackupRecord } from '@/utils/api';
+import {
+  dashboardApi, backupApi, gcApi, createProgressStream,
+  type DashboardStats, type BackupRecord, type ProgressEvent, type ProgressPhase,
+} from '@/utils/api';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { GaugeChart } from '@/components/ui/GaugeChart';
 import { StatCard } from '@/components/ui/StatCard';
@@ -31,6 +35,63 @@ const historyColumns: Column<BackupRecord>[] = [
   { key: 'completed_at', header: '完成时间', render: (r) => formatDateTime(r.completed_at) },
 ];
 
+const PHASE_COLORS: Record<ProgressPhase, string> = {
+  scanning: 'text-sky-400',
+  hashing: 'text-violet-400',
+  deduplicating: 'text-amber-400',
+  uploading: 'text-brand-400',
+  finalizing: 'text-emerald-400',
+  completed: 'text-emerald-400',
+  failed: 'text-red-400',
+  cancelled: 'text-slate-400',
+};
+
+const LOG_ICON: Record<string, typeof Info> = {
+  debug: Info,
+  info: Info,
+  warn: AlertCircle,
+  error: XCircle,
+};
+
+const LOG_COLOR: Record<string, string> = {
+  debug: 'text-slate-500',
+  info: 'text-slate-300',
+  warn: 'text-amber-400',
+  error: 'text-red-400',
+};
+
+interface LogEntry {
+  id: number;
+  level: 'debug' | 'info' | 'warn' | 'error';
+  message: string;
+  detail?: string;
+  timestamp: string;
+}
+
+interface ProgressState {
+  isRunning: boolean;
+  backupId: number | null;
+  phase: ProgressPhase | null;
+  phaseName: string;
+  message: string;
+  current: number;
+  total: number;
+  percent: number;
+  currentFile: string;
+}
+
+const initialProgress: ProgressState = {
+  isRunning: false,
+  backupId: null,
+  phase: null,
+  phaseName: '',
+  message: '',
+  current: 0,
+  total: 0,
+  percent: 0,
+  currentFile: '',
+};
+
 export function Dashboard() {
   const [stats, setStats] = useState<DashboardStats>({
     total_files: 0,
@@ -52,6 +113,11 @@ export function Dashboard() {
   const [confirm, setConfirm] = useState<{ open: boolean; title: string; message: string; onConfirm: () => void }>({
     open: false, title: '', message: '', onConfirm: () => {},
   });
+  const [progress, setProgress] = useState<ProgressState>(initialProgress);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const logCounter = useRef(0);
+  const logsEndRef = useRef<HTMLDivElement>(null);
+  const logsContainerRef = useRef<HTMLDivElement>(null);
   const addToast = useAppStore((s) => s.addToast);
 
   const fetchStats = useCallback(async () => {
@@ -59,11 +125,14 @@ export function Dashboard() {
       const res = await dashboardApi.getStats();
       if (res.success && res.data) {
         setStats(res.data);
+        if (!res.data.active_backup_running && progress.isRunning) {
+          setProgress(prev => ({ ...prev, isRunning: false }));
+        }
       }
     } catch (e) {
       console.error('Failed to fetch stats:', e);
     }
-  }, []);
+  }, [progress.isRunning]);
 
   const fetchHistory = useCallback(async (p = page) => {
     try {
@@ -87,15 +156,99 @@ export function Dashboard() {
     }
   }, [fetchStats, fetchHistory]);
 
-  usePolling(fetchAll, 5000, stats.active_backup_running);
+  // 用 ref 持有最新的 fetchAll 引用，避免 SSE useEffect 依赖 fetchAll
+  // 导致 progress.isRunning 变化时 SSE 连接断开重连。
+  const fetchAllRef = useRef(fetchAll);
+  fetchAllRef.current = fetchAll;
+
+  usePolling(fetchAll, 5000, stats.active_backup_running || progress.isRunning);
 
   useEffect(() => { fetchAll(); }, []);
+
+  // SSE 连接：仅在组件挂载时建立一次，避免因 fetchAll 重建而断开重连。
+  useEffect(() => {
+    const closeStream = createProgressStream((event: ProgressEvent) => {
+      switch (event.type) {
+        case 'connected':
+          break;
+        case 'phase': {
+          const isEndPhase = event.phase === 'completed' || event.phase === 'failed' || event.phase === 'cancelled';
+          setProgress(prev => ({
+            ...prev,
+            isRunning: !isEndPhase,
+            backupId: event.backup_id || prev.backupId,
+            phase: event.phase || null,
+            phaseName: event.phase_name || '',
+            message: event.message || '',
+            percent: event.phase === 'completed' ? 100 : (event.percent ?? prev.percent),
+            currentFile: '',
+          }));
+          if (isEndPhase) {
+            setTimeout(() => fetchAllRef.current(), 1000);
+          }
+          break;
+        }
+        case 'progress':
+          setProgress(prev => ({
+            ...prev,
+            isRunning: true,
+            current: event.current ?? prev.current,
+            total: event.total ?? prev.total,
+            percent: event.percent ?? prev.percent,
+          }));
+          break;
+        case 'file':
+          if (event.file_path) {
+            setProgress(prev => ({
+              ...prev,
+              isRunning: true,
+              currentFile: event.file_path,
+            }));
+          }
+          break;
+        case 'log': {
+          const entry: LogEntry = {
+            id: ++logCounter.current,
+            level: (event.level as LogEntry['level']) || 'info',
+            message: event.message || '',
+            detail: event.detail,
+            timestamp: event.timestamp,
+          };
+          setLogs(prev => {
+            const next = [...prev, entry];
+            if (next.length > 500) return next.slice(-500);
+            return next;
+          });
+          break;
+        }
+      }
+    });
+    return closeStream;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 智能滚动：仅当用户位于日志底部时自动滚动到最新日志。
+  useEffect(() => {
+    const container = logsContainerRef.current;
+    if (!container) return;
+    // 如果用户距底部超过 50px，说明在查看历史日志，不自动滚动。
+    const distFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    if (distFromBottom < 50) {
+      logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [logs]);
 
   const handleTrigger = async (type: 'full' | 'incremental') => {
     try {
       const res = await backupApi.trigger(type);
       if (res.success) {
         addToast({ type: 'success', message: `${type === 'full' ? '全量' : '增量'}备份已启动` });
+        setLogs([]);
+        setProgress({
+          ...initialProgress,
+          isRunning: true,
+          backupId: res.data?.backup_id || null,
+        });
         fetchAll();
       } else {
         addToast({ type: 'error', message: res.error || '启动备份失败' });
@@ -138,6 +291,8 @@ export function Dashboard() {
   const openConfirm = (title: string, message: string, onConfirm: () => void) =>
     setConfirm({ open: true, title, message, onConfirm });
 
+  const displayIsRunning = stats.active_backup_running || progress.isRunning;
+
   if (loading) {
     return (
       <div className="space-y-6">
@@ -148,13 +303,19 @@ export function Dashboard() {
     );
   }
 
+  const pct = Math.min(100, Math.max(0, progress.percent || 0));
+  const PhaseIcon = progress.phase === 'completed' ? CheckCircle
+    : progress.phase === 'failed' ? XCircle
+    : progress.phase === 'cancelled' ? Square
+    : Activity;
+
   return (
     <div className="space-y-6">
       {/* Status Banner */}
       <div className="card p-6 bg-gradient-to-r from-brand-900/50 to-surface-1">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
-            {stats.active_backup_running ? (
+            {displayIsRunning ? (
               <>
                 <span className="relative flex h-3 w-3">
                   <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-brand-400 opacity-75" />
@@ -180,6 +341,91 @@ export function Dashboard() {
           </div>
         </div>
       </div>
+
+      {/* Progress Bar Section - shown only during backup */}
+      {displayIsRunning && (
+        <div className="card p-6">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-3">
+              <PhaseIcon size={20} className={PHASE_COLORS[progress.phase || 'uploading']} />
+              <div>
+                <div className={`font-semibold ${PHASE_COLORS[progress.phase || 'uploading']}`}>
+                  {progress.phaseName || '备份进行中'}
+                </div>
+                <div className="text-sm text-slate-400">{progress.message || '处理中...'}</div>
+              </div>
+            </div>
+            <div className="text-right">
+              <div className="text-2xl font-bold text-white">{pct.toFixed(0)}%</div>
+              {progress.total > 0 && (
+                <div className="text-sm text-slate-400">
+                  {progress.current} / {progress.total}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="w-full h-3 bg-surface-2 rounded-full overflow-hidden mb-3">
+            <div
+              className="h-full bg-gradient-to-r from-brand-600 to-brand-400 rounded-full transition-all duration-300 ease-out"
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+
+          {progress.currentFile && (
+            <div className="flex items-center gap-2 text-sm text-slate-400 truncate">
+              <Activity size={14} className="flex-shrink-0 animate-pulse" />
+              <span className="truncate font-mono text-xs">{progress.currentFile}</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Real-time Logs Panel - shown during backup or if there are recent logs */}
+      {(displayIsRunning || logs.length > 0) && (
+        <div className="card p-6">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <Terminal size={18} className="text-brand-400" />
+              <h2 className="text-lg font-semibold text-white">实时日志</h2>
+              {displayIsRunning && (
+                <span className="flex items-center gap-1 text-xs text-brand-400 bg-brand-400/10 px-2 py-0.5 rounded-full">
+                  <span className="w-1.5 h-1.5 bg-brand-400 rounded-full animate-pulse" />
+                  实时
+                </span>
+              )}
+            </div>
+            {logs.length > 0 && !displayIsRunning && (
+              <button
+                onClick={() => setLogs([])}
+                className="text-xs text-slate-400 hover:text-white transition-colors"
+              >
+                清空
+              </button>
+            )}
+          </div>
+          <div ref={logsContainerRef} className="bg-surface-0 rounded-lg p-4 h-64 overflow-y-auto font-mono text-xs space-y-1">
+            {logs.length === 0 ? (
+              <div className="text-slate-500 italic">等待日志输出...</div>
+            ) : (
+              logs.map((log) => {
+                const Icon = LOG_ICON[log.level] || Info;
+                return (
+                  <div key={log.id} className="flex items-start gap-2 leading-relaxed">
+                    <Icon size={12} className={`flex-shrink-0 mt-0.5 ${LOG_COLOR[log.level]}`} />
+                    <span className={`${LOG_COLOR[log.level]}`}>
+                      <span className="text-slate-500">[{new Date(log.timestamp).toLocaleTimeString()}]</span>{' '}
+                      {log.message}
+                      {log.detail && <span className="text-slate-500"> ({log.detail})</span>}
+                    </span>
+                  </div>
+                );
+              })
+            )}
+            <div ref={logsEndRef} />
+          </div>
+        </div>
+      )}
 
       {/* Gauge Charts */}
       <div className="grid grid-cols-3 gap-4">
@@ -212,7 +458,7 @@ export function Dashboard() {
         </button>
         <button
           className="btn-danger flex items-center gap-2"
-          disabled={!stats.active_backup_running}
+          disabled={!displayIsRunning}
           onClick={() => openConfirm('取消备份', '确定要取消当前正在运行的备份任务吗？', handleCancel)}
         >
           <Square size={16} /> 取消备份

@@ -2,9 +2,13 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
+	"time"
 
+	"github.com/nas-backup/internal/backup"
 	"github.com/nas-backup/internal/models"
 )
 
@@ -93,4 +97,79 @@ func (r *Router) handleBackupStatus(w http.ResponseWriter, req *http.Request) {
 		"is_running":     isRunning,
 		"running_backup": runningBackup,
 	}, http.StatusOK)
+}
+
+// handleBackupProgressStream serves Server-Sent Events for real-time backup progress.
+func (r *Router) handleBackupProgressStream(w http.ResponseWriter, req *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		r.jsonError(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	// Disable server write timeout for this long-lived SSE connection.
+	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Time{})
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	pb := r.engine.ProgressBroker()
+	ch, unsub := pb.Subscribe()
+	defer unsub()
+
+	connectedEvent := models.ProgressEvent{
+		Type:      "connected",
+		Message:   "connected",
+		Timestamp: time.Now(),
+	}
+	if err := backup.WriteSSEEvent(w, connectedEvent); err != nil {
+		return
+	}
+	flusher.Flush()
+
+	runningID, memRunning := r.engine.RunningBackupID()
+	if memRunning && runningID > 0 {
+		rec, dbErr := r.db.BackupRepo.GetByID(runningID)
+		if dbErr != nil {
+			slog.Warn("failed to get running backup record for SSE",
+				"backup_id", runningID, "error", dbErr)
+		}
+		if rec != nil {
+			statusEvent := models.ProgressEvent{
+				Type:      "phase",
+				BackupID:  runningID,
+				Phase:     models.PhaseUploading,
+				PhaseName: "备份运行中",
+				Message:   fmt.Sprintf("备份 #%d 正在运行", runningID),
+				Timestamp: time.Now(),
+			}
+			_ = backup.WriteSSEEvent(w, statusEvent)
+			flusher.Flush()
+		}
+	}
+
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	ctx := req.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			fmt.Fprintf(w, ": heartbeat\n\n")
+			flusher.Flush()
+		case event, ok := <-ch:
+			if !ok {
+				return
+			}
+			if err := backup.WriteSSEEvent(w, event); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
 }
