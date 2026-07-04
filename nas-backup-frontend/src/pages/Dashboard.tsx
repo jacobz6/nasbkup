@@ -125,14 +125,15 @@ export function Dashboard() {
       const res = await dashboardApi.getStats();
       if (res.success && res.data) {
         setStats(res.data);
-        if (!res.data.active_backup_running && progress.isRunning) {
-          setProgress(prev => ({ ...prev, isRunning: false }));
+        // 用函数式更新检查 prev.isRunning，避免闭包陷阱。
+        if (!res.data.active_backup_running) {
+          setProgress(prev => prev.isRunning ? { ...prev, isRunning: false } : prev);
         }
       }
     } catch (e) {
       console.error('Failed to fetch stats:', e);
     }
-  }, [progress.isRunning]);
+  }, []);
 
   const fetchHistory = useCallback(async (p = page) => {
     try {
