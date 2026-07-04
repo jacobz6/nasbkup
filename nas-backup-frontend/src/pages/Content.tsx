@@ -280,8 +280,14 @@ function FileBrowser() {
         </div>
 
         {/* Right detail panel */}
-        {selectedEntry && (
-          <div className="w-72 border-l border-surface-3 bg-surface-2/20 p-5 flex flex-col gap-5 overflow-y-auto">
+        <div className="w-72 border-l border-surface-3 bg-surface-2/20 p-5 flex flex-col gap-5 overflow-y-auto">
+          {!selectedEntry ? (
+            <div className="flex flex-col items-center justify-center h-full text-slate-500 gap-2">
+              <FolderOpen size={32} strokeWidth={1} className="text-slate-600" />
+              <p className="text-sm">点击文件查看详情</p>
+            </div>
+          ) : (
+            <>
             {/* Entry info */}
             <div>
               <div className="flex items-center gap-2 mb-3">
@@ -388,8 +394,9 @@ function FileBrowser() {
                 </button>
               </div>
             )}
-          </div>
-        )}
+            </>
+          )}
+        </div>
       </div>
     </div>
   );

@@ -101,15 +101,12 @@ func (r *Router) handleBackupStatus(w http.ResponseWriter, req *http.Request) {
 
 // handleBackupProgressStream serves Server-Sent Events for real-time backup progress.
 func (r *Router) handleBackupProgressStream(w http.ResponseWriter, req *http.Request) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		r.jsonError(w, "streaming unsupported", http.StatusInternalServerError)
-		return
-	}
-
-	// Disable server write timeout for this long-lived SSE connection.
+	// 用 ResponseController 穿透中间件包装层（如 statusWriter），
+	// 获取底层的 Flusher 并禁用写超时。
 	rc := http.NewResponseController(w)
-	_ = rc.SetWriteDeadline(time.Time{})
+	if err := rc.SetWriteDeadline(time.Time{}); err != nil {
+		slog.Warn("failed to disable write deadline for SSE", "error", err)
+	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -128,7 +125,7 @@ func (r *Router) handleBackupProgressStream(w http.ResponseWriter, req *http.Req
 	if err := backup.WriteSSEEvent(w, connectedEvent); err != nil {
 		return
 	}
-	flusher.Flush()
+	_ = rc.Flush()
 
 	runningID, memRunning := r.engine.RunningBackupID()
 	if memRunning && runningID > 0 {
@@ -147,7 +144,7 @@ func (r *Router) handleBackupProgressStream(w http.ResponseWriter, req *http.Req
 				Timestamp: time.Now(),
 			}
 			_ = backup.WriteSSEEvent(w, statusEvent)
-			flusher.Flush()
+			_ = rc.Flush()
 		}
 	}
 
@@ -161,7 +158,7 @@ func (r *Router) handleBackupProgressStream(w http.ResponseWriter, req *http.Req
 			return
 		case <-ticker.C:
 			fmt.Fprintf(w, ": heartbeat\n\n")
-			flusher.Flush()
+			_ = rc.Flush()
 		case event, ok := <-ch:
 			if !ok {
 				return
@@ -169,7 +166,7 @@ func (r *Router) handleBackupProgressStream(w http.ResponseWriter, req *http.Req
 			if err := backup.WriteSSEEvent(w, event); err != nil {
 				return
 			}
-			flusher.Flush()
+			_ = rc.Flush()
 		}
 	}
 }
