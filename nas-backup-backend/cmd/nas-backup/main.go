@@ -72,7 +72,6 @@ func main() {
 
 	// Initialize components
 	sc := scanner.NewScanner(database.FileRepo, database.ConfigRepo)
-	dd := dedup.NewDeduplicator(database.HashRepo)
 	comp := compress.NewCompressor(cfg.ToModelsCompressionConfig())
 	enc, err := crypto.NewEncryptor(cfg.Backup.Encryption.KeyFilePath)
 	if err != nil {
@@ -90,6 +89,12 @@ func main() {
 		logger.Error("Failed to ensure rclone config: %v", err)
 		log.Fatalf("Failed to ensure rclone config: %v", err)
 	}
+
+	// Deduplicator is initialized after storage so it can verify OSS object
+	// existence before skipping a file whose hash already exists in the index.
+	// This prevents silent data loss when a previous crash left hash_index
+	// pointing to a missing OSS object.
+	dd := dedup.NewDeduplicator(database.HashRepo, stor, cfg.Storage.Concurrency)
 
 	// Initialize progress broker for real-time backup progress
 	pb := backup.NewProgressBroker()

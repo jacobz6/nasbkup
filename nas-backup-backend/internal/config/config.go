@@ -22,6 +22,7 @@ type AppConfig struct {
 	Rclone   RcloneConfig   `yaml:"rclone"`
 	Logging  LoggingConfig  `yaml:"logging"`
 	Reconcile ReconcileConfig `yaml:"reconcile"`
+	Storage   StorageConfig  `yaml:"storage"`
 }
 
 // ServerConfig defines the HTTP server parameters.
@@ -96,6 +97,16 @@ type RetentionConfig struct {
 type EncryptionConfig struct {
 	Algorithm   string `yaml:"algorithm"`
 	KeyFilePath string `yaml:"key_file_path"`
+}
+
+// StorageConfig controls batch / concurrent operations against OSS.
+// Used by ExistsBatch and DownloadBatch to right-size the worker pool for the
+// operator's network and OSS quota. Higher values speed up bulk checks and
+// restores but may hit rate-limits on shared buckets.
+type StorageConfig struct {
+	// Concurrency is the worker count for batch OSS operations (default 8).
+	// Values ≤ 0 fall back to the storage.DefaultBatchConcurrency constant.
+	Concurrency int `yaml:"concurrency"`
 }
 
 // ReconcileConfig controls the system sync / reconciliation feature that
@@ -212,6 +223,11 @@ func DefaultConfig() *AppConfig {
 		Reconcile: ReconcileConfig{
 			DryRun:        true,
 			OSSListPrefix: "data/",
+		},
+		// Storage defaults to 8 concurrent workers — the recommended
+		// value for Alibaba Cloud OSS to stay under rate-limits.
+		Storage: StorageConfig{
+			Concurrency: 8,
 		},
 	}
 }

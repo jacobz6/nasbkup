@@ -22,6 +22,12 @@ import (
 // aborting the restore mid-flight.
 const restoreTimeout = 4 * time.Hour
 
+// reconcileTimeout is the maximum duration for a reconciliation pass. Listing
+// all OSS objects + batch existence checks over a large bucket can take
+// several minutes, so use a detached context to avoid being killed by the
+// HTTP server's WriteTimeout (60s).
+const reconcileTimeout = 30 * time.Minute
+
 // handleRestore restores files from backup.
 func (r *Router) handleRestore(w http.ResponseWriter, req *http.Request) {
 	var restoreReq models.RestoreRequest
@@ -71,10 +77,17 @@ func (r *Router) handleRestore(w http.ResponseWriter, req *http.Request) {
 	r.jsonResponse(w, result, http.StatusOK)
 }
 
+// gcTimeout is the maximum duration for a garbage collection pass. Deleting
+// many orphan OSS objects can take several minutes; use a detached context
+// with a generous timeout.
+const gcTimeout = 30 * time.Minute
+
 // handleGarbageCollection triggers garbage collection asynchronously.
 func (r *Router) handleGarbageCollection(w http.ResponseWriter, req *http.Request) {
 	go func() {
-		if err := r.engine.RunGarbageCollection(context.Background()); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), gcTimeout)
+		defer cancel()
+		if err := r.engine.RunGarbageCollection(ctx); err != nil {
 			slog.Error("garbage collection failed", "error", err)
 			_ = r.db.LogRepo.Insert(nil, models.LogLevelError,
 				"garbage collection failed", err.Error())
@@ -111,7 +124,14 @@ func (r *Router) handleReconcile(w http.ResponseWriter, req *http.Request) {
 		dryRun = b
 	}
 
-	report, err := r.engine.Reconcile(req.Context(), dryRun)
+	// Use a detached context with a generous timeout: reconcile over a large
+	// bucket (listing all OSS objects, batch-checking failed backups) can take
+	// several minutes. Binding to req.Context() caused reconciliation to be
+	// cancelled when the server's WriteTimeout (60s) elapsed, aborting mid-fix.
+	ctx, cancel := context.WithTimeout(context.Background(), reconcileTimeout)
+	defer cancel()
+
+	report, err := r.engine.Reconcile(ctx, dryRun)
 	if err != nil {
 		// A running backup returns an error; surface it as 409 so the client
 		// can distinguish from a real failure.
@@ -166,4 +186,34 @@ func containsAny(haystack []string, substr string) bool {
 		}
 	}
 	return false
+}
+
+// handleStorageHealth verifies OSS connectivity by pinging the configured remote.
+// Returns 200 with status "ok" when the OSS remote responds, 503 with the
+// error message when it does not. Used by operators to verify that the OSS
+// configuration, credentials, and network path are all healthy.
+func (r *Router) handleStorageHealth(w http.ResponseWriter, req *http.Request) {
+	start := time.Now()
+	err := r.restorer.PingStorage(req.Context())
+	duration := time.Since(start)
+
+	if err != nil {
+		slog.Warn("storage health check failed",
+			"error", err, "duration", duration)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(models.APIResponse{
+			Success: false,
+			Error:   fmt.Sprintf("OSS unreachable: %v", err),
+			Data: map[string]interface{}{
+				"latency_ms": duration.Milliseconds(),
+			},
+		})
+		return
+	}
+
+	r.jsonResponse(w, map[string]interface{}{
+		"status":     "ok",
+		"latency_ms": duration.Milliseconds(),
+	}, http.StatusOK)
 }

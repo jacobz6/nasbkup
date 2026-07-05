@@ -14,7 +14,7 @@
    - 3.3 [数据模型 (models)](#33-数据模型-models)
    - 3.4 [数据库层 (db)](#34-数据库层-db)
    - 3.5 [API 路由与处理器 (api)](#35-api-路由与处理器-api)
-   - 3.6 [备份引擎 (backup)](#36-备份引擎-backup)
+   - 3.6 [备份引擎 (backup)](#36-备份引擎-backup)（含 SSE 进度推送 + 数据一致性对账）
    - 3.7 [文件扫描器 (scanner)](#37-文件扫描器-scanner)
    - 3.8 [去重模块 (dedup)](#38-去重模块-dedup)
    - 3.9 [压缩模块 (compress)](#39-压缩模块-compress)
@@ -49,11 +49,14 @@
 ### 核心设计理念
 
 - **内容寻址去重**：基于 SHA-256 哈希的全局去重索引，相同内容的文件只存储一份
-- **增量备份**：支持全量和增量两种备份模式，增量备份仅处理变更文件
+- **增量备份**：支持全量、增量和智能（auto）三种备份模式，增量备份仅处理变更文件，auto 模式基于时间间隔自动判断
 - **端到端加密**：AES-256-GCM 加密，使用 HKDF 派生每文件数据加密密钥（DEK）
 - **压缩优化**：zstd 压缩，智能跳过已压缩文件类型
 - **冷归档友好**：支持 OSS ColdArchive 存储类，含解冻（thaw）流程
 - **定时调度**：基于 cron 表达式的自动备份调度，自动判断全量/增量
+- **实时进度反馈**：基于 SSE 的实时备份进度推送，含阶段、百分比、当前文件、实时日志
+- **数据一致性保障**：三层数据一致性对账（OSS ↔ hash_index ↔ backup_files），支持 DryRun 审计和自动修复
+- **崩溃恢复**：启动时自动清理残留状态，全量备份重建映射，锁内双重检查防止竞态
 
 ### 技术栈
 
@@ -81,9 +84,14 @@ nasbkup_system/
 ├── nas-backup-backend/          # Go 后端服务
 │   ├── cmd/nas-backup/          # 程序入口
 │   │   └── main.go
+│   ├── cmd/restore-cli/         # 下云恢复 CLI 工具
 │   ├── internal/                # 内部包（不可被外部导入）
 │   │   ├── api/                 # HTTP API 层（路由 + 处理器）
-│   │   ├── backup/              # 备份引擎 + 恢复器
+│   │   ├── backup/              # 备份引擎 + 恢复器 + 进度推送 + 对账
+│   │   │   ├── engine.go        # 备份引擎核心
+│   │   │   ├── progress.go      # SSE 进度推送 Broker
+│   │   │   ├── reconcile.go     # 数据一致性对账修复
+│   │   │   └── restore.go       # 文件恢复器
 │   │   ├── compress/            # zstd 压缩/解压
 │   │   ├── config/              # 配置加载与验证
 │   │   ├── crypto/              # AES-256-GCM 加密/解密
@@ -107,8 +115,13 @@ nasbkup_system/
 │   │   │   └── ui/              # 基础 UI 组件
 │   │   ├── hooks/               # 自定义 Hooks
 │   │   ├── pages/               # 页面组件
+│   │   │   ├── Dashboard.tsx    # 全览页面（含进度条 + 实时日志）
+│   │   │   ├── Content.tsx      # 内容选择
+│   │   │   ├── Strategy.tsx     # 策略设置
+│   │   │   ├── Logs.tsx         # 日志查看
+│   │   │   └── Reconcile.tsx    # 系统对账
 │   │   ├── store/               # Zustand 状态
-│   │   ├── utils/               # 工具函数
+│   │   ├── utils/               # 工具函数（api.ts 含 SSE 客户端）
 │   │   ├── lib/                 # 通用库
 │   │   ├── App.tsx              # 路由配置
 │   │   ├── main.tsx             # 入口
@@ -116,6 +129,9 @@ nasbkup_system/
 │   ├── package.json
 │   ├── vite.config.ts
 │   └── tailwind.config.js
+├── docker/                      # Docker 部署配置（含 Nginx SSE 配置）
+│   ├── nginx.conf
+│   └── config.docker.yaml
 ├── DEPLOYMENT.md                # 生产部署指南
 ├── DEPLOYMENT_testenv.md        # 测试环境部署指南
 └── nas_file_generator.py        # 测试数据生成器
@@ -124,27 +140,32 @@ nasbkup_system/
 ### 架构分层
 
 ```
-┌─────────────────────────────────────────┐
-│           Frontend (React SPA)          │
-│  Dashboard / Content / Strategy / Logs  │
-└──────────────────┬──────────────────────┘
-                   │ HTTP API (JSON)
-┌──────────────────▼──────────────────────┐
-│            API Layer (api/)             │
-│  Router → Handlers → JSON Response      │
-└──────────────────┬──────────────────────┘
-                   │
-┌──────────────────▼──────────────────────┐
-│         Business Logic Layer            │
-│  Engine / Restorer / Scheduler          │
-│  Scanner / Dedup / Compress / Crypto    │
-└──────────┬──────────────┬───────────────┘
-           │              │
-┌──────────▼──────┐ ┌────▼──────────────┐
-│   Database      │ │   Storage         │
-│   (SQLite)      │ │   (rclone → OSS)  │
-│   db/ repos     │ │   storage/        │
-└─────────────────┘ └───────────────────┘
+┌─────────────────────────────────────────────────────┐
+│               Frontend (React SPA)                  │
+│  Dashboard / Content / Strategy / Logs / Reconcile  │
+│         (含 SSE EventSource 进度订阅)                │
+└────────────────────────┬────────────────────────────┘
+                         │ HTTP API (JSON) + SSE 实时流
+┌────────────────────────▼────────────────────────────┐
+│                API Layer (api/)                     │
+│  Router → Handlers → JSON Response                  │
+│  loggingMiddleware (4xx=WARN, 5xx=ERROR)            │
+│  SSE 端点: /api/backup/progress/stream              │
+└────────────────────────┬────────────────────────────┘
+                         │
+┌────────────────────────▼────────────────────────────┐
+│              Business Logic Layer                   │
+│  Engine / Restorer / Scheduler / ProgressBroker     │
+│  Scanner / Dedup / Compress / Crypto / Reconciler   │
+└──────────┬───────────────────────┬──────────────────┘
+           │                       │
+┌──────────▼──────┐        ┌───────▼──────────────┐
+│   Database      │        │   Storage            │
+│   (SQLite)      │        │   (rclone → OSS)     │
+│   db/ repos     │        │   storage/           │
+│  启动时清理      │        │  Health Check        │
+│  残留 running   │        │                      │
+└─────────────────┘        └──────────────────────┘
 ```
 
 ---
@@ -162,19 +183,22 @@ nasbkup_system/
 3. **初始化日志**：`logger.Init()` 设置日志级别、文件输出、轮转
 4. **创建数据目录**：`cfg.EnsureDataDirs()` 确保所有必要目录存在
 5. **打开数据库**：`db.Open()` 打开 SQLite 并运行迁移
-6. **初始化组件**：
+6. **清理崩溃残留状态**：`db.BackupRepo.CleanupStaleRunning()` 将上一次进程崩溃遗留的 `running`/`pending` 备份记录标记为 failed，避免新进程无法启动备份
+7. **初始化组件**：
    - `scanner.NewScanner(fileRepo, configRepo)` — 文件扫描器
-   - `dedup.NewDeduplicator(hashRepo)` — 去重器
    - `compress.NewCompressor(compressionConfig)` — 压缩器
    - `crypto.NewEncryptor(keyFilePath)` — 加密器
    - `storage.NewStorageManager(cfg)` — 存储管理器
-   - `backup.NewEngine(db, sc, dd, comp, enc, stor, cfg)` — 备份引擎
+   - `stor.EnsureRcloneConfig()` — 确保 rclone 配置存在
+   - `dedup.NewDeduplicator(hashRepo, stor, concurrency)` — 去重器（注入 storage 用于 OSS 存在性校验，防止崩溃后引用丢失对象）
+   - `backup.NewProgressBroker()` — SSE 进度推送 Broker
+   - `backup.NewEngine(db, sc, dd, comp, enc, stor, cfg, pb)` — 备份引擎（注入 ProgressBroker）
    - `backup.NewRestorer(db, enc, comp, stor, cfg)` — 恢复器
    - `scheduler.NewScheduler(engine, db, cfg)` — 调度器
-7. **启动调度器**（如果配置启用）：`sched.Start()`
-8. **创建 HTTP 路由**：`api.NewRouter()` + `router.Setup()`
-9. **启动 HTTP 服务器**：监听 `host:port`
-10. **优雅关闭**：捕获 SIGINT/SIGTERM，30 秒超时优雅关闭
+8. **启动调度器**（如果配置启用）：`sched.Start()`
+9. **创建 HTTP 路由**：`api.NewRouter()` + `router.Setup()`（注册 SSE 端点、Reconcile、Storage Health 等路由）
+10. **启动 HTTP 服务器**：监听 `host:port`。注意：SSE 端点通过 `http.NewResponseController` 动态禁用 `WriteTimeout` 以支持长连接
+11. **优雅关闭**：捕获 SIGINT/SIGTERM，30 秒超时优雅关闭
 
 ### 3.2 配置系统 (config)
 
@@ -188,7 +212,7 @@ AppConfig
 │   ├── Host              # 监听地址 (默认 "0.0.0.0")
 │   ├── Port              # 监听端口 (默认 8080)
 │   ├── ReadTimeout       # 读超时秒数 (默认 30)
-│   └── WriteTimeout      # 写超时秒数 (默认 60)
+│   └── WriteTimeout      # 写超时秒数 (默认 60, SSE端点动态禁用)
 ├── DatabaseConfig        # 数据库配置
 │   └── Path              # SQLite 文件路径 (默认 "./data/nas-backup.db")
 ├── BackupConfig          # 备份配置
@@ -199,6 +223,11 @@ AppConfig
 │   ├── Compression       # CompressionConfig — 压缩配置
 │   ├── Retention         # RetentionConfig — 保留策略
 │   └── Encryption        # EncryptionConfig — 加密配置
+├── StorageConfig         # OSS 批量操作并发配置
+│   └── Concurrency       # 批量 OSS 操作 worker 数 (默认 8)
+├── ReconcileConfig       # 数据一致性对账配置
+│   ├── DryRun            # 默认 dry-run 模式 (默认 true, 不自动修复)
+│   └── OSSListPrefix     # OSS 对象列表前缀 (默认 "data/")
 ├── OSSConfig             # 阿里云 OSS 配置
 │   ├── Endpoint          # OSS 端点
 │   ├── Bucket            # 存储桶名
@@ -265,7 +294,7 @@ AppConfig
 
 | 类型 | 字段 | 说明 |
 |------|------|------|
-| `BackupType` | `full` / `incremental` | 备份类型 |
+| `BackupType` | `full` / `incremental` / `auto` | 备份类型（auto 由系统自动判断全量/增量） |
 | `BackupStatus` | `pending` / `running` / `completed` / `failed` / `cancelled` | 备份状态 |
 | `BackupRecord` | ID, Type, Status, BaseBackupID, TotalFiles, TotalSize, UploadedSize, SkippedByDedup, SkippedByInc, CompressSaved, StartedAt, CompletedAt, ErrorMessage, CreatedAt | 备份会话记录 |
 
@@ -315,14 +344,37 @@ AppConfig
 
 | 类型 | 字段 | 说明 |
 |------|------|------|
-| `DashboardStats` | TotalFiles, TotalSize, BackedUpFiles, BackedUpSize, OSSStorageUsed, LastBackupTime, LastBackupStatus, NextBackupTime, SavedByDedup, SavedByCompress, ActiveBackupRunning | 仪表板统计 |
-| `BackupTriggerRequest` | Type | 触发备份请求 |
+| `OSSInfo` | StorageClass, Endpoint, Bucket, RemoteName, Region | OSS 配置信息（仪表板显示） |
+| `DashboardStats` | TotalFiles, TotalSize, OSSStorageUsed, OSSQuotaBytes, BackupCount, UniqueHashCount, NeedsReconcile, OSSInfo, LastBackupTime, LastBackupStatus, NextBackupTime, ActiveBackupRunning | 仪表板统计 |
+| `BackupTriggerRequest` | Type | 触发备份请求（支持 full/incremental/auto） |
 | `RestoreRequest` | Paths, Pattern, BackupID, OutputDir, Expedited | 恢复请求 |
 | `RestoreResult` | TotalFiles, RestoredFiles, FailedFiles, TotalSize, ElapsedMs | 恢复结果 |
-| `FSEntry` | Name, Path, IsDir, Size, ModTime, InBackup, HasUpdate, WillBackup | 文件系统条目 |
+| `FSEntry` | Name, Path, IsDir, Size, ModTime, InBackup, PartialBackup, HasUpdate, WillBackup | 文件系统条目（PartialBackup 表示目录部分纳入备份） |
 | `FSBrowseResult` | Path, ParentPath, Entries | 文件浏览结果 |
 | `APIResponse` | Success, Data, Error | 标准 API 响应 |
 | `PaginatedResponse` | Success, Data, Total, Page, Size | 分页 API 响应 |
+
+#### SSE 进度事件
+
+| 类型 | 字段 | 说明 |
+|------|------|------|
+| `BackupPhase` | `scanning`/`hashing`/`deduplicating`/`uploading`/`finalizing`/`completed`/`failed`/`cancelled` | 备份阶段 |
+| `ProgressEvent` | Type, BackupID, Phase, PhaseName, Current, Total, Percent, Message, Detail, Level, FilePath, FileSize, Timestamp | SSE 进度事件 |
+
+ProgressEvent.Type 取值：
+- `connected` — 连接建立
+- `phase` — 阶段切换
+- `progress` — 进度百分比更新
+- `file` — 当前处理文件
+- `log` — 实时日志条目
+
+#### 数据一致性对账报告
+
+| 类型 | 字段 | 说明 |
+|------|------|------|
+| `RefCountMismatch` | Hash, StoredInDB, ActualActive | ref_count 不匹配项 |
+| `BackupStatusFix` | BackupID, From, To, Reason | 备份状态修正建议 |
+| `ReconcileReport` | StartedAt, FinishedAt, Duration, DryRun, OSSOnlyOrphans, DanglingHashIndexesRefZero, DanglingHashIndexesRefNonZero, OrphanBackupFiles, BackupFilesMissingHashIndexButInOSS, RefCountMismatches, FailedBackupsWithFiles, CompletedBackupsNoFiles, AppliedFixes, SkippedFixes, Errors | 对账报告 |
 
 ### 3.4 数据库层 (db)
 
@@ -367,9 +419,11 @@ SQLite 性能优化 PRAGMA：
 | `GetByPath` | `(path) (*FileRecord, error)` | 按路径查询，未找到返回 nil |
 | `GetByHash` | `(hash) ([]*FileRecord, error)` | 按哈希查询所有活跃文件 |
 | `GetByID` | `(id) (*FileRecord, error)` | 按主键查询 |
-| `ListByStatus` | `(status, limit, offset) ([]*FileRecord, error)` | 按状态分页查询 |
+| `ListByStatus` | `(status, limit, offset) ([]*FileRecord, error)` | 按状态分页查询（limit=0 返回所有） |
 | `ListActiveByDirectory` | `(dirPath) ([]*FileRecord, error)` | 查询目录下所有活跃文件（LIKE dirPath/%） |
+| `ListActiveByBackup` | `(backupID, dirPath) ([]*FileRecord, error)` | 查询指定备份中某目录下的文件 |
 | `ListAllPaths` | `() ([]string, error)` | 列出所有文件路径 |
+| `CountActiveByHash` | `() (map[string]int, error)` | 按 hash 统计活跃文件数（用于对账 ref_count 校验） |
 | `MarkDeleted` | `(path) error` | 标记文件为已删除 |
 | `MarkDeletedBatch` | `(paths) error` | 批量标记删除（事务） |
 | `UpdateHash` | `(id, hash) error` | 更新文件哈希 |
@@ -384,16 +438,24 @@ SQLite 性能优化 PRAGMA：
 | `UpdateStatus` | `(id, status, errorMsg) error` | 更新状态，running 设置 started_at，completed/failed/cancelled 设置 completed_at |
 | `UpdateStats` | `(id, totalFiles, totalSize, uploadedSize, skippedDedup, skippedInc, compressSaved) error` | 更新备份统计 |
 | `GetByID` | `(id) (*BackupRecord, error)` | 按主键查询 |
-| `List` | `(limit, offset) ([]*BackupRecord, error)` | 分页查询，按 created_at DESC |
+| `GetRunning` | `() (*BackupRecord, error)` | 获取当前 running 状态的备份记录 |
+| `CleanupStaleRunning` | `() (int64, error)` | 启动时清理崩溃残留的 running/pending 记录，标记为 failed |
+| `List` | `(limit, offset) ([]*BackupRecord, error)` | 分页查询，按 created_at DESC（返回总数用于分页） |
 | `GetLatestCompleted` | `() (*BackupRecord, error)` | 获取最近完成的备份 |
 | `GetLatestFull` | `() (*BackupRecord, error)` | 获取最近完成的全量备份 |
 | `GetIncrementalsSinceFull` | `(fullBackupID) ([]*BackupRecord, error)` | 获取基于指定全量的增量备份 |
 | `CountByStatus` | `(status) (int64, error)` | 按状态计数 |
+| `Count` | `() (int64, error)` | 统计备份总数 |
+| `ListFailedBackupsWithFiles` | `() ([]*BackupRecord, error)` | 列出有 backup_files 但状态为 failed 的备份（对账用） |
+| `ListCompletedBackupsWithoutFiles` | `() ([]*BackupRecord, error)` | 列出状态为 completed 但无 backup_files 的备份（对账用） |
 | `AddBackupFile` | `(bf) error` | 添加单条备份-文件关联 |
 | `AddBackupFilesBatch` | `(bfs) error` | 批量添加备份-文件关联（事务） |
 | `GetBackupFiles` | `(backupID) ([]*BackupFileRecord, error)` | 获取备份的所有文件关联 |
 | `GetFileRestoreInfo` | `(fileID) (*BackupFileRecord, error)` | 获取文件最新恢复信息 |
-| `IsRunning` | `() (bool, error)` | 检查是否有运行中的备份 |
+| `GetBackupFileByFileID` | `(fileID) (*BackupFileRecord, error)` | 按文件 ID 获取备份文件记录 |
+| `ListAllBackupFileStorageKeys` | `() (map[string]int, error)` | 获取所有 backup_files 的 storage_key 及引用计数（对账用） |
+| `DeleteBackupFilesByStorageKey` | `(storageKey) (int64, error)` | 按 storage_key 删除孤立的 backup_files 记录 |
+| `IsRunning` | `() (bool, error)` | 检查是否有运行中的备份（内存+DB双重检查） |
 
 #### HashRepository
 
@@ -402,11 +464,16 @@ SQLite 性能优化 PRAGMA：
 | `GetByHash` | `(hash) (*HashIndexRecord, error)` | 按哈希查询 |
 | `Upsert` | `(hash, fileSize, storageKey) (int64, error)` | 插入或递增 ref_count |
 | `IncrementRef` | `(hash) error` | 递增引用计数 |
-| `DecrementRef` | `(hash) (int, error)` | 递减引用计数（不低于0），返回新值 |
+| `DecrementRef` | `(hash) (int, error)` | 递减引用计数（事务内，不低于0），返回新值 |
+| `SetRefCount` | `(hash, count) error` | 直接设置引用计数（对账修复用） |
+| `HasRefCountMismatches` | `() (bool, error)` | 快速检查是否存在 ref_count 不匹配（轻量级，不列 OSS） |
+| `ListAll` | `() ([]*HashIndexRecord, error)` | 列出所有哈希索引记录（对账用） |
 | `GetOrphans` | `() ([]*HashIndexRecord, error)` | 获取 ref_count=0 的孤儿记录 |
 | `GetOrphansOlderThan` | `(days) ([]*HashIndexRecord, error)` | 获取超过指定天数的孤儿记录 |
 | `DeleteByHash` | `(hash) error` | 按哈希删除 |
+| `DeleteByStorageKey` | `(storageKey) error` | 按 storage_key 删除悬空索引 |
 | `DeleteBatch` | `(hashes) error` | 批量删除（事务） |
+| `CountUnique` | `() (int64, error)` | 统计唯一哈希数 |
 | `TotalDedupSaved` | `() (int64, error)` | 计算去重节省的总字节数 |
 | `GetAllStorageKeys` | `() ([]string, error)` | 获取所有存储键 |
 
@@ -456,17 +523,18 @@ type Router struct {
 }
 ```
 
-#### 辅助函数
+#### 辅助函数与中间件
 
 | 函数 | 签名 | 说明 |
 |------|------|------|
 | `jsonResponse` | `(w, data, status)` | 写入成功 JSON 响应 |
 | `jsonPaginatedResponse` | `(w, data, total, page, size)` | 写入分页 JSON 响应 |
-| `jsonError` | `(w, message, status)` | 写入错误 JSON 响应 |
-| `parsePagination` | `(req) (page, size)` | 从查询参数提取分页，默认 page=1, size=20 |
+| `jsonError` | `(w, message, status)` | 写入错误 JSON 响应（4xx=WARN 日志，5xx=ERROR 日志） |
+| `parsePagination` | `(req) (page, size)` | 从查询参数提取分页，默认 page=1, size=20，size 硬上限 200 |
 | `parseStringSlice` | `(s) []string` | 逗号分隔字符串转切片 |
 | `formatStringSlice` | `(parts) string` | 切片转逗号分隔字符串 |
 | `corsMiddleware` | `(next) http.Handler` | CORS 中间件，允许所有来源 |
+| `loggingMiddleware` | `(next) http.Handler` | HTTP 请求日志中间件：记录方法/路径/状态码/耗时，4xx→WARN，5xx→ERROR |
 
 #### 处理器详解
 
@@ -474,9 +542,10 @@ type Router struct {
 
 | 处理器 | 请求 | 说明 |
 |--------|------|------|
-| `handleBackupTrigger` | `POST /api/backup/trigger` | 触发备份，body: `{type: "full"/"incremental"}`，返回 `{backup_id, status}` |
-| `handleBackupCancel` | `POST /api/backup/cancel?backup_id=X` | 取消备份，backup_id 可选（不传则自动查找运行中的） |
-| `handleBackupStatus` | `GET /api/backup/status` | 获取当前备份状态，返回 `{is_running, running_backup}` |
+| `handleBackupTrigger` | `POST /api/backup/trigger` | 触发备份，body: `{type: "full"/"incremental"/"auto"}`（auto 由系统自动判断），返回 `{backup_id, status}`（202 Accepted） |
+| `handleBackupCancel` | `POST /api/backup/cancel?backup_id=X` | 取消备份，backup_id 可选（不传则自动查找内存中的，再查 DB 残留记录） |
+| `handleBackupStatus` | `GET /api/backup/status` | 获取当前备份状态（OR 逻辑：内存 running 或 DB running），返回 `{is_running, running_backup}` |
+| `handleBackupProgressStream` | `GET /api/backup/progress/stream` | **SSE 实时进度流**：15 秒心跳保活，连接时回放历史事件，推送 phase/progress/file/log 事件。Nginx 需配置 `proxy_buffering off` 和 1 小时超时 |
 
 **dashboard_handler.go**
 
@@ -491,10 +560,10 @@ type Router struct {
 |--------|------|------|
 | `handleListDirectories` | `GET /api/content/directories` | 列出所有备份目录 |
 | `handleAddDirectory` | `POST /api/content/directories` | 添加备份目录，body: BackupDirectory |
-| `handleUpdateDirectory` | `PUT /api/content/directories/{id}` | 更新备份目录 |
+| `handleUpdateDirectory` | `PATCH /api/content/directories/{id}` | 更新备份目录（PATCH 语义：只更新提供的字段，启用/禁用切换只需传 `{enabled: true/false}`） |
 | `handleDeleteDirectory` | `DELETE /api/content/directories/{id}` | 删除备份目录 |
 | `handleListExclusions` | `GET /api/content/exclusions` | 列出所有排除规则 |
-| `handleAddExclusion` | `POST /api/content/exclusions` | 添加排除规则，body: ExclusionRule |
+| `handleAddExclusion` | `POST /api/content/exclusions` | 添加排除规则，body: ExclusionRule（必须包含 pattern 字段） |
 | `handleUpdateExclusion` | `PUT /api/content/exclusions/{id}` | 更新排除规则 |
 | `handleDeleteExclusion` | `DELETE /api/content/exclusions/{id}` | 删除排除规则 |
 
@@ -538,12 +607,14 @@ type Router struct {
 
 | 处理器 | 请求 | 说明 |
 |--------|------|------|
-| `handleRestore` | `POST /api/restore` | 恢复文件，body: RestoreRequest |
+| `handleRestore` | `POST /api/restore` | 恢复文件，body: RestoreRequest（使用独立 4h 超时 context，客户端断连不中断） |
 | `handleGarbageCollection` | `POST /api/gc` | 异步触发垃圾回收 |
+| `handleReconcile` | `POST /api/reconcile?dry_run=true/false` | **数据一致性对账**：同步检查 OSS ↔ hash_index ↔ backup_files ↔ 备份状态。dry_run=true 仅报告不修复，备份运行中返回 409 Conflict |
+| `handleStorageHealth` | `GET /api/storage/health` | **OSS 连通性健康检查**：ping OSS 验证配置/凭证/网络，返回延迟 ms，不可用时返回 503 |
 
 ### 3.6 备份引擎 (backup)
 
-**文件**: `internal/backup/engine.go`, `restore.go`
+**文件**: `internal/backup/engine.go`, `restore.go`, `progress.go`, `reconcile.go`
 
 #### Engine 结构体
 
@@ -557,7 +628,8 @@ type Engine struct {
     storage    *storage.StorageManager
     config     *config.AppConfig
     logger     *slog.Logger
-    mu             sync.Mutex
+    progress   *ProgressBroker       // SSE 进度推送
+    mu         sync.Mutex
     runningBackupID int64
     cancelFuncs    map[int64]context.CancelFunc
 }
@@ -567,27 +639,50 @@ type Engine struct {
 
 | 方法 | 签名 | 说明 |
 |------|------|------|
-| `NewEngine` | `(db, sc, dd, comp, enc, stor, cfg) *Engine` | 创建引擎 |
-| `RunFullBackup` | `(ctx) error` | 同步执行全量备份 |
-| `RunIncrementalBackup` | `(ctx) error` | 同步执行增量备份 |
-| `StartBackup` | `(backupType) (int64, error)` | 异步启动备份，返回 backupID |
+| `NewEngine` | `(db, sc, dd, comp, enc, stor, cfg, pb) *Engine` | 创建引擎（注入 ProgressBroker） |
+| `ProgressBroker` | `() *ProgressBroker` | 获取进度 Broker 供 SSE 订阅 |
+| `RunFullBackup` | `(ctx) error` | 同步执行全量备份（锁内双重检查内存+DB状态） |
+| `RunIncrementalBackup` | `(ctx) error` | 同步执行增量备份（锁内双重检查内存+DB状态） |
+| `determineBackupType` | `() (BackupType, *int64, error)` | 自动判断全量/增量（基于 full_reset_interval） |
+| `StartBackup` | `(backupType) (int64, error)` | 异步启动备份（支持 type=auto），锁内完成状态检查和记录创建防止竞态 |
 | `Cancel` | `(backupID) error` | 取消运行中的备份 |
 | `RunningBackupID` | `() (int64, bool)` | 获取当前运行中的备份 ID |
+| `NeedsReconcile` | `() bool` | 轻量级一致性检查（不列 OSS，检查 ref_count 漂移和状态错误） |
+| `Reconcile` | `(ctx, dryRun) (*ReconcileReport, error)` | 执行完整数据一致性对账 |
 | `RunGarbageCollection` | `(ctx) error` | 执行垃圾回收 |
 
-#### 备份执行流程 (`executeBackup`)
+#### 并发安全与崩溃恢复
+
+- **互斥锁保护**：`StartBackup`/`RunFullBackup`/`RunIncrementalBackup` 在 `mu.Lock()` 内同时检查内存 `runningBackupID` 和数据库 `IsRunning()`，双重检查防止并发竞态
+- **启动时清理**：main 启动时调用 `CleanupStaleRunning()` 将残留 running/pending 标记为 failed
+- **取消兜底**：`handleBackupCancel` 若内存中找不到运行备份，会检查 DB 残留记录并清理
+- **全量备份重建映射**：全量备份将 Unchanged 文件重写为 Modified 处理，确保崩溃后重建 hash_index ↔ OSS 映射
+- **同批次去重元数据**：使用 `pendingByHash` map 暂存本批次上传文件的加密/压缩元数据，供同批次去重文件复用
+
+#### 备份执行流程 (`executeBackup`) 与进度加权
 
 ```
 Phase 1: 更新状态为 running
-Phase 2: 扫描目录 (scanner.Scan)
+         → 推送 phase=scanning 事件
+Phase 2: 扫描目录 (scanner.ScanWithProgress)
+         → 进度 0-5%（对数曲线估算，扫描中每 500 文件记日志）
 Phase 3: 计算哈希 (scanner.ComputeHashes)
-Phase 4: 按变更类型分类 (Added/Modified/Deleted/Unchanged)
+         → 进度 5-30%，逐文件推送 file + log 事件（仅SSE，不写DB）
+Phase 4: 按变更类型分类
+         → 全量: Unchanged → Modified（重建映射）
+         → 增量: Unchanged 跳过 (skippedInc++)
 Phase 5: 去重 (dedup.Deduplicate)
+         → 进度 30-35%
 Phase 6: 处理需上传文件 (compress → encrypt → upload → verify)
-Phase 7: 处理去重跳过的文件 (更新引用计数)
+         → 处理去重跳过文件（同批次从 pendingByHash 取元数据，跨批次查 DB）
+         → 进度 35-95%，逐文件推送详细日志
+Phase 7: (已合并到 Phase 6)
 Phase 8: 批量写入 backup_files 关联
-Phase 9: 标记已删除文件并递减引用计数
+Phase 9: 标记已删除文件并递减引用计数（事务内安全递减）
+         → 进度 95-100%
 Phase 10: 更新备份统计
+结束: 推送 completed/failed/cancelled 事件
+     → 30 秒后清空 ProgressBroker 历史缓冲
 ```
 
 #### 单文件处理流程 (`processAndUploadFile`)
@@ -595,12 +690,13 @@ Phase 10: 更新备份统计
 ```
 1. Upsert 文件记录获取 fileID
 2. 判断是否需要压缩 (ShouldCompress)
-3. 如需压缩: zstd 压缩到临时文件
-4. AES-256-GCM 加密到临时文件
-5. 生成存储键: data/{YYYYMMDD}-{type}/{hash_prefix}/{hash}.enc
-6. 通过 rclone 上传到 OSS
-7. 验证上传 (Exists 检查)
-8. Upsert 哈希索引记录
+3. 如需压缩: zstd 压缩到临时文件（推送日志）
+4. AES-256-GCM 加密到临时文件（推送日志）
+5. Stat 加密文件获取 storedSize
+6. 生成存储键: data/{YYYYMMDD}-{type}/{hash_prefix}/{hash}.enc
+7. 通过 rclone 上传到 OSS（推送日志）
+8. 验证上传 (Exists 检查，推送日志)
+9. Upsert 哈希索引记录（推送日志）
 ```
 
 #### Restorer 结构体
@@ -636,6 +732,66 @@ type Restorer struct {
 5. SHA-256 哈希验证
 6. 移动到输出目录
 ```
+
+#### ProgressBroker - SSE 进度推送 (`progress.go`)
+
+```go
+type ProgressBroker struct {
+    clients    map[chan models.ProgressEvent]struct{}
+    history    []models.ProgressEvent
+    historyMax int
+    mu         sync.RWMutex
+    logger     *slog.Logger
+}
+```
+
+| 方法 | 签名 | 说明 |
+|------|------|------|
+| `NewProgressBroker` | `(logger) *ProgressBroker` | 创建 Broker，默认保留 200 条历史 |
+| `Subscribe` | `() (<-chan event, history, unsub func)` | 订阅事件：返回只读 channel、历史事件回放、取消订阅函数 |
+| `Publish` | `(event)` | 推送事件给所有订阅者（非阻塞发送，channel 满则丢弃并警告） |
+| `ClearHistory` | `()` | 清空历史缓冲（备份完成 30 秒后调用） |
+
+**SSE 事件格式**：
+```
+event: progress
+data: {"type":"progress","phase":"uploading","current":150,"total":200,"percent":75,"message":"上传中...","timestamp":"..."}
+
+: heartbeat (每 15 秒)
+```
+
+**前端订阅**：使用 `EventSource` 连接 `/api/backup/progress/stream`，自动重连。
+
+#### Reconciler - 数据一致性对账 (`reconcile.go`)
+
+检查和修复三层数据的一致性问题：OSS 对象存储 ↔ hash_index（引用计数） ↔ backup_files（备份-文件关联）。
+
+| 方法 | 签名 | 说明 |
+|------|------|------|
+| `Reconcile` | `(ctx, dryRun) (*ReconcileReport, error)` | 执行完整对账 |
+
+**检查项（6 类不一致）**：
+
+| 问题类型 | 说明 | DryRun 修复行为 |
+|----------|------|-----------------|
+| OSSOnlyOrphans | OSS 有对象但 hash_index 无记录（不自动删除，需要人工确认） | 不自动修复，记录告警 |
+| DanglingHashIndexesRefZero | hash_index 有记录但 ref_count=0 且 OSS 无对应对象 | 自动删除 hash_index 记录 |
+| DanglingHashIndexesRefNonZero | hash_index 有记录且 ref_count>0 但 OSS 无对应对象 | 不自动修复，记录错误 |
+| OrphanBackupFiles | backup_files 有记录但 hash_index 无对应条目 | 自动删除 orphan backup_files 记录 |
+| BackupFilesMissingHashIndexButInOSS | backup_files 指向的 hash_index 不存在但 OSS 有对象 | 自动重建 hash_index 记录（ref_count=1） |
+| RefCountMismatches | hash_index.ref_count 与实际活跃文件数不一致 | 自动修正 ref_count |
+| FailedBackupsWithFiles | 备份状态为 failed 但有 backup_files 记录 | 自动修正为 completed 或清理孤立文件 |
+| CompletedBackupsNoFiles | 备份状态为 completed 但无 backup_files 记录 | 自动修正为 failed |
+
+**关键约束**：
+- 备份运行中（锁被持有）时拒绝执行，返回 409 Conflict
+- DryRun=true 只检查不修改数据库/OSS
+- 修复操作在事务中执行
+- OSS 上的孤儿对象不会自动删除（避免误删），仅记录在报告中
+
+**并发控制**：`Reconcile` 方法内部会 `engine.mu.Lock()` 获取备份锁，确保与备份任务互斥。
+
+**轻量级检查**：`NeedsReconcile()` 不列 OSS，仅检查 DB 层 ref_count 漂移和备份状态错误，用于仪表板快速提示。
 
 ### 3.7 文件扫描器 (scanner)
 
@@ -848,6 +1004,7 @@ type StorageManager struct {
 | `RestoreObject` | `(remoteKey, expedited) error` | 发起解冻请求（OSS SDK） |
 | `CheckRestored` | `(remoteKey) (bool, error)` | 检查对象是否已解冻（检查 X-Oss-Restore 头） |
 | `GetStorageUsage` | `() (int64, error)` | 获取存储使用量（rclone size） |
+| `Ping` | `(ctx) (latencyMs int64, err error)` | OSS 连通性健康检查：向临时文件 `._health_check` 写入 1 字节并删除，测量延迟 |
 | `FindRcloneBinary` | `() string` | 查找 rclone 二进制 |
 
 #### 重试机制
@@ -940,7 +1097,8 @@ BrowserRouter
     ├── /           → Dashboard (全览)
     ├── /content    → Content (内容选择)
     ├── /strategy   → Strategy (策略设置)
-    └── /logs       → Logs (日志)
+    ├── /logs       → Logs (日志)
+    └── /reconcile  → Reconcile (数据一致性对账)
 ```
 
 ### 4.3 状态管理 (Zustand)
@@ -982,13 +1140,14 @@ API_BASE = `/api`（开发环境代理到后端）
 |------|------|-------------|
 | `dashboardApi` | `getStats()` | GET /dashboard/stats |
 | | `getHistory(page, size)` | GET /dashboard/history |
-| `backupApi` | `trigger(type)` | POST /backup/trigger |
+| `backupApi` | `trigger(type)` | POST /backup/trigger（type 支持 full/incremental/auto） |
 | | `cancel(backupId?)` | POST /backup/cancel |
 | | `getStatus()` | GET /backup/status |
+| | `getProgressStreamUrl()` | 返回 SSE 端点 URL `/api/backup/progress/stream` |
 | `fsApi` | `browse(path)` | GET /fs/browse |
 | `directoryApi` | `list()` | GET /content/directories |
 | | `create(data)` | POST /content/directories |
-| | `update(id, data)` | PUT /content/directories/{id} |
+| | `update(id, data)` | PATCH /content/directories/{id}（PATCH 语义） |
 | | `delete(id)` | DELETE /content/directories/{id} |
 | `exclusionApi` | `list()` | GET /content/exclusions |
 | | `create(data)` | POST /content/exclusions |
@@ -1007,10 +1166,12 @@ API_BASE = `/api`（开发环境代理到后端）
 | `logApi` | `list(params)` | GET /logs |
 | | `get(id)` | GET /logs/{id} |
 | `gcApi` | `trigger()` | POST /gc |
+| `reconcileApi` | `run(dryRun?)` | POST /api/reconcile?dry_run=true/false |
+| `storageApi` | `health()` | GET /api/storage/health |
 
 #### TypeScript 类型定义
 
-前端定义了与后端 models 对应的 TypeScript 接口：`DashboardStats`, `BackupRecord`, `BackupStatus`, `BackupDirectory`, `ExclusionRule`, `ScheduleConfig`, `CompressionConfig`, `UploadConfig`, `RetentionConfig`, `EncryptionConfig`, `LogRecord`, `LogQueryParams`, `FSEntry`, `FSBrowseResult`
+前端定义了与后端 models 对应的 TypeScript 接口：`DashboardStats`（含 `ossInfo`/`ossQuotaBytes`/`backupCount`/`uniqueHashCount`/`needsReconcile`），`BackupRecord`，`BackupStatus`，`BackupType`（新增 `auto`），`BackupDirectory`，`ExclusionRule`，`ScheduleConfig`，`CompressionConfig`，`UploadConfig`（含 `concurrency`），`RetentionConfig`（含 `deletedRetentionDays`），`EncryptionConfig`，`LogRecord`，`LogQueryParams`，`FSEntry`（含 `partialBackup`），`FSBrowseResult`，`ProgressEvent`，`BackupPhase`，`ReconcileReport`，`RefCountMismatch`，`StorageHealthResult`。
 
 ### 4.5 页面详解
 
@@ -1019,18 +1180,26 @@ API_BASE = `/api`（开发环境代理到后端）
 **功能**: 系统全览，备份操作入口
 
 **布局**:
-1. **状态横幅**: 显示备份运行状态（运行中/空闲）、上次备份时间、下次备份时间
-2. **仪表盘图表** (3 列): OSS 存储使用率、去重节省、压缩节省
-3. **统计卡片** (4 列): 活跃文件数、已备份文件数、总文件大小、已备份大小
-4. **操作按钮**: 全量备份、增量备份、取消备份、垃圾回收
-5. **备份历史表格**: ID、类型、状态、文件数、大小、上传量、去重跳过、开始/完成时间
-6. **分页组件**
+1. **状态横幅**: 显示备份运行状态（运行中/空闲，含进度条和阶段名）、上次备份时间、下次备份时间
+   - 运行中时：展示当前阶段（scanning→hashing→uploading→finalizing）、百分比进度条、实时日志尾行（SSE）
+   - idle 时：显示 SSE 连接状态指示
+2. **对账告警横幅**: `stats.needsReconcile` 为 true 时显示黄色警告，提示用户前往对账页
+3. **仪表盘图表** (3 列): OSS 存储使用率（含配额/已用/总节省）、去重节省、压缩节省
+4. **统计卡片** (4 列): 备份总数、唯一哈希数、活跃文件数、OSS 使用量
+5. **OSS 信息卡片**: 显示存储类型、Endpoint、Bucket、Region
+6. **操作按钮**: 一键备份（auto 类型）、全量备份、取消备份、垃圾回收、数据对账
+7. **备份历史表格**: ID、类型（full/inc/auto）、状态（彩色徽章）、文件数、大小、上传量、去重跳过、开始/完成时间
+8. **分页组件**
 
-**数据刷新**: 使用 `usePolling` 每 5 秒轮询，备份运行中时自动启用
+**数据刷新**:
+- idle 状态：每 10 秒轮询
+- 备份运行中：**优先使用 SSE 实时推送**，不依赖轮询；断开时降级为 2 秒轮询
+- SSE 进度流通过 `useBackupProgress` Hook 订阅，自动重连
 
 **交互**:
-- 触发备份前无需确认，直接调用 API
+- "一键备份"按钮调用 `trigger('auto')`，系统自动判断全量/增量
 - 取消备份和垃圾回收前弹出确认对话框
+- OSS 信息可一键复制
 
 #### Content 页面 (`src/pages/Content.tsx`)
 
@@ -1039,7 +1208,7 @@ API_BASE = `/api`（开发环境代理到后端）
 **布局**:
 1. **文件浏览器** (FileBrowser 组件):
    - 面包屑导航
-   - 文件列表表格（名称、大小、备份状态）
+   - 文件列表表格（名称、大小、备份状态标签：已备份/部分备份/未备份/有更新）
    - 右侧详情面板（文件信息、备份状态、操作按钮）
    - 操作: 设为备份目录、禁用/启用备份、移除备份目录、进入目录
 2. **排除规则表格**: 模式、类型（扩展名/目录/模式/大小超限）、启用状态、操作
@@ -1050,19 +1219,20 @@ API_BASE = `/api`（开发环境代理到后端）
 - 双击目录进入
 - 目录可直接设为备份目标或移除
 - 排除规则支持增删改和启用/禁用
+- 目录状态徽章：完全纳入备份（绿色）/部分纳入（黄色，子目录有不同设置）/未备份（灰色）
 
 #### Strategy 页面 (`src/pages/Strategy.tsx`)
 
 **功能**: 备份策略配置
 
 **布局** (5 个配置卡片):
-1. **调度配置**: 启用开关、Cron 表达式、时区选择
-2. **压缩配置**: 启用开关、算法（只读）、压缩级别滑块 (1-22)、跳过类型标签管理
-3. **上传配置**: 存储类型选择、并发数、分块大小、重试次数、重试延迟
+1. **调度配置**: 启用开关、Cron 表达式、时区选择（含常见预设：每小时/每天/每周/每月/自定义）
+2. **压缩配置**: 启用开关、算法（只读 zstd）、压缩级别滑块 (1-22)、跳过类型标签管理
+3. **上传配置**: 存储类型选择（标准/低频/归档/冷归档）、OSS 并发数（1-10）、上传分块大小、重试次数、重试延迟
 4. **保留策略**: 版本保留数、孤儿数据清理天数、全量备份间隔(月)、已删除文件保留天数
-5. **加密配置**: 算法（只读）、密钥文件路径
+5. **加密配置**: 算法（只读 AES-256-GCM）、密钥文件路径
 
-每个卡片有独立的保存按钮。
+每个卡片有独立的保存按钮。配置变更后提示用户重新加载或应用。
 
 #### Logs 页面 (`src/pages/Logs.tsx`)
 
@@ -1078,6 +1248,29 @@ API_BASE = `/api`（开发环境代理到后端）
 - 点击详情按钮展开/折叠日志详情
 - 级别颜色: DEBUG=灰, INFO=蓝, WARN=黄, ERROR=红
 
+#### Reconcile 页面 (`src/pages/Reconcile.tsx`)
+
+**功能**: 数据一致性对账（诊断与修复）
+
+**布局**:
+1. **操作栏**: "执行对账检查（Dry Run）"按钮、"执行修复"按钮（红色）、健康状态指示器
+2. **上次检查结果摘要**: 执行时间、耗时、DryRun 标识、发现问题总数/已修复数/错误数
+3. **问题分类卡片**（按问题类型分块）:
+   - OSS 孤儿对象（仅告警，不自动删除）
+   - 悬空哈希索引（ref=0，无OSS对象）
+   - ref_count 不匹配项
+   - 孤立 backup_files 记录
+   - 备份状态异常
+   - 每个分类显示数量和详情列表（hash/路径/原因）
+4. **实时日志面板**: 对账执行过程中的实时输出
+5. **存储健康检查**: OSS 连通性状态、延迟 ms
+
+**交互**:
+- Dry Run 按钮：只读检查，不修改数据
+- 修复按钮：执行对账并自动修复可修复项，需二次确认
+- 执行中按钮置灰，显示加载状态
+- 对账完成后各问题卡片展开显示详情，已修复项标记为绿色
+
 ### 4.6 组件详解
 
 #### 布局组件
@@ -1088,7 +1281,7 @@ API_BASE = `/api`（开发环境代理到后端）
 - 右上角 Toast 通知区域（4 秒自动消失）
 
 **Sidebar** (`src/components/layout/Sidebar.tsx`)
-- 4 个导航项: 全览(/)、内容选择(/content)、策略设置(/strategy)、日志(/logs)
+- 5 个导航项: 全览(/)、内容选择(/content)、策略设置(/strategy)、日志(/logs)、数据对账(/reconcile)
 - 底部折叠/展开按钮
 - 活跃路由高亮
 
@@ -1141,6 +1334,29 @@ function usePolling<T>(
 
 轮询 Hook，enabled 变化时自动启动/停止。
 
+**useBackupProgress** (`src/hooks/useBackupProgress.ts`)
+
+```typescript
+function useBackupProgress(onEvent?: (event: ProgressEvent) => void): {
+  events: ProgressEvent[];      // 历史事件列表
+  connected: boolean;           // SSE 连接状态
+  currentPhase: BackupPhase | null;
+  percent: number;              // 0-100
+  currentFile: string | null;
+  latestMessage: string | null;
+}
+```
+
+SSE 实时进度订阅 Hook：
+- 自动管理 EventSource 生命周期（连接/重连/断开）
+- 回放历史事件，接收实时 phase/progress/file/log 事件
+- 备份完成后 30 秒自动清空缓冲
+- 连接断开时自动重连（浏览器原生 EventSource 行为）
+
+**useConfirm** (`src/hooks/useConfirm.ts`)
+
+全局确认对话框 Hook，返回 `{ confirm, ConfirmDialog }`，`confirm(message): Promise<boolean>` 用于异步确认操作。
+
 ### 4.8 工具函数
 
 **format.ts** (`src/utils/format.ts`)
@@ -1158,11 +1374,12 @@ function usePolling<T>(
 | 常量 | 说明 |
 |------|------|
 | `BACKUP_STATUS_MAP` | 备份状态中文映射 + 颜色 |
-| `BACKUP_TYPE_MAP` | 备份类型中文映射 + 颜色 |
+| `BACKUP_TYPE_MAP` | 备份类型中文映射 + 颜色（含 auto→智能） |
 | `LOG_LEVEL_MAP` | 日志级别映射 + 颜色 + 背景 |
 | `EXCLUSION_TYPE_MAP` | 排除规则类型中文映射 |
-| `STORAGE_CLASS_MAP` | 存储类型中文映射 |
-| `TIMEZONE_OPTIONS` | 时区选项列表 |
+| `STORAGE_CLASS_MAP` | 存储类型中文映射（标准/低频/归档/冷归档） |
+| `TIMEZONE_OPTIONS` | 时区选项列表（含 Asia/Shanghai 等） |
+| `BACKUP_PHASE_MAP` | 备份阶段中文映射（扫描/计算哈希/去重/上传/完成等） |
 
 **lib/utils.ts** (`src/lib/utils.ts`)
 
@@ -1198,7 +1415,7 @@ function usePolling<T>(
 | 列 | 类型 | 约束 | 说明 |
 |----|------|------|------|
 | id | INTEGER | PK AUTOINCREMENT | 主键 |
-| type | TEXT | NOT NULL CHECK(full/incremental) | 备份类型 |
+| type | TEXT | NOT NULL CHECK(full/incremental/auto) | 备份类型（auto 由系统判断） |
 | status | TEXT | NOT NULL DEFAULT 'pending' CHECK(pending/running/completed/failed/cancelled) | 状态 |
 | base_backup_id | INTEGER | | 基础全量备份 ID |
 | total_files | INTEGER | NOT NULL DEFAULT 0 | 总文件数 |
@@ -1299,9 +1516,10 @@ function usePolling<T>(
 
 | 方法 | 路径 | 请求 | 响应 | 说明 |
 |------|------|------|------|------|
-| POST | `/api/backup/trigger` | Body: `{type: "full"/"incremental"}` | `APIResponse<{backup_id, status}>` | 触发备份 |
+| POST | `/api/backup/trigger` | Body: `{type: "full"/"incremental"/"auto"}` | `APIResponse<{backup_id, status}>` (202) | 触发备份 |
 | POST | `/api/backup/cancel?backup_id=` | Query: backup_id (可选) | `APIResponse<{status}>` | 取消备份 |
-| GET | `/api/backup/status` | - | `APIResponse<{is_running, running_backup}>` | 备份状态 |
+| GET | `/api/backup/status` | - | `APIResponse<{is_running, running_backup}>` | 备份状态（内存+DB双重检查） |
+| GET | `/api/backup/progress/stream` | SSE 连接 | `text/event-stream` | **SSE 实时进度流**（phase/progress/file/log/heartbeat） |
 
 ### Content - File System
 
@@ -1315,7 +1533,7 @@ function usePolling<T>(
 |------|------|------|------|------|
 | GET | `/api/content/directories` | - | `APIResponse<BackupDirectory[]>` | 列出目录 |
 | POST | `/api/content/directories` | Body: BackupDirectory | `APIResponse<BackupDirectory>` | 添加目录 |
-| PUT | `/api/content/directories/{id}` | Body: BackupDirectory | `APIResponse<BackupDirectory>` | 更新目录 |
+| PATCH | `/api/content/directories/{id}` | Body: 部分字段 | `APIResponse<BackupDirectory>` | 更新目录（部分更新） |
 | DELETE | `/api/content/directories/{id}` | - | `APIResponse<{status}>` | 删除目录 |
 
 ### Content - Exclusions
@@ -1349,74 +1567,106 @@ function usePolling<T>(
 | GET | `/api/logs?backup_id=&level=&search=&start_time=&end_time=&page=&page_size=` | Query: 过滤参数 | `PaginatedResponse<LogRecord>` | 日志列表 |
 | GET | `/api/logs/{id}` | - | `APIResponse<LogRecord>` | 日志详情 |
 
-### Restore & GC
+### Restore & GC & Maintenance
 
 | 方法 | 路径 | 请求 | 响应 | 说明 |
 |------|------|------|------|------|
-| POST | `/api/restore` | Body: RestoreRequest | `APIResponse<RestoreResult>` | 恢复文件 |
-| POST | `/api/gc` | - | `APIResponse<{status}>` | 触发垃圾回收 |
+| POST | `/api/restore` | Body: RestoreRequest | `APIResponse<RestoreResult>` | 恢复文件（4h 独立超时） |
+| POST | `/api/gc` | - | `APIResponse<{status}>` | 触发垃圾回收（异步） |
+| POST | `/api/reconcile?dry_run=` | Query: dry_run (默认 true) | `APIResponse<ReconcileReport>` | **数据一致性对账**（备份运行中返回 409） |
+| GET | `/api/storage/health` | - | `APIResponse<{latency_ms, ok}>` (200/503) | OSS 连通性健康检查 |
 
 ---
 
 ## 7. 核心业务流程
 
-### 7.1 全量备份流程
+### 7.0 应用启动与崩溃恢复流程
+
+```
+main() 启动:
+  1. 加载配置 (config.Load)
+  2. 初始化日志 (logger.Init)
+  3. 打开数据库 (db.Open, 执行 migrations)
+  4. 清理崩溃残留: BackupRepo.CleanupStaleRunning()
+     → 将所有 status=pending/running 的记录标记为 failed
+  5. 初始化各模块 (scanner/dedup/compress/encryptor/storage)
+  6. 创建 ProgressBroker (SSE 进度中心)
+  7. 创建 Engine (注入 ProgressBroker)
+  8. 初始化调度器 (scheduler.New)
+  9. 创建 API Router (注入 engine 等)
+  10. 启动 HTTP 服务器
+  11. 启动调度器 (scheduler.Start)
+  12. 等待 SIGINT/SIGTERM → 优雅关闭
+```
+
+### 7.1 全量备份流程（含 SSE 进度推送）
 
 ```
 用户触发 → POST /api/backup/trigger {type: "full"}
+  → 锁内双重检查（内存 runningBackupID + DB IsRunning）
   → Engine.StartBackup(full)
     → 创建 BackupRecord (status=pending)
-    → 异步执行 executeBackup:
-      Phase 1: status → running
-      Phase 2: Scanner.Scan() 扫描所有启用目录
+    → goroutine 异步执行 executeBackup:
+      Phase 1: status → running，推送 phase=scanning 事件
+      Phase 2: Scanner.ScanWithProgress() 扫描所有启用目录
+               → 进度 0-5%（对数曲线估算），每 500 文件推送日志
       Phase 3: Scanner.ComputeHashes() 计算哈希
-      Phase 4: 分类变更 (Added/Modified/Deleted/Unchanged)
-               Unchanged 文件也包含（刷新引用计数）
-      Phase 5: Dedup.Deduplicate() 去重
-      Phase 6: 逐文件处理:
-               Upsert → Compress → Encrypt → Upload → Verify → Upsert HashIndex
-      Phase 7: 去重跳过文件: Upsert FileRecord + 引用已有存储
-      Phase 8: 批量写入 backup_files
-      Phase 9: 标记删除文件 + 递减引用计数
+               → 进度 5-30%，逐文件推送 file + log 事件（仅 SSE）
+               → 新哈希==旧哈希时降级为 Unchanged
+      Phase 4: 分类变更
+               → 全量备份：Unchanged 也按 Modified 处理（重建映射）
+               → 用 pendingByHash 暂存本批次文件元数据
+      Phase 5: Dedup.Deduplicate() 去重 → 进度 30-35%
+      Phase 6: 逐文件处理 (compress → encrypt → upload → verify):
+               → 进度 35-95%，逐文件推送详细日志
+               → 本批次去重：直接从 pendingByHash 获取元数据，不上传
+               → 跨批次去重：查 HashIndex 获取元数据
+               → 新文件：完整处理流程
+      Phase 7: (已合并到 Phase 6)
+      Phase 8: 批量写入 backup_files（事务）
+      Phase 9: 标记删除文件 + 事务内递减引用计数 → 进度 95-100%
       Phase 10: 更新备份统计
-      成功: status → completed
-      失败: status → failed
-      取消: status → cancelled
+      结束: 推送 completed/failed/cancelled 事件
+           → 30 秒后 ClearHistory()
 ```
 
 ### 7.2 增量备份流程
 
 与全量备份的区别：
-- 必须先有至少一次完成的全量备份
+- `determineBackupType()` 判断：超过 full_reset_interval 则自动升级为全量
 - `base_backup_id` 指向最近的全量备份
-- Phase 4 中 Unchanged 文件被跳过（`skippedInc++`）
+- Phase 4 中 Unchanged 文件被跳过（`skippedInc++`），不重建映射
 - 只处理 Added 和 Modified 文件
+- Deleted 文件仍标记删除（引用计数递减）
 
 ### 7.3 定时调度流程
 
 ```
 Scheduler.Start() → 注册 cron 任务
   → 每次触发:
-    → isFullResetNeeded()?
-      是 → RunFullBackup()
-      否 → RunIncrementalBackup()
+    → determineBackupType():
+      full_reset_interval == 0 → 永远增量
+      最近全量不存在/失败/超过间隔 → full
+      否则 → incremental
+    → 根据判断结果调用 RunFullBackup / RunIncrementalBackup
 ```
 
 ### 7.4 文件恢复流程
 
 ```
 POST /api/restore {paths/pattern, output_dir, backup_id?, expedited?}
+  → 使用 context.Background() + 4h 超时（独立于 HTTP 请求）
   → Restorer.Restore()
     → resolveFiles(): 按路径或模式查找文件
     → 逐文件:
       → resolveBackupFile(): 查找备份文件记录
       → restoreFile():
         1. 检查解冻状态 (CheckRestored)
-        2. 如需解冻: RestoreObject + 轮询等待
-        3. 下载 (rclone copyto)
-        4. 解密 (AES-256-GCM)
-        5. 解压 (zstd, 如有)
-        6. 哈希验证
+        2. 如需解冻: RestoreObject + 轮询等待（最多30分钟）
+        3. 下载 (rclone copyto, 3次重试)
+        4. 解密 (AES-256-GCM 流式)
+        5. 解压 (zstd, 如有压缩)
+        6. SHA-256 哈希验证
         7. 移动到输出目录
 ```
 
@@ -1428,6 +1678,48 @@ POST /api/gc
     → 获取超过 orphan_grace_days 的孤儿哈希记录 (ref_count=0)
     → 逐个删除 OSS 对象
     → 批量删除数据库哈希记录
+```
+
+### 7.6 数据一致性对账流程
+
+```
+POST /api/reconcile?dry_run=true
+  → 获取 engine.mu 锁（与备份互斥）
+  → 备份运行中 → 409 Conflict
+  → Reconciler.Reconcile(ctx, dryRun):
+    1. 查询 hash_index 所有记录
+    2. 查询 OSS 所有对象（rclone lsjson，分批）
+    3. 查询 backup_files 所有 storage_key
+    4. 按 hash 统计 files 表活跃文件数（CountActiveByHash）
+    5. 检查各层不一致:
+       a. OSS 有但 hash_index 无 → OSSOnlyOrphans（仅告警）
+       b. hash_index 有但 OSS 无 → DanglingHashIndexes
+          - ref=0: 删除 hash_index（修复）
+          - ref>0: 错误（不修复）
+       c. ref_count 与实际活跃文件数不符 → SetRefCount（修复）
+       d. backup_files 指向的 hash_index 不存在:
+          - OSS 有对象 → 重建 hash_index（修复）
+          - OSS 无对象 → 删除 backup_files（修复）
+       e. failed 备份有 backup_files → 修正为 completed（修复）
+       f. completed 备份无 backup_files → 修正为 failed（修复）
+    6. dryRun=true 时跳过所有修复操作
+    7. 返回 ReconcileReport
+  → 释放锁
+```
+
+### 7.7 SSE 进度推送流程
+
+```
+前端 EventSource 连接 → GET /api/backup/progress/stream
+  → handleBackupProgressStream:
+    1. 设置 Content-Type: text/event-stream
+    2. 禁用写超时 (SetWriteDeadline(0))
+    3. ProgressBroker.Subscribe() → 获取 channel + 历史事件
+    4. 回放历史事件（按 Timestamp 排序）
+    5. 循环:
+       - 收到事件 → data: JSON\n\n 写入
+       - 15 秒无事件 → : heartbeat\n\n 保活
+       - 客户端断开 → unsub() 清理 channel
 ```
 
 ---
@@ -1524,6 +1816,14 @@ npm run preview  # 预览构建结果
 1. 后端编译为二进制，配置 systemd 服务
 2. 前端构建为静态文件，由 Nginx 反向代理
 3. Nginx 配置：`/` → 前端静态文件，`/api` → 后端服务
+4. **SSE 特别配置**：`/api/backup/progress/stream` 需要：
+   - `proxy_buffering off;` — 禁用缓冲，实时推送
+   - `proxy_read_timeout 3600s;` — 1 小时长连接超时
+   - `proxy_set_header Connection '';` — 不发送 Connection: close
+   - `chunked_transfer_encoding on;`
+   - `tcp_nopush off;`
+   - `add_header Cache-Control 'no-cache';`
+   - `add_header X-Accel-Buffering no;`（告诉 Nginx 不要缓冲）
 
 详见 [DEPLOYMENT.md](file:///Users/jacobzhang/工作区/code/nasbkup_system/DEPLOYMENT.md)
 
@@ -1571,6 +1871,14 @@ CLI 触发备份的便捷脚本，支持：
 6. **配置双层存储**：YAML 文件提供默认值，数据库 config_kv 支持运行时修改
 7. **引用计数去重**：hash_index.ref_count 跟踪内容引用，支持垃圾回收
 8. **冷归档解冻**：恢复时自动检测并触发解冻，支持标准/加急两种模式
+9. **SSE 而非 WebSocket**：备份进度是单向推送（服务器→客户端），SSE 更轻量、自动重连、HTTP 友好，无需额外协议升级
+10. **锁内双重检查防竞态**：StartBackup 在互斥锁内同时检查内存状态和数据库状态，防止并发触发多个备份
+11. **崩溃恢复设计**：启动时 CleanupStaleRunning 清理残留记录；全量备份重处理 Unchanged 文件以重建映射；取消兜底检查 DB 残留
+12. **对账分层安全**：DryRun 模式先审计再修复；OSS 孤儿对象不自动删除（避免误删）；DB 层不一致自动修复；修复操作均在事务内
+13. **同批次去重元数据缓存**：使用 pendingByHash map 避免同批次重复文件重复查询 hash_index，减少 DB 往返
+14. **进度加权分段估算**：扫描阶段使用对数曲线估算进度（文件数未知前无法精确），哈希/上传阶段按已处理文件比例计算，上传阶段占主要权重（35-95%）
+15. **恢复独立超时 context**：使用 context.Background() + 4h 超时而非 HTTP 请求 context，避免客户端断连中断大文件恢复/解冻等待
+16. **PATCH 而非 PUT 目录更新**：启用/禁用切换只需传 enabled 字段，无需发送完整对象，语义更准确
 
 ---
 

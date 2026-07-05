@@ -98,12 +98,13 @@ type BackupFileRecord struct {
 // HashIndexRecord maps a content hash to its single physical storage location.
 // Multiple file paths may reference the same hash (dedup).
 type HashIndexRecord struct {
-	ID          int64     `json:"id"`
-	Hash        string    `json:"hash"`
-	FileSize    int64     `json:"file_size"`
-	StorageKey  string    `json:"storage_key"`
-	RefCount    int       `json:"ref_count"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID          int64      `json:"id"`
+	Hash        string     `json:"hash"`
+	FileSize    int64      `json:"file_size"`
+	StorageKey  string     `json:"storage_key"`
+	RefCount    int        `json:"ref_count"`
+	CreatedAt   time.Time  `json:"created_at"`
+	OrphanedAt  *time.Time `json:"orphaned_at,omitempty"`
 }
 
 // ---------------------------------------------------------------------------

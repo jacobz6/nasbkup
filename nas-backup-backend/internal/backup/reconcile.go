@@ -25,6 +25,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/nas-backup/internal/models"
@@ -195,7 +196,7 @@ func (e *Engine) reconcileGatherAndCompare(ctx context.Context, report *Reconcil
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	ossKeys, err := e.storage.List(prefix)
+	ossKeys, err := e.storage.List(ctx, prefix)
 	if err != nil {
 		err = fmt.Errorf("list OSS objects under %q: %w", prefix, err)
 		report.Errors = append(report.Errors, err.Error())
@@ -302,6 +303,15 @@ func (e *Engine) reconcileRefCount(ctx context.Context, report *ReconcileReport)
 	}
 
 	for _, r := range hashRecords {
+		// Skip reconciler-synthesized hash entries: their hash is synthetic
+		// (prefixed with "reconciled:") and does not correspond to any real
+		// files.hash, so CountActiveByHash will always report 0. These rows
+		// exist solely to keep hash_index ↔ backup_files consistent and to
+		// prevent GC from deleting the OSS object; ref_count is intentionally
+		// kept at 1.
+		if strings.HasPrefix(r.Hash, "reconciled:") {
+			continue
+		}
 		actual := actualCounts[r.Hash]
 		if r.RefCount != actual {
 			report.RefCountMismatches = append(report.RefCountMismatches, RefCountMismatch{
@@ -328,14 +338,25 @@ func (e *Engine) reconcileBackupStatus(ctx context.Context, report *ReconcileRep
 	}
 
 	// Failed backups that have backup_files → candidate for completion IF
-	// every storage_key exists in OSS. We only check OSS existence on demand
-	// (it's expensive), so we do it per-backup only for the failed set.
+	// every storage_key exists in OSS. We collect all storage keys first and
+	// batch-check via ExistsBatch (parallel rclone workers) instead of
+	// serially calling Exists for each key — serial checks were extremely
+	// slow for large numbers of failed backups (each rclone invocation takes
+	// 0.5-2s).
 	failedBackups, err := e.db.BackupRepo.ListFailedBackupsWithFiles()
 	if err != nil {
 		err = fmt.Errorf("list failed backups with files: %w", err)
 		report.Errors = append(report.Errors, err.Error())
 		return err
 	}
+
+	// Collect all files across failed backups for batch existence check.
+	type backupFileInfo struct {
+		backupID   int64
+		storageKey string
+	}
+	var allKeys []string
+	backupFileMap := make(map[int64][]*backupFileInfo) // backupID → files
 	for _, b := range failedBackups {
 		files, err := e.db.BackupRepo.GetBackupFiles(b.ID)
 		if err != nil {
@@ -343,35 +364,90 @@ func (e *Engine) reconcileBackupStatus(ctx context.Context, report *ReconcileRep
 				fmt.Sprintf("get backup files for failed backup %d: %v", b.ID, err))
 			continue
 		}
-		// Verify every storage_key exists in OSS before proposing completion.
-		allExist := true
-		missing := []string{}
 		for _, bf := range files {
-			exists, err := e.storage.Exists(bf.StorageKey)
-			if err != nil {
+			allKeys = append(allKeys, bf.StorageKey)
+			fi := &backupFileInfo{backupID: b.ID, storageKey: bf.StorageKey}
+			backupFileMap[b.ID] = append(backupFileMap[b.ID], fi)
+		}
+	}
+
+	// Batch-check existence in OSS with parallel workers.
+	existsMap := make(map[string]bool, len(allKeys))
+	if len(allKeys) > 0 {
+		var keyErrors []string
+		result, errs, err := e.storage.ExistsBatch(ctx, allKeys, 8)
+		if err != nil {
+			// Batch failure is serious but we still try per-backup; record the error.
+			report.Errors = append(report.Errors,
+				fmt.Sprintf("batch exists check failed, falling back to serial: %v", err))
+			// Fall back to serial checking for each backup individually.
+			for _, b := range failedBackups {
+				files := backupFileMap[b.ID]
+				allExist := true
+				missing := []string{}
+				for _, fi := range files {
+					exists, exErr := e.storage.Exists(ctx, fi.storageKey)
+					if exErr != nil {
+						report.Errors = append(report.Errors,
+							fmt.Sprintf("check OSS existence for backup %d storage_key %q: %v",
+								b.ID, fi.storageKey, exErr))
+						allExist = false
+						break
+					}
+					if !exists {
+						missing = append(missing, fi.storageKey)
+						allExist = false
+					}
+				}
+				if allExist && len(files) > 0 {
+					report.FailedBackupsWithFiles = append(report.FailedBackupsWithFiles, BackupStatusFix{
+						BackupID: b.ID,
+						From:     models.BackupStatusFailed,
+						To:       models.BackupStatusCompleted,
+						Reason:   fmt.Sprintf("backup marked failed but has %d backup_files all present in OSS", len(files)),
+					})
+				} else if !allExist {
+					e.logger.Info("skip marking failed backup as completed: missing OSS objects",
+						"backup_id", b.ID, "missing_count", len(missing))
+				}
+			}
+		} else {
+			existsMap = result
+			for _, ke := range errs {
+				keyErrors = append(keyErrors, fmt.Sprintf("%s: %v", ke.Key, ke.Err))
+			}
+			if len(keyErrors) > 0 {
 				report.Errors = append(report.Errors,
-					fmt.Sprintf("check OSS existence for backup %d storage_key %q: %v",
-						b.ID, bf.StorageKey, err))
-				allExist = false
-				break
+					fmt.Sprintf("batch exists check had %d errors: %s", len(keyErrors), strings.Join(keyErrors, "; ")))
 			}
-			if !exists {
-				missing = append(missing, bf.StorageKey)
-				allExist = false
+
+			// Determine which failed backups have all files present.
+			for _, b := range failedBackups {
+				files := backupFileMap[b.ID]
+				if len(files) == 0 {
+					continue
+				}
+				allExist := true
+				missingCount := 0
+				for _, fi := range files {
+					if !existsMap[fi.storageKey] {
+						allExist = false
+						missingCount++
+					}
+				}
+				if allExist {
+					report.FailedBackupsWithFiles = append(report.FailedBackupsWithFiles, BackupStatusFix{
+						BackupID: b.ID,
+						From:     models.BackupStatusFailed,
+						To:       models.BackupStatusCompleted,
+						Reason:   fmt.Sprintf("backup marked failed but has %d backup_files all present in OSS", len(files)),
+					})
+				} else {
+					e.logger.Info("skip marking failed backup as completed: missing OSS objects",
+						"backup_id", b.ID, "missing_count", missingCount)
+				}
 			}
 		}
-		if !allExist {
-			// Not safe to mark completed — record why we skipped.
-			e.logger.Info("skip marking failed backup as completed: missing OSS objects",
-				"backup_id", b.ID, "missing_count", len(missing))
-			continue
-		}
-		report.FailedBackupsWithFiles = append(report.FailedBackupsWithFiles, BackupStatusFix{
-			BackupID: b.ID,
-			From:     models.BackupStatusFailed,
-			To:       models.BackupStatusCompleted,
-			Reason:   fmt.Sprintf("backup marked failed but has %d backup_files all present in OSS", len(files)),
-		})
 	}
 
 	// Completed backups with no backup_files → candidate for failed.
@@ -395,14 +471,27 @@ func (e *Engine) reconcileBackupStatus(ctx context.Context, report *ReconcileRep
 // reconcileApplyFixes performs the actual DB / OSS mutations to fix the
 // detected inconsistencies. Each fix is logged into AppliedFixes; errors are
 // recorded in Errors but do not abort the whole pass.
+//
+// DB mutations (Fix 1-5) are wrapped in a single transaction so that a crash
+// mid-fix cannot leave the database in a partially-corrected state. OSS
+// deletions (Fix 6) are executed ONLY after the DB transaction commits
+// successfully — if the DB commit fails, OSS objects are left in place and
+// the next reconcile run will detect them again.
 func (e *Engine) reconcileApplyFixes(ctx context.Context, report *ReconcileReport) error {
+	// ── Phase A: DB mutations in a single transaction ──────────────────
+	tx, err := e.db.DB().Begin()
+	if err != nil {
+		return fmt.Errorf("begin transaction for reconcile fixes: %w", err)
+	}
+	defer tx.Rollback()
+
 	// Fix 1: dangling hash_index with ref_count == 0 → delete the row.
 	//        (OSS object already missing, so no OSS deletion needed.)
 	for _, key := range report.DanglingHashIndexesRefZero {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if err := e.db.HashRepo.DeleteByStorageKey(key); err != nil {
+		if _, err := tx.Exec(`DELETE FROM hash_index WHERE storage_key = ?`, key); err != nil {
 			report.Errors = append(report.Errors,
 				fmt.Sprintf("delete dangling hash_index (ref=0) storage_key=%q: %v", key, err))
 			continue
@@ -416,12 +505,13 @@ func (e *Engine) reconcileApplyFixes(ctx context.Context, report *ReconcileRepor
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		affected, err := e.db.BackupRepo.DeleteBackupFilesByStorageKey(key)
+		res, err := tx.Exec(`DELETE FROM backup_files WHERE storage_key = ?`, key)
 		if err != nil {
 			report.Errors = append(report.Errors,
 				fmt.Sprintf("delete orphan backup_files storage_key=%q: %v", key, err))
 			continue
 		}
+		affected, _ := res.RowsAffected()
 		report.AppliedFixes = append(report.AppliedFixes,
 			fmt.Sprintf("deleted %d orphan backup_files rows for storage_key=%s", affected, key))
 	}
@@ -429,12 +519,14 @@ func (e *Engine) reconcileApplyFixes(ctx context.Context, report *ReconcileRepor
 	// Fix 3: backup_files whose storage_key is missing from hash_index but
 	//        exists in OSS → recreate the hash_index entry. We do NOT have
 	//        the original file_size / hash for these objects (the encrypted
-	//        blob is opaque), so we insert a minimal record with hash="" and
-	//        ref_count=1. The hash field is UNIQUE-constrained and NOT NULL,
-	//        but the schema allows empty string — however inserting multiple
-	//        empty-hash rows would conflict. Since each OSS object maps to
-	//        at most one backup_files storage_key, we synthesize a synthetic
-	//        hash from the storage_key to keep it unique.
+	//        blob is opaque), so we insert a minimal record with a synthetic
+	//        hash derived from the storage_key (guaranteed unique per key).
+	//
+	//        Uses INSERT OR IGNORE to avoid double-incrementing ref_count on
+	//        repeated reconcile runs (previously Upsert would increment on
+	//        conflict, causing ref_count to grow unbounded). ref_count is
+	//        set to 1 to prevent GC from deleting the OSS object that is
+	//        still referenced by backup_files.
 	//
 	//        NOTE: This is a best-effort repair. The recreated row will not
 	//        be findable by hash (since it's synthetic), but it will prevent
@@ -444,10 +536,12 @@ func (e *Engine) reconcileApplyFixes(ctx context.Context, report *ReconcileRepor
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		// Synthetic hash unique per storage_key. Prefixed to make it identifiable
-		// as reconciler-synthesized in case of future inspection.
 		syntheticHash := "reconciled:" + key
-		if _, err := e.db.HashRepo.Upsert(syntheticHash, 0, key); err != nil {
+		now := time.Now().UTC().Format(time.RFC3339)
+		if _, err := tx.Exec(`
+			INSERT OR IGNORE INTO hash_index (hash, file_size, storage_key, ref_count, created_at)
+			VALUES (?, 0, ?, 1, ?)
+		`, syntheticHash, key, now); err != nil {
 			report.Errors = append(report.Errors,
 				fmt.Sprintf("recreate hash_index for storage_key=%q: %v", key, err))
 			continue
@@ -461,7 +555,8 @@ func (e *Engine) reconcileApplyFixes(ctx context.Context, report *ReconcileRepor
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if err := e.db.HashRepo.SetRefCount(m.Hash, m.ActualActive); err != nil {
+		if _, err := tx.Exec(`UPDATE hash_index SET ref_count = ? WHERE hash = ?`,
+			m.ActualActive, m.Hash); err != nil {
 			report.Errors = append(report.Errors,
 				fmt.Sprintf("set ref_count for hash=%q (db=%d, actual=%d): %v",
 					m.Hash, m.StoredInDB, m.ActualActive, err))
@@ -483,16 +578,37 @@ func (e *Engine) reconcileApplyFixes(ctx context.Context, report *ReconcileRepor
 		if fix.To == models.BackupStatusFailed {
 			errMsg = "reconciler: marked failed (no backup_files found)"
 		}
-		if err := e.db.BackupRepo.UpdateStatus(fix.BackupID, fix.To, errMsg); err != nil {
-			report.Errors = append(report.Errors,
-				fmt.Sprintf("update backup %d status %s → %s: %v",
-					fix.BackupID, fix.From, fix.To, err))
-			continue
+		now := time.Now().UTC().Format(time.RFC3339)
+		switch fix.To {
+		case models.BackupStatusCompleted:
+			if _, err := tx.Exec(`
+				UPDATE backups SET status = ?, completed_at = ?, error_message = ? WHERE id = ?
+			`, fix.To, now, errMsg, fix.BackupID); err != nil {
+				report.Errors = append(report.Errors,
+					fmt.Sprintf("update backup %d status %s → %s: %v",
+						fix.BackupID, fix.From, fix.To, err))
+				continue
+			}
+		default:
+			if _, err := tx.Exec(`
+				UPDATE backups SET status = ?, error_message = ? WHERE id = ?
+			`, fix.To, errMsg, fix.BackupID); err != nil {
+				report.Errors = append(report.Errors,
+					fmt.Sprintf("update backup %d status %s → %s: %v",
+						fix.BackupID, fix.From, fix.To, err))
+				continue
+			}
 		}
 		report.AppliedFixes = append(report.AppliedFixes,
 			fmt.Sprintf("corrected backup %d status: %s → %s", fix.BackupID, fix.From, fix.To))
 	}
 
+	// Commit DB transaction before touching OSS.
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit reconcile DB fixes: %w", err)
+	}
+
+	// ── Phase B: OSS deletions (after DB commit, not reversible) ──────
 	// Fix 6: OSS-only orphans → delete OSS objects.
 	//        These have no hash_index row and no backup_files reference, so
 	//        deleting them is safe. We delete via storage.Delete which already
@@ -501,7 +617,7 @@ func (e *Engine) reconcileApplyFixes(ctx context.Context, report *ReconcileRepor
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if err := e.storage.Delete(key); err != nil {
+		if err := e.storage.Delete(ctx, key); err != nil {
 			report.Errors = append(report.Errors,
 				fmt.Sprintf("delete OSS-only orphan storage_key=%q: %v", key, err))
 			continue

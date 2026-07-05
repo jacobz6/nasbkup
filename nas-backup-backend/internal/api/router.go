@@ -97,6 +97,9 @@ func (r *Router) Setup() http.Handler {
 	// Reconcile (system sync): keep OSS / hash_index / backup_files consistent.
 	r.mux.HandleFunc("POST /api/reconcile", r.handleReconcile)
 
+	// Storage health — verify OSS connectivity / credentials.
+	r.mux.HandleFunc("GET /api/storage/health", r.handleStorageHealth)
+
 	return r.loggingMiddleware(r.corsMiddleware(r.mux))
 }
 

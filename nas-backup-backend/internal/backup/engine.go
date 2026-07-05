@@ -273,9 +273,22 @@ func (e *Engine) NeedsReconcile() bool {
 }
 
 // RunGarbageCollection cleans up orphan data in OSS and the database.
+// It refuses to run while a backup is in progress to avoid deleting objects
+// that are in the process of being uploaded but not yet recorded in
+// hash_index.
 func (e *Engine) RunGarbageCollection(ctx context.Context) error {
 	e.logger.Info("starting garbage collection")
 	start := time.Now()
+
+	// Refuse to run while a backup is in progress, same as reconcile.
+	if _, running := e.RunningBackupID(); running {
+		return fmt.Errorf("a backup is currently running; run GC after it finishes")
+	}
+	if running, err := e.db.BackupRepo.IsRunning(); err != nil {
+		return fmt.Errorf("check running backup: %w", err)
+	} else if running {
+		return fmt.Errorf("a backup is currently running (db); run GC after it finishes")
+	}
 
 	graceDays := e.config.Backup.Retention.OrphanGraceDays
 	orphans, err := e.db.HashRepo.GetOrphansOlderThan(graceDays)
@@ -300,7 +313,7 @@ func (e *Engine) RunGarbageCollection(ctx context.Context) error {
 			return ctx.Err()
 		}
 
-		if err := e.storage.Delete(orphan.StorageKey); err != nil {
+		if err := e.storage.Delete(ctx, orphan.StorageKey); err != nil {
 			e.logger.Error("failed to delete OSS object",
 				"storage_key", orphan.StorageKey, "error", err)
 			deleteErrors = append(deleteErrors, fmt.Sprintf("%s: %v", orphan.StorageKey, err))
@@ -501,7 +514,15 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 				skippedInc++
 				continue
 			}
-			changedFiles = append(changedFiles, change)
+			// For full backups, rewrite Unchanged → Modified so the dedup
+			// pipeline processes them. Without this, dedup.go skips
+			// Unchanged entirely and a full backup degenerates into an
+			// incremental one (to_upload=0 when all files are unchanged on
+			// disk), never rebuilding hash_index ↔ OSS mappings for objects
+			// that were lost in a previous crash.
+			rewritten := change
+			rewritten.ChangeType = scanner.Modified
+			changedFiles = append(changedFiles, rewritten)
 		case scanner.Added, scanner.Modified:
 			changedFiles = append(changedFiles, change)
 		}
@@ -522,7 +543,7 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 	if e.progress != nil {
 		e.progress.PublishPhase(backupID, models.PhaseDeduplicating, "正在去重分析...")
 	}
-	dedupResult, err := e.dedup.Deduplicate(changedFiles)
+	dedupResult, err := e.dedup.Deduplicate(ctx, changedFiles)
 	if err != nil {
 		return fmt.Errorf("deduplicate: %w", err)
 	}
@@ -597,7 +618,7 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 			fmt.Sprintf("[%d/%d] %s (%s)", i+1, len(dedupResult.ToUpload), entry.Path, formatSize(entry.Size)))
 
 		fileID, origSize, storedSize, compressType, storageKey, encIV, err := e.processAndUploadFile(
-			entry, backupType, tmpDir, backupID)
+			ctx, entry, backupType, tmpDir, backupID)
 		if err != nil {
 			e.logEvent(backupID, models.LogLevelError, "文件处理失败",
 				fmt.Sprintf("path=%s error=%v", entry.Path, err))
@@ -842,6 +863,7 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 
 // processAndUploadFile handles compress → encrypt → upload → verify for a single file.
 func (e *Engine) processAndUploadFile(
+	ctx context.Context,
 	entry *dedup.DedupFileEntry,
 	backupType models.BackupType,
 	tmpDir string,
@@ -900,15 +922,19 @@ func (e *Engine) processAndUploadFile(
 	}
 	storedSize = encInfo.Size()
 
-	// Generate storage key.
-	storageKey = e.generateStorageKey(backupType, entry.NewHash)
+	// Generate storage key. Reuse existing key when re-uploading a missing object.
+	if entry.StorageKey != "" {
+		storageKey = entry.StorageKey
+	} else {
+		storageKey = e.generateStorageKey(backupType, entry.NewHash)
+	}
 
 	// Upload.
 	if e.progress != nil {
 		e.progress.PublishLog(backupID, "info", "上传文件",
 			fmt.Sprintf("%s → %s", entry.Path, storageKey))
 	}
-	if err := e.storage.Upload(encryptedPath, storageKey); err != nil {
+	if err := e.storage.Upload(ctx, encryptedPath, storageKey); err != nil {
 		return 0, 0, 0, "", "", "", fmt.Errorf("upload file: %w", err)
 	}
 
@@ -916,7 +942,7 @@ func (e *Engine) processAndUploadFile(
 	if e.progress != nil {
 		e.progress.PublishLog(backupID, "info", "验证上传", storageKey)
 	}
-	exists, verifyErr := e.storage.Exists(storageKey)
+	exists, verifyErr := e.storage.Exists(ctx, storageKey)
 	if verifyErr != nil {
 		return 0, 0, 0, "", "", "", fmt.Errorf("verify upload: %w", verifyErr)
 	}
@@ -924,12 +950,16 @@ func (e *Engine) processAndUploadFile(
 		return 0, 0, 0, "", "", "", fmt.Errorf("upload verification failed: object %q not found in storage", storageKey)
 	}
 
-	// Upsert hash index record.
-	if e.progress != nil {
-		e.progress.PublishLog(backupID, "info", "更新哈希索引", entry.Path)
-	}
-	if _, hashErr := e.db.HashRepo.Upsert(entry.NewHash, entry.Size, storageKey); hashErr != nil {
-		return 0, 0, 0, "", "", "", fmt.Errorf("upsert hash record: %w", hashErr)
+	// Upsert hash index record. For re-uploads (missing OSS object being restored),
+	// the hash_index row already exists with correct ref_count, so skip the upsert
+	// to avoid double-counting.
+	if entry.IsNew {
+		if e.progress != nil {
+			e.progress.PublishLog(backupID, "info", "更新哈希索引", entry.Path)
+		}
+		if _, hashErr := e.db.HashRepo.Upsert(entry.NewHash, entry.Size, storageKey); hashErr != nil {
+			return 0, 0, 0, "", "", "", fmt.Errorf("upsert hash record: %w", hashErr)
+		}
 	}
 
 	return fileID, originalSize, storedSize, compressType, storageKey, encIV, nil

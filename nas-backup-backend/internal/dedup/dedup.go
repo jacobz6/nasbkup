@@ -5,10 +5,14 @@
 package dedup
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/nas-backup/internal/db"
+	"github.com/nas-backup/internal/models"
 	"github.com/nas-backup/internal/scanner"
+	"github.com/nas-backup/internal/storage"
 )
 
 // DedupFileEntry represents a file that needs to be uploaded (or has been
@@ -46,13 +50,27 @@ func truncateHash(hash string, n int) string {
 
 // Deduplicator checks file changes against the global hash index.
 type Deduplicator struct {
-	hashRepo *db.HashRepository
+	hashRepo    *db.HashRepository
+	storage     *storage.StorageManager
+	concurrency int // worker count for batch OSS existence checks
 }
 
 // NewDeduplicator creates a Deduplicator backed by the given hash repository.
-func NewDeduplicator(hashRepo *db.HashRepository) *Deduplicator {
+// The storage manager is used to verify that the OSS object referenced by a
+// hash_index row actually exists — if it has been lost (e.g. by a crash in a
+// previous backup window), the file is re-queued for upload instead of being
+// silently skipped.
+//
+// concurrency controls the worker pool for batch OSS existence checks.
+// When ≤ 0, storage.DefaultBatchConcurrency is used.
+func NewDeduplicator(hashRepo *db.HashRepository, stor *storage.StorageManager, concurrency int) *Deduplicator {
+	if concurrency <= 0 {
+		concurrency = storage.DefaultBatchConcurrency
+	}
 	return &Deduplicator{
-		hashRepo: hashRepo,
+		hashRepo:    hashRepo,
+		storage:     stor,
+		concurrency: concurrency,
 	}
 }
 
@@ -60,15 +78,50 @@ func NewDeduplicator(hashRepo *db.HashRepository) *Deduplicator {
 // checking each file's hash against the global hash index. Files whose
 // content already exists are skipped (with a ref-count increment); new
 // content is added to the upload list.
-func (d *Deduplicator) Deduplicate(changes []scanner.FileChange) (*DedupResult, error) {
+//
+// Implementation note: this function performs OSS existence checks in batch
+// (via ExistsBatch) rather than one-by-one. This is critical for performance
+// when scanning thousands of unchanged files during a full backup: a serial
+// rclone lsl per file would take minutes, while the batched version takes
+// seconds at concurrency=8.
+func (d *Deduplicator) Deduplicate(ctx context.Context, changes []scanner.FileChange) (*DedupResult, error) {
 	result := &DedupResult{}
 
+	// Pass 1: classify changes and look up hash_index entries.
+	// We collect (change, existingRecord) pairs for files that need an OSS
+	// existence check; everything else is handled inline.
+	type pending struct {
+		change   scanner.FileChange
+		existing *models.HashIndexRecord
+	}
+	var (
+		pendingChecks []pending
+	)
 	for _, change := range changes {
 		switch change.ChangeType {
 		case scanner.Added, scanner.Modified:
-			if err := d.processChange(change, result); err != nil {
-				return nil, fmt.Errorf("deduplicate %q: %w", change.Path, err)
+			// Files with no hash are always uploaded.
+			if change.NewHash == "" {
+				result.ToUpload = append(result.ToUpload, DedupFileEntry{
+					FileChange: change,
+					IsNew:      true,
+				})
+				continue
 			}
+			existing, err := d.hashRepo.GetByHash(change.NewHash)
+			if err != nil {
+				return nil, fmt.Errorf("query hash index for %q: %w", change.NewHash, err)
+			}
+			if existing == nil {
+				// New content — queue for upload.
+				result.ToUpload = append(result.ToUpload, DedupFileEntry{
+					FileChange: change,
+					IsNew:      true,
+				})
+				continue
+			}
+			// Hash exists in DB — defer OSS existence check to the batch pass.
+			pendingChecks = append(pendingChecks, pending{change: change, existing: existing})
 
 		case scanner.Deleted, scanner.Unchanged, scanner.Renamed:
 			// Deleted files are handled separately by the backup engine.
@@ -77,46 +130,68 @@ func (d *Deduplicator) Deduplicate(changes []scanner.FileChange) (*DedupResult, 
 		}
 	}
 
-	return result, nil
-}
-
-// processChange handles a single Added or Modified file change.
-func (d *Deduplicator) processChange(change scanner.FileChange, result *DedupResult) error {
-	// A file with no hash cannot be deduplicated — it must be uploaded.
-	if change.NewHash == "" {
-		result.ToUpload = append(result.ToUpload, DedupFileEntry{
-			FileChange: change,
-			IsNew:      true,
-		})
-		return nil
+	// Pass 2: batch OSS existence check for all hashes that exist in DB.
+	// Use a set to deduplicate storage_keys (multiple files may share the
+	// same hash, hence the same storage_key).
+	ossExists := map[string]bool{}
+	if len(pendingChecks) > 0 && d.storage != nil {
+		seen := map[string]struct{}{}
+		keys := make([]string, 0, len(pendingChecks))
+		for _, p := range pendingChecks {
+			if _, ok := seen[p.existing.StorageKey]; ok {
+				continue
+			}
+			seen[p.existing.StorageKey] = struct{}{}
+			keys = append(keys, p.existing.StorageKey)
+		}
+		existsMap, errs, err := d.storage.ExistsBatch(ctx, keys, d.concurrency)
+		if err != nil {
+			return nil, fmt.Errorf("batch OSS existence check: %w", err)
+		}
+		ossExists = existsMap
+		for _, ke := range errs {
+			slog.Warn("dedup: OSS existence check failed for one key, treating as missing",
+				"storage_key", ke.Key, "error", ke.Message)
+		}
 	}
 
-	// Look up the hash in the global index.
-	existing, err := d.hashRepo.GetByHash(change.NewHash)
-	if err != nil {
-		return fmt.Errorf("query hash index for %q: %w", change.NewHash, err)
-	}
+	// Pass 3: apply the OSS check results and finalize each pending change.
+	for _, p := range pendingChecks {
+		exists, checked := ossExists[p.existing.StorageKey]
+		// If the OSS check failed (key absent from map), fall back to skip
+		// to avoid blocking the entire backup on one transient rclone error.
+		ossMissing := checked && !exists
 
-	if existing != nil {
-		// Content already exists — skip upload, increment ref count.
-		if err := d.hashRepo.IncrementRef(change.NewHash); err != nil {
-			return fmt.Errorf("increment ref for hash %q: %w", change.NewHash, err)
+		if ossMissing {
+			// OSS object missing — re-upload to restore data redundancy.
+			// Do NOT increment ref_count; the existing hash_index row will
+			// be reused (processAndUploadFile keeps the same storage_key).
+			slog.Info("dedup: OSS object missing, re-queuing for upload",
+				"hash", truncateHash(p.change.NewHash, 16),
+				"storage_key", p.existing.StorageKey)
+			result.ToUpload = append(result.ToUpload, DedupFileEntry{
+				FileChange: p.change,
+				StorageKey: p.existing.StorageKey,
+				IsNew:      false,
+			})
+			continue
+		}
+
+		// OSS object exists (or check was skipped/failed — treat as exists
+		// to preserve legacy behavior on transient errors). Skip upload and
+		// increment ref count.
+		if err := d.hashRepo.IncrementRef(p.change.NewHash); err != nil {
+			return nil, fmt.Errorf("increment ref for hash %q: %w", p.change.NewHash, err)
 		}
 
 		result.Skipped = append(result.Skipped, DedupSkippedEntry{
-			Path:               change.Path,
-			Hash:               change.NewHash,
-			ExistingStorageKey: existing.StorageKey,
-			Reason:             fmt.Sprintf("content already stored (hash=%s, ref_count=%d)", truncateHash(change.NewHash, 16), existing.RefCount+1),
+			Path:               p.change.Path,
+			Hash:               p.change.NewHash,
+			ExistingStorageKey: p.existing.StorageKey,
+			Reason:             fmt.Sprintf("content already stored (hash=%s, ref_count=%d)", truncateHash(p.change.NewHash, 16), p.existing.RefCount+1),
 		})
-		result.TotalSaved += change.Size
-	} else {
-		// New content — queue for upload.
-		result.ToUpload = append(result.ToUpload, DedupFileEntry{
-			FileChange: change,
-			IsNew:      true,
-		})
+		result.TotalSaved += p.change.Size
 	}
 
-	return nil
+	return result, nil
 }

@@ -19,14 +19,17 @@ func NewHashRepository(db *sql.DB) *HashRepository {
 	return &HashRepository{db: db}
 }
 
+const hashIndexColumns = "id, hash, file_size, storage_key, ref_count, created_at, orphaned_at"
+
 // scanHashIndexRecord scans a single hash_index row from a scanner into a HashIndexRecord.
 func scanHashIndexRecord(s scanner) (*models.HashIndexRecord, error) {
 	var (
-		rec       models.HashIndexRecord
-		createdAt string
+		rec          models.HashIndexRecord
+		createdAt    string
+		orphanedAt   sql.NullString
 	)
 	if err := s.Scan(
-		&rec.ID, &rec.Hash, &rec.FileSize, &rec.StorageKey, &rec.RefCount, &createdAt,
+		&rec.ID, &rec.Hash, &rec.FileSize, &rec.StorageKey, &rec.RefCount, &createdAt, &orphanedAt,
 	); err != nil {
 		return nil, err
 	}
@@ -37,6 +40,14 @@ func scanHashIndexRecord(s scanner) (*models.HashIndexRecord, error) {
 	}
 	rec.CreatedAt = t
 
+	if orphanedAt.Valid {
+		ot, err := time.Parse(time.RFC3339, orphanedAt.String)
+		if err != nil {
+			return nil, fmt.Errorf("parse orphaned_at %q: %w", orphanedAt.String, err)
+		}
+		rec.OrphanedAt = &ot
+	}
+
 	return &rec, nil
 }
 
@@ -44,7 +55,7 @@ func scanHashIndexRecord(s scanner) (*models.HashIndexRecord, error) {
 // Returns nil without error if no record is found.
 func (r *HashRepository) GetByHash(hash string) (*models.HashIndexRecord, error) {
 	row := r.db.QueryRow(`
-		SELECT id, hash, file_size, storage_key, ref_count, created_at
+		SELECT `+hashIndexColumns+`
 		FROM hash_index WHERE hash = ?
 	`, hash)
 	rec, err := scanHashIndexRecord(row)
@@ -57,8 +68,19 @@ func (r *HashRepository) GetByHash(hash string) (*models.HashIndexRecord, error)
 	return rec, nil
 }
 
-// Upsert inserts a new hash index record or increments the ref_count if the hash already exists.
-// When the hash already exists, only the ref_count is incremented; other fields are not updated.
+// Upsert inserts a new hash index record or, if the hash already exists,
+// increments ref_count AND updates storage_key/file_size to the latest values.
+//
+// When incrementing ref_count from 0 back to >0, orphaned_at is cleared so the
+// grace-period clock resets.
+//
+// Updating storage_key on conflict is essential for recovering from data loss:
+// when a previous crash left hash_index pointing to an OSS object that was
+// lost, a subsequent full backup re-uploads the content to a new storage_key
+// and this update makes hash_index point to the new (valid) OSS object.
+// Without it, hash_index would forever reference the missing object and
+// restore would keep failing.
+//
 // Returns the hash record ID.
 func (r *HashRepository) Upsert(hash string, fileSize int64, storageKey string) (int64, error) {
 	now := Now()
@@ -66,7 +88,11 @@ func (r *HashRepository) Upsert(hash string, fileSize int64, storageKey string) 
 	err := r.db.QueryRow(`
 		INSERT INTO hash_index (hash, file_size, storage_key, ref_count, created_at)
 		VALUES (?, ?, ?, 1, ?)
-		ON CONFLICT(hash) DO UPDATE SET ref_count = ref_count + 1
+		ON CONFLICT(hash) DO UPDATE SET
+			ref_count = ref_count + 1,
+			storage_key = excluded.storage_key,
+			file_size = excluded.file_size,
+			orphaned_at = NULL
 		RETURNING id
 	`, hash, fileSize, storageKey, now).Scan(&id)
 	if err != nil {
@@ -77,10 +103,14 @@ func (r *HashRepository) Upsert(hash string, fileSize int64, storageKey string) 
 }
 
 // IncrementRef increments the ref_count for an existing hash record.
+// Clears orphaned_at if the ref_count was 0 (content is referenced again).
 // Returns an error if the hash does not exist.
 func (r *HashRepository) IncrementRef(hash string) error {
 	result, err := r.db.Exec(`
-		UPDATE hash_index SET ref_count = ref_count + 1 WHERE hash = ?
+		UPDATE hash_index SET
+			ref_count = ref_count + 1,
+			orphaned_at = CASE WHEN ref_count = 0 THEN NULL ELSE orphaned_at END
+		WHERE hash = ?
 	`, hash)
 	if err != nil {
 		return fmt.Errorf("increment ref for hash %q: %w", hash, err)
@@ -96,7 +126,9 @@ func (r *HashRepository) IncrementRef(hash string) error {
 }
 
 // DecrementRef decrements the ref_count for an existing hash record.
-// The ref_count will never go below 0. Returns the new ref_count value.
+// When ref_count reaches 0, sets orphaned_at to now so the GC grace period
+// clock starts ticking. The ref_count will never go below 0.
+// Returns the new ref_count value.
 func (r *HashRepository) DecrementRef(hash string) (int, error) {
 	tx, err := r.db.Begin()
 	if err != nil {
@@ -104,8 +136,11 @@ func (r *HashRepository) DecrementRef(hash string) (int, error) {
 	}
 	defer tx.Rollback()
 
+	now := Now()
 	result, err := tx.Exec(`
-		UPDATE hash_index SET ref_count = ref_count - 1 WHERE hash = ? AND ref_count > 0
+		UPDATE hash_index
+		SET ref_count = ref_count - 1
+		WHERE hash = ? AND ref_count > 0
 	`, hash)
 	if err != nil {
 		return 0, fmt.Errorf("decrement ref for hash %q: %w", hash, err)
@@ -127,6 +162,13 @@ func (r *HashRepository) DecrementRef(hash string) (int, error) {
 		return 0, nil
 	}
 
+	// If ref_count just hit 0, set orphaned_at.
+	if _, err := tx.Exec(`
+		UPDATE hash_index SET orphaned_at = ? WHERE hash = ? AND ref_count = 0
+	`, now, hash); err != nil {
+		return 0, fmt.Errorf("set orphaned_at for hash %q: %w", hash, err)
+	}
+
 	var newCount int
 	err = tx.QueryRow(`SELECT ref_count FROM hash_index WHERE hash = ?`, hash).Scan(&newCount)
 	if err != nil {
@@ -142,7 +184,7 @@ func (r *HashRepository) DecrementRef(hash string) (int, error) {
 // These represent content that is no longer referenced by any file.
 func (r *HashRepository) GetOrphans() ([]*models.HashIndexRecord, error) {
 	rows, err := r.db.Query(`
-		SELECT id, hash, file_size, storage_key, ref_count, created_at
+		SELECT `+hashIndexColumns+`
 		FROM hash_index WHERE ref_count = 0
 		ORDER BY created_at
 	`)
@@ -166,13 +208,19 @@ func (r *HashRepository) GetOrphans() ([]*models.HashIndexRecord, error) {
 }
 
 // GetOrphansOlderThan retrieves orphaned hash index records (ref_count=0)
-// that were created more than the specified number of days ago.
+// whose orphaned_at timestamp is older than the specified number of days.
+// This correctly implements the grace period: only content that has been
+// orphaned for at least `days` days is eligible for deletion. Rows with
+// orphaned_at=NULL (ref_count>0 or pre-migration rows) are excluded;
+// pre-migration orphans that were backfilled with orphaned_at=created_at
+// are treated as having been orphaned since their creation.
 func (r *HashRepository) GetOrphansOlderThan(days int) ([]*models.HashIndexRecord, error) {
 	cutoff := time.Now().UTC().AddDate(0, 0, -days).Format(time.RFC3339)
 	rows, err := r.db.Query(`
-		SELECT id, hash, file_size, storage_key, ref_count, created_at
-		FROM hash_index WHERE ref_count = 0 AND created_at < ?
-		ORDER BY created_at
+		SELECT `+hashIndexColumns+`
+		FROM hash_index
+		WHERE ref_count = 0 AND orphaned_at IS NOT NULL AND orphaned_at < ?
+		ORDER BY orphaned_at
 	`, cutoff)
 	if err != nil {
 		return nil, fmt.Errorf("get orphan hash records older than %d days: %w", days, err)
@@ -338,7 +386,7 @@ func (r *HashRepository) GetAllStorageKeys() ([]string, error) {
 // the DB index against OSS contents and against actual file references.
 func (r *HashRepository) ListAll() ([]*models.HashIndexRecord, error) {
 	rows, err := r.db.Query(`
-		SELECT id, hash, file_size, storage_key, ref_count, created_at
+		SELECT `+hashIndexColumns+`
 		FROM hash_index ORDER BY id
 	`)
 	if err != nil {
@@ -361,13 +409,24 @@ func (r *HashRepository) ListAll() ([]*models.HashIndexRecord, error) {
 }
 
 // SetRefCount sets the ref_count of a hash record to the specified value.
-// Used by the reconciler to correct ref_count drift caused by missed
-// DecrementRef / IncrementRef calls during crashes.
+// Manages orphaned_at: sets it to now when count reaches 0, clears it when
+// count goes above 0. Used by the reconciler to correct ref_count drift.
 func (r *HashRepository) SetRefCount(hash string, count int) error {
 	if count < 0 {
 		count = 0
 	}
-	result, err := r.db.Exec(`UPDATE hash_index SET ref_count = ? WHERE hash = ?`, count, hash)
+	now := Now()
+	var result sql.Result
+	var err error
+	if count == 0 {
+		result, err = r.db.Exec(`
+			UPDATE hash_index SET ref_count = ?, orphaned_at = ? WHERE hash = ?
+		`, count, now, hash)
+	} else {
+		result, err = r.db.Exec(`
+			UPDATE hash_index SET ref_count = ?, orphaned_at = NULL WHERE hash = ?
+		`, count, hash)
+	}
 	if err != nil {
 		return fmt.Errorf("set ref_count for hash %q: %w", hash, err)
 	}

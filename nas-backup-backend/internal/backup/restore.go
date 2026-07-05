@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,22 +30,30 @@ const thawPollInterval = 30 * time.Second
 
 // Restorer handles file restoration from backup storage.
 type Restorer struct {
-	db         *db.Database
-	encryptor  *crypto.Encryptor
-	compressor *compress.Compressor
-	storage    *storage.StorageManager
-	config     *config.AppConfig
+	db          *db.Database
+	encryptor   *crypto.Encryptor
+	compressor  *compress.Compressor
+	storage     *storage.StorageManager
+	config      *config.AppConfig
+	concurrency int // worker count for concurrent restore
 }
 
 // NewRestorer creates a new Restorer with all required dependencies.
+// concurrency controls the worker pool for concurrent file restore; ≤ 0 falls
+// back to storage.DefaultBatchConcurrency.
 func NewRestorer(database *db.Database, enc *crypto.Encryptor, comp *compress.Compressor,
 	stor *storage.StorageManager, cfg *config.AppConfig) *Restorer {
+	concurrency := 0
+	if cfg != nil {
+		concurrency = cfg.Storage.Concurrency
+	}
 	return &Restorer{
-		db:         database,
-		encryptor:  enc,
-		compressor: comp,
-		storage:    stor,
-		config:     cfg,
+		db:          database,
+		encryptor:   enc,
+		compressor:  comp,
+		storage:     stor,
+		config:      cfg,
+		concurrency: concurrency,
 	}
 }
 
@@ -99,39 +108,86 @@ func (r *Restorer) Restore(ctx context.Context, req *models.RestoreRequest) (*mo
 		TotalFiles: len(files),
 	}
 
-	for _, fileRec := range files {
-		if ctx.Err() != nil {
-			break
-		}
-
-		// Get the backup_file record for this file.
-		bfRec, err := r.resolveBackupFile(fileRec.ID, req.BackupID)
-		if err != nil {
-			slog.Error("resolve backup file record",
-				"path", fileRec.Path, "error", err)
-			result.FailedFiles = append(result.FailedFiles, fileRec.Path)
-			continue
-		}
-		if bfRec == nil {
-			slog.Error("no backup file record found",
-				"path", fileRec.Path, "file_id", fileRec.ID)
-			result.FailedFiles = append(result.FailedFiles, fileRec.Path)
-			continue
-		}
-
-		if err := r.restoreFile(ctx, fileRec, bfRec, req.OutputDir, stripPrefix, req.Expedited, tmpDir); err != nil {
-			slog.Error("restore file failed",
-				"path", fileRec.Path, "error", err)
-			result.FailedFiles = append(result.FailedFiles, fileRec.Path)
-			continue
-		}
-
-		result.RestoredFiles++
-		result.TotalSize += fileRec.Size
+	// Process files concurrently using a worker pool. restoreFile's pipeline
+	// (thaw → download → decrypt → decompress → verify → move) is self-contained
+	// per file, so parallelizing at the file level is safe. Thaw wait times
+	// don't consume OSS bandwidth, allowing workers to overlap wait latency
+	// with another file's actual download.
+	concurrency := r.concurrency
+	if concurrency <= 0 {
+		concurrency = storage.DefaultBatchConcurrency
 	}
+	if concurrency > len(files) {
+		concurrency = len(files)
+	}
+
+	var (
+		mu sync.Mutex
+		wg sync.WaitGroup
+	)
+	jobs := make(chan *models.FileRecord, len(files))
+
+	// Worker function: pulls files from the queue and restores them,
+	// updating shared result under mutex.
+	worker := func() {
+		defer wg.Done()
+		for fileRec := range jobs {
+			if ctx.Err() != nil {
+				return
+			}
+
+			bfRec, err := r.resolveBackupFile(fileRec.ID, req.BackupID)
+			if err != nil {
+				slog.Error("resolve backup file record",
+					"path", fileRec.Path, "error", err)
+				mu.Lock()
+				result.FailedFiles = append(result.FailedFiles, fileRec.Path)
+				mu.Unlock()
+				continue
+			}
+			if bfRec == nil {
+				slog.Error("no backup file record found",
+					"path", fileRec.Path, "file_id", fileRec.ID)
+				mu.Lock()
+				result.FailedFiles = append(result.FailedFiles, fileRec.Path)
+				mu.Unlock()
+				continue
+			}
+
+			if err := r.restoreFile(ctx, fileRec, bfRec, req.OutputDir, stripPrefix, req.Expedited, tmpDir); err != nil {
+				slog.Error("restore file failed",
+					"path", fileRec.Path, "error", err)
+				mu.Lock()
+				result.FailedFiles = append(result.FailedFiles, fileRec.Path)
+				mu.Unlock()
+				continue
+			}
+
+			mu.Lock()
+			result.RestoredFiles++
+			result.TotalSize += fileRec.Size
+			mu.Unlock()
+		}
+	}
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go worker()
+	}
+	for _, fileRec := range files {
+		jobs <- fileRec
+	}
+	close(jobs)
+	wg.Wait()
 
 	result.ElapsedMs = time.Since(start).Milliseconds()
 	return result, nil
+}
+
+// PingStorage verifies OSS connectivity by listing the root of the remote.
+// Exposed via GET /api/storage/health for operator diagnostics.
+func (r *Restorer) PingStorage(ctx context.Context) error {
+	return r.storage.Ping(ctx)
 }
 
 // ListRestorableFiles returns file records that can be restored under a given
@@ -296,7 +352,7 @@ func (r *Restorer) restoreFile(
 	}
 
 	// Step 2: Download encrypted file.
-	if err := r.storage.Download(bfRec.StorageKey, downloadedPath); err != nil {
+	if err := r.storage.Download(ctx, bfRec.StorageKey, downloadedPath); err != nil {
 		return fmt.Errorf("download %q: %w", bfRec.StorageKey, err)
 	}
 

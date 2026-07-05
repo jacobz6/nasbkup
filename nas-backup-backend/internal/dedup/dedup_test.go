@@ -1,6 +1,7 @@
 package dedup
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
@@ -25,14 +26,14 @@ func TestDeduplicateNewFiles(t *testing.T) {
 	hashRepo, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	dedup := NewDeduplicator(hashRepo)
+	dedup := NewDeduplicator(hashRepo, nil, 0)
 
 	changes := []scanner.FileChange{
 		{Path: "/data/file1.txt", ChangeType: scanner.Added, Size: 100, ModTime: time.Now(), NewHash: "hash1"},
 		{Path: "/data/file2.txt", ChangeType: scanner.Added, Size: 200, ModTime: time.Now(), NewHash: "hash2"},
 	}
 
-	result, err := dedup.Deduplicate(changes)
+	result, err := dedup.Deduplicate(context.Background(), changes)
 	if err != nil {
 		t.Fatalf("Deduplicate failed: %v", err)
 	}
@@ -54,14 +55,14 @@ func TestDeduplicateAllExisting(t *testing.T) {
 	hashRepo.Upsert("hash_ex1", 500, "key1")
 	hashRepo.Upsert("hash_ex2", 300, "key2")
 
-	dedup := NewDeduplicator(hashRepo)
+	dedup := NewDeduplicator(hashRepo, nil, 0)
 
 	changes := []scanner.FileChange{
 		{Path: "/data/dup1.txt", ChangeType: scanner.Added, Size: 500, NewHash: "hash_ex1"},
 		{Path: "/data/dup2.txt", ChangeType: scanner.Modified, Size: 300, NewHash: "hash_ex2"},
 	}
 
-	result, err := dedup.Deduplicate(changes)
+	result, err := dedup.Deduplicate(context.Background(), changes)
 	if err != nil {
 		t.Fatalf("Deduplicate failed: %v", err)
 	}
@@ -80,9 +81,9 @@ func TestDeduplicateEmptyChanges(t *testing.T) {
 	hashRepo, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	dedup := NewDeduplicator(hashRepo)
+	dedup := NewDeduplicator(hashRepo, nil, 0)
 
-	result, err := dedup.Deduplicate([]scanner.FileChange{})
+	result, err := dedup.Deduplicate(context.Background(), []scanner.FileChange{})
 	if err != nil {
 		t.Fatalf("Deduplicate failed: %v", err)
 	}
@@ -95,14 +96,14 @@ func TestDeduplicateSkipsNonAddedModified(t *testing.T) {
 	hashRepo, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	dedup := NewDeduplicator(hashRepo)
+	dedup := NewDeduplicator(hashRepo, nil, 0)
 
 	changes := []scanner.FileChange{
 		{Path: "/data/deleted.txt", ChangeType: scanner.Deleted, Size: 100, NewHash: "hash_d"},
 		{Path: "/data/new.txt", ChangeType: scanner.Added, Size: 100, NewHash: "hash_n"},
 	}
 
-	result, err := dedup.Deduplicate(changes)
+	result, err := dedup.Deduplicate(context.Background(), changes)
 	if err != nil {
 		t.Fatalf("Deduplicate failed: %v", err)
 	}
@@ -115,13 +116,13 @@ func TestDeduplicateEmptyHash(t *testing.T) {
 	hashRepo, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	dedup := NewDeduplicator(hashRepo)
+	dedup := NewDeduplicator(hashRepo, nil, 0)
 
 	changes := []scanner.FileChange{
 		{Path: "/data/nohash.txt", ChangeType: scanner.Added, Size: 100, NewHash: ""},
 	}
 
-	result, err := dedup.Deduplicate(changes)
+	result, err := dedup.Deduplicate(context.Background(), changes)
 	if err != nil {
 		t.Fatalf("Deduplicate failed: %v", err)
 	}
@@ -139,13 +140,13 @@ func TestDeduplicateStorageKeyInResult(t *testing.T) {
 
 	hashRepo.Upsert("hash_key", 500, "storage/key.enc")
 
-	dedup := NewDeduplicator(hashRepo)
+	dedup := NewDeduplicator(hashRepo, nil, 0)
 
 	changes := []scanner.FileChange{
 		{Path: "/data/dup.txt", ChangeType: scanner.Added, Size: 500, NewHash: "hash_key"},
 	}
 
-	result, err := dedup.Deduplicate(changes)
+	result, err := dedup.Deduplicate(context.Background(), changes)
 	if err != nil {
 		t.Fatalf("Deduplicate failed: %v", err)
 	}
