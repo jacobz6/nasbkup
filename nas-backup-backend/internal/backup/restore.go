@@ -3,12 +3,14 @@ package backup
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/nas-backup/internal/compress"
@@ -75,9 +77,21 @@ func (r *Restorer) Restore(ctx context.Context, req *models.RestoreRequest) (*mo
 
 	// 2. Compute the common base directory to strip from output paths
 	// so that directory structure is preserved under outputDir.
+	//
+	// For a single file we strip the grandparent directory so the immediate
+	// parent dir name is preserved: restoring /data/docs/report.pdf lands at
+	// outputDir/docs/report.pdf. Previously filepath.Base() was used which
+	// flattened the path to outputDir/report.pdf, losing all directory
+	// structure — inconsistent with multi-file restore which preserves the
+	// relative structure under the common prefix.
 	stripPrefix := ""
-	if len(files) > 1 {
-		stripPrefix = longestCommonDirPrefix(files)
+	switch len(files) {
+	case 1:
+		stripPrefix = filepath.Dir(filepath.Dir(files[0].Path))
+	default:
+		if len(files) > 1 {
+			stripPrefix = longestCommonDirPrefix(files)
+		}
 	}
 
 	// 3. Process each file.
@@ -121,8 +135,13 @@ func (r *Restorer) Restore(ctx context.Context, req *models.RestoreRequest) (*mo
 }
 
 // ListRestorableFiles returns file records that can be restored under a given
-// directory path. If dirPath is empty, all active files are returned.
+// directory path. If backupID is provided, only files contained in that backup
+// session are returned (joined via backup_files); otherwise all active files
+// are considered. If dirPath is empty, all matching files are returned.
 func (r *Restorer) ListRestorableFiles(dirPath string, backupID *int64) ([]*models.FileRecord, error) {
+	if backupID != nil {
+		return r.db.FileRepo.ListActiveByBackup(*backupID, dirPath)
+	}
 	if dirPath != "" {
 		return r.db.FileRepo.ListActiveByDirectory(dirPath)
 	}
@@ -183,20 +202,13 @@ func (r *Restorer) resolveFiles(req *models.RestoreRequest) ([]*models.FileRecor
 }
 
 // resolveBackupFile returns the BackupFileRecord for a given file ID, optionally
-// filtered by a specific backup ID.
+// filtered by a specific backup ID. When backupID is provided this is a single
+// indexed lookup on the (backup_id, file_id) primary key; previously it loaded
+// every backup_file row of the session and scanned linearly, which was
+// O(N×M) for large restores.
 func (r *Restorer) resolveBackupFile(fileID int64, backupID *int64) (*models.BackupFileRecord, error) {
 	if backupID != nil {
-		// Get the backup files for the specific backup and find our file.
-		bfRecords, err := r.db.BackupRepo.GetBackupFiles(*backupID)
-		if err != nil {
-			return nil, fmt.Errorf("get backup files for backup %d: %w", *backupID, err)
-		}
-		for _, bf := range bfRecords {
-			if bf.FileID == fileID {
-				return bf, nil
-			}
-		}
-		return nil, nil
+		return r.db.BackupRepo.GetBackupFileByFileID(*backupID, fileID)
 	}
 	// Default: get the latest backup file record for this file.
 	return r.db.BackupRepo.GetFileRestoreInfo(fileID)
@@ -235,13 +247,18 @@ func (r *Restorer) restoreFile(
 		}
 		slog.Info("object thaw initiated, waiting...", "storage_key", bfRec.StorageKey)
 
-		// Wait for thaw with timeout.
+		// Wait for thaw with timeout. Use select on ctx.Done() + a timer
+		// instead of time.Sleep so that context cancellation is observed
+		// promptly (within one poll tick at most). Previously time.Sleep
+		// blocked for the full thawPollInterval, delaying cancellation by up
+		// to 30s per iteration.
 		deadline := time.Now().Add(maxThawWait)
 		for time.Now().Before(deadline) {
-			if ctx.Err() != nil {
+			select {
+			case <-ctx.Done():
 				return ctx.Err()
+			case <-time.After(thawPollInterval):
 			}
-			time.Sleep(thawPollInterval)
 
 			restored, err = r.storage.CheckRestored(bfRec.StorageKey)
 			if err != nil {
@@ -322,14 +339,29 @@ func sha256File(path string) (string, error) {
 	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 
-// moveFile moves a file from src to dst. Falls back to copy+delete
-// if the rename fails (e.g. cross-device).
+// moveFile moves a file from src to dst. It only falls back to copy+delete
+// when os.Rename fails with a cross-device link error (EXDEV); other rename
+// errors (permission denied, dst already exists, etc.) are returned directly
+// so that an existing destination is NOT silently overwritten.
+//
+// In the copy+delete path, out.Close() errors are checked explicitly (a
+// deferred Close would silently drop write-back failures such as disk-full or
+// NFS commit errors, leaving a truncated file on disk while the function
+// reported success).
 func moveFile(src, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
 		return fmt.Errorf("create output directory: %w", err)
 	}
-	if err := os.Rename(src, dst); err == nil {
+
+	renameErr := os.Rename(src, dst)
+	if renameErr == nil {
 		return nil
+	}
+	// Only fall back to copy+delete for cross-device link errors. Previously
+	// ANY rename error triggered the copy fallback, and os.Create(dst) would
+	// truncate an already-existing destination file.
+	if !errors.Is(renameErr, syscall.EXDEV) {
+		return fmt.Errorf("rename %q → %q: %w", src, dst, renameErr)
 	}
 
 	// Cross-device rename: copy then delete.
@@ -343,15 +375,29 @@ func moveFile(src, dst string) error {
 	if err != nil {
 		return fmt.Errorf("create destination: %w", err)
 	}
-	defer out.Close()
 
-	if _, err := io.Copy(out, in); err != nil {
+	copyErr := func() error {
+		if _, err := io.Copy(out, in); err != nil {
+			return fmt.Errorf("copy content: %w", err)
+		}
+		if err := out.Sync(); err != nil {
+			return fmt.Errorf("sync destination: %w", err)
+		}
+		return nil
+	}()
+
+	// Always close the destination; if close fails after a successful copy,
+	// treat the whole move as failed and clean up the partial file.
+	if cerr := out.Close(); cerr != nil {
 		os.Remove(dst)
-		return fmt.Errorf("copy content: %w", err)
+		if copyErr == nil {
+			return fmt.Errorf("close destination: %w", cerr)
+		}
 	}
 
-	if err := out.Sync(); err != nil {
-		return fmt.Errorf("sync destination: %w", err)
+	if copyErr != nil {
+		os.Remove(dst)
+		return copyErr
 	}
 
 	os.Remove(src)

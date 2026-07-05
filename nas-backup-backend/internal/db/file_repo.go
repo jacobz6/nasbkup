@@ -75,7 +75,8 @@ func (r *FileRepository) Upsert(path string, size int64, modTime time.Time, hash
         now := Now()
         modTimeStr := modTime.UTC().Format(time.RFC3339)
 
-        result, err := r.db.Exec(`
+        var id int64
+        err := r.db.QueryRow(`
                 INSERT INTO files (path, size, mod_time, hash, inode, status, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
                 ON CONFLICT(path) DO UPDATE SET
@@ -85,15 +86,12 @@ func (r *FileRepository) Upsert(path string, size int64, modTime time.Time, hash
                         inode = excluded.inode,
                         status = 'active',
                         updated_at = excluded.updated_at
-        `, path, size, modTimeStr, hash, inode, now, now)
+                RETURNING id
+        `, path, size, modTimeStr, hash, inode, now, now).Scan(&id)
         if err != nil {
                 return 0, fmt.Errorf("upsert file %q: %w", path, err)
         }
 
-        id, err := result.LastInsertId()
-        if err != nil {
-                return 0, fmt.Errorf("last insert id after upsert file %q: %w", path, err)
-        }
         return id, nil
 }
 
@@ -282,29 +280,81 @@ func (r *FileRepository) CountBackedUp() (int64, error) {
 // ListActiveByDirectory retrieves all active file records whose path starts with
 // the given directory path (i.e., files under that directory).
 func (r *FileRepository) ListActiveByDirectory(dirPath string) ([]*models.FileRecord, error) {
-        pattern := dirPath + "/%"
-        rows, err := r.db.Query(`
-                SELECT id, path, size, mod_time, hash, status, backup_id, inode, created_at, updated_at
-                FROM files WHERE path LIKE ? AND status = 'active'
-                ORDER BY path
-        `, pattern)
-        if err != nil {
-                return nil, fmt.Errorf("list active files by directory %q: %w", dirPath, err)
-        }
-        defer rows.Close()
+	pattern := dirPath + "/%"
+	rows, err := r.db.Query(`
+		SELECT id, path, size, mod_time, hash, status, backup_id, inode, created_at, updated_at
+		FROM files WHERE path LIKE ? AND status = 'active'
+		ORDER BY path
+	`, pattern)
+	if err != nil {
+		return nil, fmt.Errorf("list active files by directory %q: %w", dirPath, err)
+	}
+	defer rows.Close()
 
-        records := make([]*models.FileRecord, 0)
-        for rows.Next() {
-                rec, err := scanFileRecord(rows)
-                if err != nil {
-                        return nil, fmt.Errorf("scan file row by directory: %w", err)
-                }
-                records = append(records, rec)
-        }
-        if err := rows.Err(); err != nil {
-                return nil, fmt.Errorf("iterate active files by directory: %w", err)
-        }
-        return records, nil
+	records := make([]*models.FileRecord, 0)
+	for rows.Next() {
+		rec, err := scanFileRecord(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan file row by directory: %w", err)
+		}
+		records = append(records, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate active files by directory: %w", err)
+	}
+	return records, nil
+}
+
+// ListActiveByBackup retrieves active file records that are part of a specific
+// backup session. If dirPath is non-empty, results are additionally filtered to
+// files whose path starts with dirPath. This joins backup_files with files so
+// that only files actually contained in the given backup are returned — the
+// previous implementation ignored backupID entirely and could return files that
+// were never in the targeted backup, causing spurious "no backup file record
+// found" errors during restore.
+func (r *FileRepository) ListActiveByBackup(backupID int64, dirPath string) ([]*models.FileRecord, error) {
+	var (
+		query string
+		args  []interface{}
+	)
+	if dirPath != "" {
+		query = `
+			SELECT f.id, f.path, f.size, f.mod_time, f.hash, f.status, f.backup_id, f.inode, f.created_at, f.updated_at
+			FROM files f
+			INNER JOIN backup_files bf ON bf.file_id = f.id
+			WHERE bf.backup_id = ? AND f.status = 'active' AND f.path LIKE ?
+			ORDER BY f.path
+		`
+		args = append(args, backupID, dirPath+"/%")
+	} else {
+		query = `
+			SELECT f.id, f.path, f.size, f.mod_time, f.hash, f.status, f.backup_id, f.inode, f.created_at, f.updated_at
+			FROM files f
+			INNER JOIN backup_files bf ON bf.file_id = f.id
+			WHERE bf.backup_id = ? AND f.status = 'active'
+			ORDER BY f.path
+		`
+		args = append(args, backupID)
+	}
+
+	rows, err := r.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list active files by backup %d: %w", backupID, err)
+	}
+	defer rows.Close()
+
+	records := make([]*models.FileRecord, 0)
+	for rows.Next() {
+		rec, err := scanFileRecord(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan file row by backup: %w", err)
+		}
+		records = append(records, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate active files by backup: %w", err)
+	}
+	return records, nil
 }
 
 // ListAllPaths returns all file paths in the database, used for comparing

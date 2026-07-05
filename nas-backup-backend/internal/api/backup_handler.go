@@ -20,13 +20,20 @@ func (r *Router) handleBackupTrigger(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if triggerReq.Type != models.BackupTypeFull && triggerReq.Type != models.BackupTypeIncremental {
-		r.jsonError(w, "type must be 'full' or 'incremental'", http.StatusBadRequest)
+	// Default to auto if type is not specified
+	backupType := triggerReq.Type
+	if backupType == "" {
+		backupType = models.BackupTypeAuto
+	}
+
+	if backupType != models.BackupTypeFull && backupType != models.BackupTypeIncremental && backupType != models.BackupTypeAuto {
+		r.jsonError(w, "type must be 'full', 'incremental', or 'auto'", http.StatusBadRequest)
 		return
 	}
 
-	backupID, err := r.engine.StartBackup(triggerReq.Type)
+	backupID, err := r.engine.StartBackup(backupType)
 	if err != nil {
+		slog.Warn("backup trigger failed", "error", err)
 		r.jsonError(w, err.Error(), http.StatusConflict)
 		return
 	}

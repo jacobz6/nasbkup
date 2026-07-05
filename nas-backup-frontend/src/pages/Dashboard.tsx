@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import {
-  Play, FastForward, Square, Trash2, Files, HardDrive,
+  Play, Square, Trash2, Files, HardDrive,
   FileCheck, ArrowDownToLine, RefreshCw, CheckCircle, Clock,
   Activity, Terminal, XCircle, AlertCircle, Info,
 } from 'lucide-react';
@@ -244,11 +244,11 @@ export function Dashboard() {
     }
   }, [logs]);
 
-  const handleTrigger = async (type: 'full' | 'incremental') => {
+  const handleTrigger = async () => {
     try {
-      const res = await backupApi.trigger(type);
+      const res = await backupApi.trigger();
       if (res.success) {
-        addToast({ type: 'success', message: `${type === 'full' ? '全量' : '增量'}备份已启动` });
+        addToast({ type: 'success', message: '备份已启动' });
         setLogs([]);
         setProgress({
           ...initialProgress,
@@ -456,11 +456,12 @@ export function Dashboard() {
 
       {/* Action Buttons */}
       <div className="flex items-center gap-3">
-        <button className="btn-primary flex items-center gap-2" onClick={() => handleTrigger('full')}>
-          <Play size={16} /> 全量备份
-        </button>
-        <button className="btn-secondary flex items-center gap-2" onClick={() => handleTrigger('incremental')}>
-          <FastForward size={16} /> 增量备份
+        <button
+          className="btn-primary flex items-center gap-2"
+          disabled={displayIsRunning}
+          onClick={handleTrigger}
+        >
+          <Play size={16} /> 立即备份
         </button>
         <button
           className="btn-danger flex items-center gap-2"

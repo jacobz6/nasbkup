@@ -37,6 +37,7 @@
 8. [依赖关系图](#8-依赖关系图)
 9. [项目运行方式](#9-项目运行方式)
 10. [辅助脚本](#10-辅助脚本)
+11. [下云恢复指南 (restore-cli)](#11-下云恢复指南-restore-cli)
 
 ---
 
@@ -1569,3 +1570,243 @@ CLI 触发备份的便捷脚本，支持：
 6. **配置双层存储**：YAML 文件提供默认值，数据库 config_kv 支持运行时修改
 7. **引用计数去重**：hash_index.ref_count 跟踪内容引用，支持垃圾回收
 8. **冷归档解冻**：恢复时自动检测并触发解冻，支持标准/加急两种模式
+
+---
+
+## 11. 下云恢复指南 (restore-cli)
+
+> 本章描述将云端加密对象还原为本地原始文件的完整流程。下云恢复与上云备份构成完整闭环：**上传 (压缩→加密→上云) ↔ 下云 (解冻→下载→解密→解压→哈希校验)**。
+
+### 11.1 工具与能力概览
+
+| 工具 | 路径 | 适用场景 |
+|------|------|---------|
+| **restore-cli** | `nas-backup-backend/cmd/restore-cli/main.go` | 推荐：命令行下云恢复、闭环验证、ColdArchive 解冻场景（不受 HTTP 超时限制） |
+| **HTTP API** | `POST /api/restore` | 程序化集成、小文件快速恢复（4h 超时） |
+
+**restore-cli 复用与生产 API 完全相同的 `Restorer`**，因此任何在 CLI 验证通过的恢复路径在生产 API 中行为一致。
+
+#### 支持的命令
+
+| 命令 | 说明 |
+|------|------|
+| `backups` | 列出最近 20 个备份会话（ID / 类型 / 状态 / 文件数 / 大小 / 完成时间） |
+| `list [dir-path]` | 列出可恢复文件，可按目录过滤，可指定 `--backup-id` 只列该备份中的文件 |
+| `info <path>` | 显示某路径的文件记录 + 备份元数据（含闭环无损检查、存储压缩比） |
+| `verify <path>` | 单文件闭环验证：下载→解密→解压→SHA-256 哈希校验，落在临时目录，自动清理 |
+| `verify-dir <dir> [--limit N]` | 批量抽检目录下文件，N=0 表示全量 |
+| `restore <path> -o <outdir>` | 恢复单文件到 outdir |
+| `restore-dir <dir> -o <outdir> [--limit N]` | 恢复目录下所有文件到 outdir |
+
+#### 通用 flags
+
+| Flag | 默认值 | 说明 |
+|------|--------|------|
+| `-config` | `config.yaml` | 配置文件路径 |
+| `--backup-id N` | 0（最近完成） | 指定备份会话 ID |
+| `--expedited` | false | ColdArchive 加急解冻（1-10 分钟，需 OSS 白名单） |
+| `-o <dir>` | — | 恢复输出目录（restore/restore-dir 必填） |
+| `--limit N` | 0（全部） | verify-dir/restore-dir 最多处理的文件数 |
+
+### 11.2 前置准备
+
+1. **配置就绪**：`config.yaml` 中 OSS `endpoint` / `bucket` / AK 已配置，`encryption.key_file_path` 指向 `master.key`。
+   > ⚠️ **密钥一致性**：恢复用的 `master.key` 必须与备份时使用的是同一把，否则 AES-256-GCM 解密必败（报 `cipher: message authentication failed`）。建议对主密钥做异地备份。
+2. **数据库可用**：`data/nas-backup.db` 存在且包含已 `completed` 的备份记录。
+3. **依赖工具**：`zstd` 和 `rclone` 已安装并在 PATH 中。
+4. **网络**：恢复机能访问 OSS endpoint。
+5. **输出目录**：恢复目标目录已创建且进程有写权限。
+
+### 11.3 构建 restore-cli
+
+```bash
+cd nas-backup-backend
+go build -o restore-cli ./cmd/restore-cli
+```
+
+构建产物为 `nas-backup-backend/restore-cli` 二进制。
+
+### 11.4 闭环验证 SOP（验证备份可恢复，不污染正式目录）
+
+**步骤 1：确认可用备份**
+
+```bash
+./restore-cli -config config.yaml backups
+```
+输出示例：
+```
+ID     TYPE         STATUS       FILES      SIZE         COMPLETED_AT
+--------------------------------------------------------------------------------
+5      full         completed    1200       2.3 GB       2026-07-04 21:00:00
+4      incremental  completed    35         120 MB       2026-07-04 09:00:00
+```
+
+**步骤 2：列出指定备份中的可恢复文件**
+
+```bash
+# 列出备份 #5 中 /data/docs 下的文件
+./restore-cli -config config.yaml --backup-id 5 list /data/docs
+
+# 列出备份 #5 中的所有可恢复文件
+./restore-cli -config config.yaml --backup-id 5 list
+```
+> 注意：`--backup-id` 真正生效，只返回该备份会话内的文件（通过 `backup_files` JOIN `files` 查询）。
+
+**步骤 3：查看文件备份元数据**
+
+```bash
+./restore-cli -config config.yaml info /data/docs/report.pdf
+```
+输出包含 `Lossless: true/false`（原始大小是否等于备份记录 OriginalSize）和 `StorageRatio`（存储压缩比）。
+
+**步骤 4：单文件闭环验证（关键）**
+
+```bash
+./restore-cli -config config.yaml --backup-id 5 verify /data/docs/report.pdf
+```
+执行完整闭环：下载 → AES-256-GCM 解密 → zstd 解压 → SHA-256 哈希校验。文件落在临时目录，命令结束自动清理。
+
+预期输出：
+```
+Verifying "/data/docs/report.pdf" ...
+  ✓ VERIFIED — hash matched, size=1048576 bytes (1.0 MB)
+  Elapsed: 3.2s
+```
+出现 `✓ VERIFIED` 即证明该文件从云端加密对象可完整无损还原。
+
+**步骤 5：批量抽检目录**
+
+```bash
+# 抽样 20 个文件
+./restore-cli -config config.yaml --backup-id 5 verify-dir /data/docs --limit 20
+
+# 全量验证
+./restore-cli -config config.yaml --backup-id 5 verify-dir /data/docs --limit 0
+```
+查看 `Verify Summary`，`Failed: 0` 表示闭环完整。
+
+### 11.5 正式下云恢复 SOP
+
+**单文件恢复**
+
+```bash
+./restore-cli -config config.yaml --backup-id 5 \
+  restore /data/docs/report.pdf -o /restore
+```
+结果路径：`/restore/docs/report.pdf`（保留父目录名，剥离祖父目录）。
+
+**目录恢复**
+
+```bash
+./restore-cli -config config.yaml --backup-id 5 \
+  restore-dir /data/docs -o /restore
+```
+结果：目录结构按公共前缀保留在 `/restore` 下。例：`/data/docs/a.txt` 和 `/data/docs/sub/b.txt` 恢复为 `/restore/docs/a.txt` 和 `/restore/docs/sub/b.txt`。
+
+**全备份恢复**
+
+```bash
+./restore-cli -config config.yaml --backup-id 5 \
+  restore-dir / -o /restore
+```
+
+查看 `Restore Summary` 确认 `Failed: 0`：
+```
+── Restore Summary ──────────────────────────
+  Total:    1200
+  Restored: 1200  ✓
+  Failed:   0  ✗
+  Size:     2.3 GB
+  Elapsed:  8m42s
+```
+
+### 11.6 ColdArchive/Archive 归档存储恢复要点
+
+归档对象需先「解冻」才能下载，restore-cli 自动处理，但需注意耗时：
+
+| 解冻方式 | 耗时 | 命令 flag | 适用 |
+|---------|------|----------|------|
+| Expedited（加急） | 1–10 分钟 | `--expedited` | 需 OSS 白名单开通，紧急恢复 |
+| Standard（标准） | 1–10 小时 | 默认 | 无需开通，但**会超过 maxThawWait** |
+
+⚠️ **重要限制**：当前 `maxThawWait = 30 分钟`（见 [restore.go:25](file:///Users/jacobzhang/工作区/code/nasbkup_system/nas-backup-backend/internal/backup/restore.go#L24-L28)）。Standard 解冻需 1–10 小时会超过此上限报错 `object not restored after 30m0s`。
+
+**建议**：
+- ColdArchive 恢复一律加 `--expedited`
+- 或将常需恢复的数据存为 Standard/IA 存储类别
+- 若必须用 Standard 解冻，需手动调整 `maxThawWait` 常量并重新编译
+
+解冻轮询机制（[restore.go:255-272](file:///Users/jacobzhang/工作区/code/nasbkup_system/nas-backup-backend/internal/backup/restore.go#L250-L276)）：
+- 每 30 秒轮询 OSS 检查 `X-Oss-Restore` 头
+- 使用 `select` + `time.After`，支持上下文取消即时响应
+- 解冻恢复窗口为 7 天（OSS RestoreConfiguration.Days=7）
+
+### 11.7 HTTP API 恢复方式
+
+适合程序化集成或前端调用：
+
+```bash
+curl -X POST http://localhost:8080/api/restore \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "paths": ["/data/docs/report.pdf"],
+    "backup_id": 5,
+    "output_dir": "/restore",
+    "expedited": false
+  }'
+```
+
+响应：
+```json
+{
+  "success": true,
+  "data": {
+    "total_files": 1,
+    "restored_files": 1,
+    "failed_files": [],
+    "total_size": 1048576,
+    "elapsed_ms": 3200
+  }
+}
+```
+
+> **HTTP 与 CLI 差异**：API 使用独立 `context.Background()` + 4h 超时（见 [restore_handler.go:21](file:///Users/jacobzhang/工作区/code/nasbkup_system/nas-backup-backend/internal/api/restore_handler.go#L15-L21)），客户端断连不中断恢复。但 ColdArchive 解冻仍建议用 restore-cli（更适合长耗时操作）。
+
+### 11.8 故障排查
+
+| 现象 | 根因 / 处理 |
+|------|------------|
+| `decrypt chunk 0: cipher: message authentication failed` | 主密钥不匹配（master.key 非备份时所用）；或密文在云端被篡改/损坏 |
+| `object not restored after 30m0s` | ColdArchive 标准解冻超时 → 改用 `--expedited`，或调大 `maxThawWait` |
+| `no backup file record found` | 该文件不在指定 backupID 的备份中 → 用 `list --backup-id N` 核对 |
+| `hash verification failed` | 云端对象被篡改/损坏，或 compressType 元数据异常 |
+| `rename ...: permission denied` | 输出目录权限不足（修复后不再静默覆盖已存在文件） |
+| `restore failed: context deadline exceeded` | 4h 总超时（API）或文件数过多 → 拆分批次或用 CLI |
+| `rclone: command not found` | rclone 未安装或不在 PATH |
+
+### 11.9 闭环完整性自检清单
+
+每次重大恢复前建议完成以下检查：
+
+- [ ] `info <path>` 输出 `Lossless: true`（原始大小 = 备份记录 OriginalSize）
+- [ ] `verify <path>` 输出 `✓ VERIFIED — hash matched`（证明 AES-256-GCM 解密 + zstd 解压无损）
+- [ ] 恢复后文件 SHA-256 与 DB 中 `files.hash` 一致（用 `sha256sum` 对比）
+- [ ] 恢复目录结构与源一致（多文件保留公共前缀下相对结构，单文件保留父目录名）
+- [ ] `Restore Summary` 中 `Failed: 0`
+- [ ] 恢复后抽样文件可正常打开/解析（无损坏）
+
+### 11.10 恢复流程源码索引
+
+| 阶段 | 源码位置 |
+|------|---------|
+| 入口（CLI） | [cmd/restore-cli/main.go](file:///Users/jacobzhang/工作区/code/nasbkup_system/nas-backup-backend/cmd/restore-cli/main.go) |
+| 入口（API） | [internal/api/restore_handler.go](file:///Users/jacobzhang/工作区/code/nasbkup_system/nas-backup-backend/internal/api/restore_handler.go) |
+| Restorer 主流程 | [internal/backup/restore.go](file:///Users/jacobzhang/工作区/code/nasbkup_system/nas-backup-backend/internal/backup/restore.go) — `Restore()`, `restoreFile()` |
+| 解冻轮询 | [restore.go:255-272](file:///Users/jacobzhang/工作区/code/nasbkup_system/nas-backup-backend/internal/backup/restore.go#L250-L276) |
+| 解密（分块 GCM） | [internal/crypto/crypto.go](file:///Users/jacobzhang/工作区/code/nasbkup_system/nas-backup-backend/internal/crypto/crypto.go) — `DecryptFile()` |
+| 解压（zstd） | [internal/compress/compress.go](file:///Users/jacobzhang/工作区/code/nasbkup_system/nas-backup-backend/internal/compress/compress.go) — `Decompress()` |
+| 哈希校验 | [restore.go:sha256File](file:///Users/jacobzhang/工作区/code/nasbkup_system/nas-backup-backend/internal/backup/restore.go) |
+| 落盘（moveFile） | [restore.go:moveFile](file:///Users/jacobzhang/工作区/code/nasbkup_system/nas-backup-backend/internal/backup/restore.go) |
+| 文件列表查询 | [internal/db/file_repo.go](file:///Users/jacobzhang/工作区/code/nasbkup_system/nas-backup-backend/internal/db/file_repo.go) — `ListActiveByBackup()`, `ListActiveByDirectory()` |
+| 备份文件元数据 | [internal/db/backup_repo.go](file:///Users/jacobzhang/工作区/code/nasbkup_system/nas-backup-backend/internal/db/backup_repo.go) — `GetBackupFileByFileID()`, `GetFileRestoreInfo()` |
+| OSS 解冻 | [internal/storage/storage.go](file:///Users/jacobzhang/工作区/code/nasbkup_system/nas-backup-backend/internal/storage/storage.go) — `RestoreObject()`, `CheckRestored()` |

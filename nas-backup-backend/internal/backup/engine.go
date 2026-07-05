@@ -127,8 +127,36 @@ func (e *Engine) RunIncrementalBackup(ctx context.Context) error {
 	return e.executeBackup(ctx, backupID, models.BackupTypeIncremental, &baseBackupID)
 }
 
+// determineBackupType automatically decides whether to run a full or incremental backup.
+// It returns the concrete backup type (full or incremental) and the base backup ID for incrementals.
+func (e *Engine) determineBackupType() (models.BackupType, *int64, error) {
+	latestFull, err := e.db.BackupRepo.GetLatestFull()
+	if err != nil {
+		return models.BackupTypeFull, nil, fmt.Errorf("get latest full backup: %w", err)
+	}
+	if latestFull == nil || latestFull.CompletedAt == nil {
+		e.logger.Info("no completed full backup found, will run full backup")
+		return models.BackupTypeFull, nil, nil
+	}
+
+	intervalMonths := e.config.Backup.Retention.FullResetInterval
+	if intervalMonths > 0 {
+		cutoff := time.Now().AddDate(0, -intervalMonths, 0)
+		if latestFull.CompletedAt.Before(cutoff) {
+			e.logger.Info("full reset interval reached, will run full backup",
+				"last_full", latestFull.CompletedAt, "interval_months", intervalMonths)
+			return models.BackupTypeFull, nil, nil
+		}
+	}
+
+	id := latestFull.ID
+	e.logger.Info("will run incremental backup", "base_backup_id", id)
+	return models.BackupTypeIncremental, &id, nil
+}
+
 // StartBackup creates a backup record and starts the backup asynchronously.
 // Returns the backup ID immediately so callers can track progress via the API.
+// Use BackupTypeAuto to let the system automatically determine full vs incremental.
 func (e *Engine) StartBackup(backupType models.BackupType) (int64, error) {
 	e.mu.Lock()
 	if e.runningBackupID > 0 {
@@ -146,22 +174,35 @@ func (e *Engine) StartBackup(backupType models.BackupType) (int64, error) {
 		return 0, fmt.Errorf("a backup is already running")
 	}
 
-	var baseBackupID *int64
-	if backupType == models.BackupTypeIncremental {
-		latestFull, err := e.db.BackupRepo.GetLatestFull()
+	var (
+		actualType   models.BackupType
+		baseBackupID *int64
+	)
+
+	if backupType == models.BackupTypeAuto {
+		actualType, baseBackupID, err = e.determineBackupType()
 		if err != nil {
 			e.mu.Unlock()
-			return 0, fmt.Errorf("get latest full backup: %w", err)
+			return 0, err
 		}
-		if latestFull == nil {
-			e.mu.Unlock()
-			return 0, fmt.Errorf("no full backup found; run a full backup first")
+	} else {
+		actualType = backupType
+		if backupType == models.BackupTypeIncremental {
+			latestFull, err := e.db.BackupRepo.GetLatestFull()
+			if err != nil {
+				e.mu.Unlock()
+				return 0, fmt.Errorf("get latest full backup: %w", err)
+			}
+			if latestFull == nil {
+				e.mu.Unlock()
+				return 0, fmt.Errorf("no full backup found; run a full backup first")
+			}
+			id := latestFull.ID
+			baseBackupID = &id
 		}
-		id := latestFull.ID
-		baseBackupID = &id
 	}
 
-	backupID, err := e.db.BackupRepo.Create(backupType, baseBackupID)
+	backupID, err := e.db.BackupRepo.Create(actualType, baseBackupID)
 	if err != nil {
 		e.mu.Unlock()
 		return 0, fmt.Errorf("create backup record: %w", err)
@@ -170,7 +211,7 @@ func (e *Engine) StartBackup(backupType models.BackupType) (int64, error) {
 
 	go func() {
 		ctx := context.Background()
-		if err := e.executeBackup(ctx, backupID, backupType, baseBackupID); err != nil {
+		if err := e.executeBackup(ctx, backupID, actualType, baseBackupID); err != nil {
 			e.logger.Error("async backup failed", "backup_id", backupID, "error", err)
 		}
 	}()
@@ -499,6 +540,19 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 		backupFiles       []*models.BackupFileRecord
 	)
 
+	// pendingMeta records the encryption/compression metadata of files uploaded
+	// in THIS batch, keyed by content hash. Dedup-skipped files in the same
+	// batch need this metadata to build their backup_file record, because the
+	// source backup_file row has not been persisted yet (AddBackupFilesBatch
+	// runs after the whole loop). Without this, compressType would be "" and
+	// violate the DB CHECK constraint, failing the entire backup.
+	type pendingMeta struct {
+		encIV       string
+		compressType string
+		storedSize  int64
+	}
+	pendingByHash := make(map[string]pendingMeta)
+
 	for i := range dedupResult.ToUpload {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -536,6 +590,16 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 			OriginalSize: origSize,
 			StoredSize:   storedSize,
 		})
+
+		// Record metadata so dedup-skipped files in this same batch (same hash)
+		// can build a valid backup_file record before AddBackupFilesBatch runs.
+		if entry.NewHash != "" {
+			pendingByHash[entry.NewHash] = pendingMeta{
+				encIV:        encIV,
+				compressType: compressType,
+				storedSize:   storedSize,
+			}
+		}
 
 		e.progress.PublishLog(backupID, "info", "文件处理完成",
 			fmt.Sprintf("[%d/%d] %s 原始=%s 存储=%s 压缩=%s",
@@ -597,14 +661,34 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 
 		var encIV, compressType string
 		var storedSize int64
-		existingFiles, err := e.db.FileRepo.GetByHash(skipped.Hash)
-		if err == nil && len(existingFiles) > 0 {
-			bfRec, bfErr := e.db.BackupRepo.GetFileRestoreInfo(existingFiles[0].ID)
-			if bfErr == nil && bfRec != nil {
-				encIV = bfRec.EncryptedIV
-				compressType = bfRec.CompressType
-				storedSize = bfRec.StoredSize
+		// 1) Same-batch lookup: the source file was uploaded earlier in this
+		//    same executeBackup run, so its backup_file row is not in the DB
+		//    yet — read from the in-memory pendingByHash map.
+		if pm, ok := pendingByHash[skipped.Hash]; ok {
+			encIV = pm.encIV
+			compressType = pm.compressType
+			storedSize = pm.storedSize
+		} else {
+			// 2) Cross-batch lookup: the hash was uploaded in a previous
+			//    backup, so the backup_file row exists in the DB.
+			existingFiles, gErr := e.db.FileRepo.GetByHash(skipped.Hash)
+			if gErr == nil && len(existingFiles) > 0 {
+				bfRec, bfErr := e.db.BackupRepo.GetFileRestoreInfo(existingFiles[0].ID)
+				if bfErr == nil && bfRec != nil {
+					encIV = bfRec.EncryptedIV
+					compressType = bfRec.CompressType
+					storedSize = bfRec.StoredSize
+				}
 			}
+		}
+		// 3) Fallback: if neither source provided metadata, default to "none".
+		//    This satisfies the DB CHECK constraint (compress_type IN
+		//    ('zstd','none')) instead of leaving an empty string that would
+		//    fail the whole batch insert.
+		if compressType == "" {
+			compressType = "none"
+			e.logger.Warn("dedup-skipped file has no compress metadata, defaulting to none",
+				"path", skipped.Path, "hash", skipped.Hash)
 		}
 
 		origSize := int64(0)

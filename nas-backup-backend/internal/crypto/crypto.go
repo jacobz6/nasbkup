@@ -317,17 +317,24 @@ func (e *Encryptor) DecryptFile(inputPath, outputPath, ivBase64 string) error {
 			}
 		}
 
-		// Read ciphertext for this chunk (up to chunkSize).
-		n, readErr := in.Read(chunkBuf)
+		// Read ciphertext for this chunk. Use io.ReadFull instead of a single
+		// in.Read: Read is allowed to return fewer bytes than requested (a
+		// "short read"), which would truncate the GCM auth tag from the tail
+		// of the chunk and cause spurious "message authentication failed"
+		// errors. This is especially likely on NFS/SMB mounts or when a read
+		// is interrupted (EINTR). ReadFull loops until the buffer is full or
+		// EOF, so every full chunk reads exactly chunkSize bytes. The final
+		// chunk is smaller and yields io.ErrUnexpectedEOF with the partial
+		// bytes, which we decrypt as the last chunk.
+		n, readErr := io.ReadFull(in, chunkBuf)
 		if n == 0 {
-			if readErr == io.EOF {
+			// No ciphertext after a nonce — malformed file (nonce without
+			// ciphertext). Treat as end of stream.
+			if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
 				break
 			}
-			if readErr != nil {
-				return fmt.Errorf("read ciphertext for chunk %d: %w", chunkIdx, readErr)
-			}
+			return fmt.Errorf("read ciphertext for chunk %d: %w", chunkIdx, readErr)
 		}
-
 		ciphertext := chunkBuf[:n]
 
 		// Decrypt this chunk.
@@ -343,8 +350,14 @@ func (e *Encryptor) DecryptFile(inputPath, outputPath, ivBase64 string) error {
 
 		chunkIdx++
 
-		if readErr == io.EOF {
+		// io.ErrUnexpectedEOF means we read a partial (final) chunk; the file
+		// ends here. io.EOF with n>0 cannot happen for ReadFull, but guard
+		// anyway.
+		if readErr == io.ErrUnexpectedEOF || readErr == io.EOF {
 			break
+		}
+		if readErr != nil {
+			return fmt.Errorf("read ciphertext for chunk %d: %w", chunkIdx, readErr)
 		}
 	}
 

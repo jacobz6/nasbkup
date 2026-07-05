@@ -65,10 +65,10 @@ export const dashboardApi = {
 
 // Backup
 export const backupApi = {
-  trigger: (type: 'full' | 'incremental') =>
+  trigger: (type?: 'full' | 'incremental' | 'auto') =>
     request<{ backup_id: number; status: string }>('/backup/trigger', {
       method: 'POST',
-      body: JSON.stringify({ type }),
+      body: JSON.stringify(type ? { type } : {}),
     }),
   cancel: (backupId?: number) =>
     request<{ status: string }>(

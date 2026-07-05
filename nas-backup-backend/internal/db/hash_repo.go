@@ -62,19 +62,17 @@ func (r *HashRepository) GetByHash(hash string) (*models.HashIndexRecord, error)
 // Returns the hash record ID.
 func (r *HashRepository) Upsert(hash string, fileSize int64, storageKey string) (int64, error) {
 	now := Now()
-	result, err := r.db.Exec(`
+	var id int64
+	err := r.db.QueryRow(`
 		INSERT INTO hash_index (hash, file_size, storage_key, ref_count, created_at)
 		VALUES (?, ?, ?, 1, ?)
 		ON CONFLICT(hash) DO UPDATE SET ref_count = ref_count + 1
-	`, hash, fileSize, storageKey, now)
+		RETURNING id
+	`, hash, fileSize, storageKey, now).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("upsert hash index %q: %w", hash, err)
 	}
 
-	id, err := result.LastInsertId()
-	if err != nil {
-		return 0, fmt.Errorf("last insert id after upsert hash %q: %w", hash, err)
-	}
 	return id, nil
 }
 

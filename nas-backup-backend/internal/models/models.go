@@ -42,6 +42,7 @@ type BackupType string
 const (
 	BackupTypeFull         BackupType = "full"
 	BackupTypeIncremental  BackupType = "incremental"
+	BackupTypeAuto         BackupType = "auto"
 )
 
 // BackupStatus represents the current state of a backup session.

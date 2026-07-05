@@ -268,7 +268,10 @@ func runVerify(restorer *backup.Restorer, backupID *int64, expedited bool, args 
 		os.Exit(1)
 	}
 	// Confirm the restored file exists and matches expected size.
-	restoredPath := filepath.Join(tmpDir, filepath.Base(path))
+	// Restore preserves the immediate parent dir name for a single file
+	// (strips the grandparent), so /data/docs/report.pdf lands at
+	// tmpDir/docs/report.pdf.
+	restoredPath := filepath.Join(tmpDir, filepath.Base(filepath.Dir(path)), filepath.Base(path))
 	info, err := os.Stat(restoredPath)
 	if err != nil {
 		fmt.Printf("  ✗ restored file missing after restore: %v\n", err)

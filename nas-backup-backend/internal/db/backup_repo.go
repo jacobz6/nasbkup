@@ -368,6 +368,29 @@ func (r *BackupRepository) GetBackupFiles(backupID int64) ([]*models.BackupFileR
 	return records, nil
 }
 
+// GetBackupFileByFileID retrieves a single backup-file junction record for a
+// given (backupID, fileID) pair. Returns nil without error if no record matches.
+//
+// This replaces the previous resolveBackupFile approach which loaded ALL
+// backup_files of a session into memory and linearly scanned them per file,
+// causing O(N×M) behavior (e.g. 1e8 scans when restoring 1000 files from a
+// 100k-file backup). The indexed PRIMARY KEY (backup_id, file_id) makes this a
+// single-row lookup.
+func (r *BackupRepository) GetBackupFileByFileID(backupID, fileID int64) (*models.BackupFileRecord, error) {
+	row := r.db.QueryRow(`
+		SELECT backup_id, file_id, storage_key, encrypted_iv, auth_tag, compress_type, original_size, stored_size
+		FROM backup_files WHERE backup_id = ? AND file_id = ?
+	`, backupID, fileID)
+	rec, err := scanBackupFileRecord(row)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get backup file (backup=%d, file=%d): %w", backupID, fileID, err)
+	}
+	return rec, nil
+}
+
 // GetFileRestoreInfo retrieves the latest backup-file entry for a given file ID,
 // which is used to determine how to restore the file.
 // Returns nil without error if no record is found.
