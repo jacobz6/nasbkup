@@ -134,7 +134,10 @@ func (d *Deduplicator) Deduplicate(ctx context.Context, changes []scanner.FileCh
 	// Use a set to deduplicate storage_keys (multiple files may share the
 	// same hash, hence the same storage_key).
 	ossExists := map[string]bool{}
+	ossCheckFailed := map[string]bool{}
+	ossCheckPerformed := false
 	if len(pendingChecks) > 0 && d.storage != nil {
+		ossCheckPerformed = true
 		seen := map[string]struct{}{}
 		keys := make([]string, 0, len(pendingChecks))
 		for _, p := range pendingChecks {
@@ -150,25 +153,38 @@ func (d *Deduplicator) Deduplicate(ctx context.Context, changes []scanner.FileCh
 		}
 		ossExists = existsMap
 		for _, ke := range errs {
-			slog.Warn("dedup: OSS existence check failed for one key, treating as missing",
+			slog.Warn("dedup: OSS existence check failed for key, will re-upload to be safe",
 				"storage_key", ke.Key, "error", ke.Message)
+			ossCheckFailed[ke.Key] = true
 		}
 	}
 
 	// Pass 3: apply the OSS check results and finalize each pending change.
 	for _, p := range pendingChecks {
 		exists, checked := ossExists[p.existing.StorageKey]
-		// If the OSS check failed (key absent from map), fall back to skip
-		// to avoid blocking the entire backup on one transient rclone error.
-		ossMissing := checked && !exists
+		checkFailed := ossCheckFailed[p.existing.StorageKey]
+
+		// Determine if the OSS object is missing or unverifiable.
+		// Fail-close policy for backup safety:
+		//   - If OSS was NOT checked (storage is nil, e.g. tests), assume exists (legacy behavior).
+		//   - If OSS was checked AND (object not found OR check errored), re-upload.
+		//     This prevents silent data loss when rclone returns an unexpected error
+		//     (e.g. crypt remote not-found messages that don't match our keyword list).
+		var ossMissing bool
+		if !ossCheckPerformed {
+			ossMissing = false
+		} else {
+			ossMissing = checkFailed || (checked && !exists)
+		}
 
 		if ossMissing {
-			// OSS object missing — re-upload to restore data redundancy.
+			// OSS object missing or unverifiable — re-upload to restore data redundancy.
 			// Do NOT increment ref_count; the existing hash_index row will
 			// be reused (processAndUploadFile keeps the same storage_key).
-			slog.Info("dedup: OSS object missing, re-queuing for upload",
+			slog.Info("dedup: OSS object missing or unverifiable, re-queuing for upload",
 				"hash", truncateHash(p.change.NewHash, 16),
-				"storage_key", p.existing.StorageKey)
+				"storage_key", p.existing.StorageKey,
+				"check_failed", checkFailed)
 			result.ToUpload = append(result.ToUpload, DedupFileEntry{
 				FileChange: p.change,
 				StorageKey: p.existing.StorageKey,
@@ -177,9 +193,8 @@ func (d *Deduplicator) Deduplicate(ctx context.Context, changes []scanner.FileCh
 			continue
 		}
 
-		// OSS object exists (or check was skipped/failed — treat as exists
-		// to preserve legacy behavior on transient errors). Skip upload and
-		// increment ref count.
+		// OSS object exists (or OSS check was not performed because storage
+		// is nil, e.g. in tests). Skip upload and increment ref count.
 		if err := d.hashRepo.IncrementRef(p.change.NewHash); err != nil {
 			return nil, fmt.Errorf("increment ref for hash %q: %w", p.change.NewHash, err)
 		}

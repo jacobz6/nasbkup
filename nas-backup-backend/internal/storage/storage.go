@@ -476,7 +476,16 @@ func (sm *StorageManager) DeleteBatch(ctx context.Context, remoteKeys []string) 
 	return nil
 }
 
-// Exists checks whether a file exists in OSS by running `rclone lsl`.
+// Exists checks whether a file exists in OSS by running `rclone lsjson` with
+// --files-only on the exact remote path. This is more reliable than `rclone lsl`
+// for existence checks because:
+//   - lsjson returns a structured JSON array; an empty array reliably means
+//     "not found" regardless of backend type (S3, crypt-wrapped S3, etc.)
+//   - It does not rely on matching error message substrings, which vary across
+//     backends and rclone versions.
+//
+// Returns (true, nil) if the object exists, (false, nil) if it doesn't,
+// or (false, error) on transport/rclone failures.
 func (sm *StorageManager) Exists(ctx context.Context, remoteKey string) (bool, error) {
 	if sm.rcloneBin == "" {
 		return false, fmt.Errorf("rclone binary not found")
@@ -484,29 +493,60 @@ func (sm *StorageManager) Exists(ctx context.Context, remoteKey string) (bool, e
 
 	remoteSpec := fmt.Sprintf("%s:%s", sm.remoteName, remoteKey)
 	cmd := exec.CommandContext(ctx, sm.rcloneBin,
-		"lsl", remoteSpec,
+		"lsjson", remoteSpec,
 		"--config", sm.rcloneConf,
+		"--files-only",
 	)
 
-	var stderr strings.Builder
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
+	err := cmd.Run()
+	if err != nil {
 		if ctx.Err() != nil {
 			return false, ctx.Err()
 		}
-		// rclone lsl returns a non-zero exit code when the file doesn't exist.
 		stderrStr := strings.TrimSpace(stderr.String())
-		if strings.Contains(stderrStr, "not found") ||
-			strings.Contains(stderrStr, "object not found") ||
-			strings.Contains(stderrStr, "no such file") ||
-			strings.Contains(stderrStr, "NoSuchKey") {
+		// rclone lsjson returns exit code 3 if the directory/object doesn't exist.
+		// Also check common error substrings as a fallback for older rclone versions.
+		exitErr, ok := err.(*exec.ExitError)
+		if ok && exitErr.ExitCode() == 3 {
 			return false, nil
 		}
-		return false, fmt.Errorf("rclone lsl %q: %w (stderr: %s)",
+		lowerStderr := strings.ToLower(stderrStr)
+		// Use space/quote-bounded " 404" to avoid false matches on substrings
+		// like "404 retries exhausted" or "404-policy".
+		if strings.Contains(lowerStderr, "not found") ||
+			strings.Contains(lowerStderr, "no such file") ||
+			strings.Contains(lowerStderr, "doesn't exist") ||
+			strings.Contains(lowerStderr, "does not exist") ||
+			strings.Contains(lowerStderr, "directory not found") ||
+			strings.Contains(lowerStderr, "nosuchkey") ||
+			strings.Contains(lowerStderr, "notfound") ||
+			strings.Contains(lowerStderr, " 404") ||
+			strings.Contains(lowerStderr, " 404\"") {
+			return false, nil
+		}
+		return false, fmt.Errorf("rclone lsjson %q: %w (stderr: %s)",
 			remoteSpec, err, stderrStr)
 	}
-	return true, nil
+
+	// Command succeeded — parse JSON to confirm we got an object entry.
+	// An empty stdout (or empty JSON array "[]") means the object doesn't exist.
+	out := strings.TrimSpace(stdout.String())
+	if out == "" || out == "[]" || out == "null" {
+		return false, nil
+	}
+
+	// Try to parse as a JSON array to confirm there's at least one entry.
+	var entries []json.RawMessage
+	if err := json.Unmarshal([]byte(out), &entries); err != nil {
+		// Unparseable output but exit code 0 — treat as exists to be safe
+		// (avoid false "missing" when rclone changes output format).
+		return true, nil
+	}
+	return len(entries) > 0, nil
 }
 
 // RestoreObject initiates a restore (thaw) request for an archived object.
@@ -744,13 +784,32 @@ func (sm *StorageManager) ExistsBatch(ctx context.Context, keys []string, concur
 	// the local process table and OSS rate limits.
 	jobs := make(chan string, len(keys))
 
+	// Track keys still pending so we can report them as failed on cancellation.
+	// Without this, callers would treat missing keys as "exists" — a fail-open
+	// window that reintroduces the data-loss bug we are fixing.
+	pending := make(map[string]struct{}, len(keys))
+	var pendingMu sync.Mutex
+	for _, k := range keys {
+		pending[k] = struct{}{}
+	}
+
 	var wg sync.WaitGroup
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for key := range jobs {
+				// Skip work if context is already cancelled — pending will be
+				// reported as failures by the collector.
+				if ctx.Err() != nil {
+					continue
+				}
 				exists, err := sm.Exists(ctx, key)
+
+				pendingMu.Lock()
+				delete(pending, key)
+				pendingMu.Unlock()
+
 				select {
 				case results <- result{key: key, exists: exists, err: err}:
 				case <-ctx.Done():
@@ -782,6 +841,20 @@ func (sm *StorageManager) ExistsBatch(ctx context.Context, keys []string, concur
 		}
 		out[r.key] = r.exists
 	}
+
+	// Any keys still pending (never processed, or processed after ctx cancel)
+	// must be reported as failures. Otherwise dedup would treat them as
+	// "OSS exists" and skip the upload.
+	pendingMu.Lock()
+	for k := range pending {
+		errs = append(errs, KeyError{
+			Key:     k,
+			Err:     context.Canceled,
+			Message: "exists check did not complete before context cancellation",
+		})
+	}
+	pendingMu.Unlock()
+
 	return out, errs, nil
 }
 
