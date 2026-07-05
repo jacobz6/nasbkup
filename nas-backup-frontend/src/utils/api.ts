@@ -167,6 +167,17 @@ export const gcApi = {
     request<{ status: string }>('/gc', { method: 'POST' }),
 };
 
+// Reconcile (system sync)
+export const reconcileApi = {
+  // dry_run query param controls whether fixes are actually applied.
+  // When omitted, the backend uses cfg.Reconcile.DryRun (default true).
+  run: (dryRun: boolean) =>
+    request<ReconcileReport>(
+      `/reconcile?dry_run=${dryRun ? 'true' : 'false'}`,
+      { method: 'POST' }
+    ),
+};
+
 // Types
 export interface DashboardStats {
   total_files: number;
@@ -373,4 +384,41 @@ export function createProgressStream(
     es.removeEventListener('connected', handleMessage);
     es.close();
   };
+}
+
+// ── Reconcile (system sync) ───────────────────────────────────────────────
+export interface RefCountMismatch {
+  hash: string;
+  stored_in_db: number;
+  actual_active: number;
+}
+
+export interface BackupStatusFix {
+  backup_id: number;
+  from: string;
+  to: string;
+  reason: string;
+}
+
+export interface ReconcileReport {
+  started_at: string;
+  finished_at: string;
+  duration: string;
+  dry_run: boolean;
+  // OSS ↔ hash_index
+  oss_only_orphans: string[];
+  dangling_hash_indexes_ref_zero: string[];
+  dangling_hash_indexes_ref_nonzero: string[];
+  // hash_index ↔ backup_files
+  orphan_backup_files: string[];
+  backup_files_missing_hash_index_but_in_oss: string[];
+  // ref_count drift
+  ref_count_mismatches: RefCountMismatch[];
+  // backup status corrections
+  failed_backups_with_files: BackupStatusFix[];
+  completed_backups_no_files: BackupStatusFix[];
+  // outcome
+  applied_fixes: string[];
+  skipped_fixes: string[];
+  errors: string[];
 }

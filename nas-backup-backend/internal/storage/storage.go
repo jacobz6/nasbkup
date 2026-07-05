@@ -552,6 +552,16 @@ func (sm *StorageManager) CheckRestored(remoteKey string) (bool, error) {
 	// GetObjectDetailedMeta returns full metadata including the X-Oss-Restore header.
 	meta, err := bucket.GetObjectDetailedMeta(remoteKey)
 	if err != nil {
+		errMsg := err.Error()
+		// Distinguish "object not found" (404 NoSuchKey) from other HEAD errors.
+		// A 404 means the object was never uploaded or has been deleted (e.g.
+		// by GC based on an inconsistent hash_index). This is a data-integrity
+		// problem, NOT a thaw issue — returning the generic "head object" error
+		// here caused restore to fail with the misleading message "check
+		// restore status failed" instead of pointing at the real problem.
+		if strings.Contains(errMsg, "404") || strings.Contains(errMsg, "NoSuchKey") {
+			return false, fmt.Errorf("object %q does not exist in OSS (404 NoSuchKey) — it may have been deleted by GC or never uploaded; verify hash_index/backup_files consistency (files.hash vs storage_key)", remoteKey)
+		}
 		return false, fmt.Errorf("head object %q: %w", remoteKey, err)
 	}
 
@@ -569,6 +579,49 @@ func (sm *StorageManager) CheckRestored(remoteKey string) (bool, error) {
 	}
 
 	return false, nil
+}
+
+// List returns all object keys under the given prefix (e.g. "data/").
+// Keys are returned as full paths relative to the bucket root, matching the
+// storage_key values stored in hash_index / backup_files.
+// Uses `rclone lsf <remote>:<prefix> --recursive` which lists objects only
+// (no directory markers). The returned keys are prefixed with prefix so they
+// compare directly to DB storage_key values.
+func (sm *StorageManager) List(prefix string) ([]string, error) {
+	if sm.rcloneBin == "" {
+		return nil, fmt.Errorf("rclone binary not found")
+	}
+
+	remoteSpec := fmt.Sprintf("%s:%s", sm.remoteName, prefix)
+	cmd := exec.Command(sm.rcloneBin,
+		"lsf", remoteSpec,
+		"--config", sm.rcloneConf,
+		"--recursive",
+	)
+
+	var (
+		stdout strings.Builder
+		stderr strings.Builder
+	)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("rclone lsf %q: %w (stderr: %s)",
+			remoteSpec, err, strings.TrimSpace(stderr.String()))
+	}
+
+	var keys []string
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// rclone lsf returns paths relative to the prefix; prepend the prefix
+		// so the keys match storage_key values stored in the database.
+		keys = append(keys, prefix+line)
+	}
+	return keys, nil
 }
 
 // GetStorageUsage returns the total storage used in the bucket in bytes.

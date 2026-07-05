@@ -94,6 +94,8 @@ func (r *Router) Setup() http.Handler {
 	// Restore & Garbage Collection
 	r.mux.HandleFunc("POST /api/restore", r.handleRestore)
 	r.mux.HandleFunc("POST /api/gc", r.handleGarbageCollection)
+	// Reconcile (system sync): keep OSS / hash_index / backup_files consistent.
+	r.mux.HandleFunc("POST /api/reconcile", r.handleReconcile)
 
 	return r.loggingMiddleware(r.corsMiddleware(r.mux))
 }

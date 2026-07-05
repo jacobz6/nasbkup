@@ -299,3 +299,61 @@ func (r *HashRepository) GetAllStorageKeys() ([]string, error) {
 	}
 	return keys, nil
 }
+
+// ListAll retrieves every hash index record. Used by the reconciler to compare
+// the DB index against OSS contents and against actual file references.
+func (r *HashRepository) ListAll() ([]*models.HashIndexRecord, error) {
+	rows, err := r.db.Query(`
+		SELECT id, hash, file_size, storage_key, ref_count, created_at
+		FROM hash_index ORDER BY id
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list all hash index records: %w", err)
+	}
+	defer rows.Close()
+
+	records := make([]*models.HashIndexRecord, 0)
+	for rows.Next() {
+		rec, err := scanHashIndexRecord(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan hash index row: %w", err)
+		}
+		records = append(records, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate all hash index records: %w", err)
+	}
+	return records, nil
+}
+
+// SetRefCount sets the ref_count of a hash record to the specified value.
+// Used by the reconciler to correct ref_count drift caused by missed
+// DecrementRef / IncrementRef calls during crashes.
+func (r *HashRepository) SetRefCount(hash string, count int) error {
+	if count < 0 {
+		count = 0
+	}
+	result, err := r.db.Exec(`UPDATE hash_index SET ref_count = ? WHERE hash = ?`, count, hash)
+	if err != nil {
+		return fmt.Errorf("set ref_count for hash %q: %w", hash, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected after set ref_count %q: %w", hash, err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("hash not found for set ref_count: %q", hash)
+	}
+	return nil
+}
+
+// DeleteByStorageKey removes a hash index record by its storage_key.
+// Used by the reconciler when an OSS object is missing AND ref_count is 0
+// (safe to drop the index entry). Returns nil without error if no row matched.
+func (r *HashRepository) DeleteByStorageKey(storageKey string) error {
+	_, err := r.db.Exec(`DELETE FROM hash_index WHERE storage_key = ?`, storageKey)
+	if err != nil {
+		return fmt.Errorf("delete hash index by storage_key %q: %w", storageKey, err)
+	}
+	return nil
+}

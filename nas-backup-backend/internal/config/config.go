@@ -21,6 +21,7 @@ type AppConfig struct {
 	OSS      OSSConfig      `yaml:"oss"`
 	Rclone   RcloneConfig   `yaml:"rclone"`
 	Logging  LoggingConfig  `yaml:"logging"`
+	Reconcile ReconcileConfig `yaml:"reconcile"`
 }
 
 // ServerConfig defines the HTTP server parameters.
@@ -95,6 +96,19 @@ type RetentionConfig struct {
 type EncryptionConfig struct {
 	Algorithm   string `yaml:"algorithm"`
 	KeyFilePath string `yaml:"key_file_path"`
+}
+
+// ReconcileConfig controls the system sync / reconciliation feature that
+// keeps OSS objects, the hash_index, backup_files and backups status
+// consistent after crashes or partial failures.
+type ReconcileConfig struct {
+	// DryRun controls the default behavior of the reconcile API. When true,
+	// inconsistencies are detected and reported but NOT fixed. The API
+	// accepts a ?dry_run=false query to override per-call.
+	DryRun bool `yaml:"dry_run"`
+	// OSSListPrefix is the OSS key prefix under which backup blobs are stored.
+	// All objects under this prefix are listed and compared to DB storage_keys.
+	OSSListPrefix string `yaml:"oss_list_prefix"`
 }
 
 // OSSConfig defines Alibaba Cloud OSS parameters.
@@ -192,6 +206,12 @@ func DefaultConfig() *AppConfig {
 			FilePath: "./data/logs/nas-backup.log",
 			MaxSize:  50,
 			MaxFiles: 10,
+		},
+		// Reconcile defaults to dry-run for safety. The operator must
+		// explicitly switch to auto-fix via config or API override.
+		Reconcile: ReconcileConfig{
+			DryRun:        true,
+			OSSListPrefix: "data/",
 		},
 	}
 }

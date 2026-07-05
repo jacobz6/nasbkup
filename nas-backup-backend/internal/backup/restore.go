@@ -235,6 +235,25 @@ func (r *Restorer) restoreFile(
 		os.Remove(decompressedPath)
 	}()
 
+	// Step 0: Validate hash consistency between files.hash and storage_key.
+	// The storage_key is built from the content hash (see generateStorageKey),
+	// so it MUST contain files.hash. A mismatch indicates the backup record
+	// was created by a buggy older version (double-hashing bug) where engine
+	// recomputed the hash over compressed data while files.hash stored the
+	// scanner's hash of the original file. In that case the hash_index is also
+	// inconsistent, and GC may have deleted the OSS object based on the
+	// hash_index ref_count while backup_files still references the old key.
+	// Failing early with a clear message is far more actionable than letting
+	// the downstream CheckRestored/Download return a cryptic 404.
+	if fileRec.Hash != "" && bfRec.StorageKey != "" {
+		if !strings.Contains(bfRec.StorageKey, fileRec.Hash) {
+			return fmt.Errorf("hash inconsistency detected for %q: files.hash=%s but storage_key=%s — "+
+				"this backup record was likely created by a buggy older version (double-hashing bug); "+
+				"the OSS object may have been deleted by GC. Re-run the backup with the current code to fix",
+				fileRec.Path, fileRec.Hash, bfRec.StorageKey)
+		}
+	}
+
 	// Step 1: Check if object needs thawing (ColdArchive objects).
 	restored, err := r.storage.CheckRestored(bfRec.StorageKey)
 	if err != nil {

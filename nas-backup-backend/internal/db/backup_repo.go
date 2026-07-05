@@ -448,3 +448,128 @@ func (r *BackupRepository) CleanupStaleRunning() (int64, error) {
 	}
 	return res.RowsAffected()
 }
+
+// ListFailedBackupsWithFiles returns failed backups that still have backup_files
+// rows attached. These are candidates for status correction: a backup that was
+// marked failed but whose files were actually uploaded should be re-evaluated.
+func (r *BackupRepository) ListFailedBackupsWithFiles() ([]*models.BackupRecord, error) {
+	rows, err := r.db.Query(`
+		SELECT id, type, status, base_backup_id,
+		       total_files, total_size, uploaded_size,
+		       skipped_dedup, skipped_inc, compress_saved,
+		       started_at, completed_at, error_message, created_at
+		FROM backups
+		WHERE status = 'failed'
+		  AND EXISTS (SELECT 1 FROM backup_files WHERE backup_id = backups.id)
+		ORDER BY id
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list failed backups with files: %w", err)
+	}
+	defer rows.Close()
+
+	records := make([]*models.BackupRecord, 0)
+	for rows.Next() {
+		rec, err := scanBackupRecord(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan failed backup row: %w", err)
+		}
+		records = append(records, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate failed backups with files: %w", err)
+	}
+	return records, nil
+}
+
+// ListCompletedBackupsWithoutFiles returns completed backups that have no
+// backup_files rows. These are candidates for status correction: a backup
+// marked completed but with no actual files backed up is likely an error.
+func (r *BackupRepository) ListCompletedBackupsWithoutFiles() ([]*models.BackupRecord, error) {
+	rows, err := r.db.Query(`
+		SELECT id, type, status, base_backup_id,
+		       total_files, total_size, uploaded_size,
+		       skipped_dedup, skipped_inc, compress_saved,
+		       started_at, completed_at, error_message, created_at
+		FROM backups
+		WHERE status = 'completed'
+		  AND NOT EXISTS (SELECT 1 FROM backup_files WHERE backup_id = backups.id)
+		ORDER BY id
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list completed backups without files: %w", err)
+	}
+	defer rows.Close()
+
+	records := make([]*models.BackupRecord, 0)
+	for rows.Next() {
+		rec, err := scanBackupRecord(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan completed backup row: %w", err)
+		}
+		records = append(records, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate completed backups without files: %w", err)
+	}
+	return records, nil
+}
+
+// CountBackupFiles returns the number of backup_files rows for a given backup.
+// Used by the reconciler to decide whether a failed backup actually has files.
+func (r *BackupRepository) CountBackupFiles(backupID int64) (int64, error) {
+	var count int64
+	err := r.db.QueryRow(
+		`SELECT COUNT(*) FROM backup_files WHERE backup_id = ?`, backupID,
+	).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count backup files for backup %d: %w", backupID, err)
+	}
+	return count, nil
+}
+
+// ListAllBackupFileStorageKeys returns the set of distinct storage_key values
+// referenced by backup_files. Used by the reconciler to detect orphan backup_files
+// rows whose storage_key is missing from hash_index.
+func (r *BackupRepository) ListAllBackupFileStorageKeys() (map[string]int, error) {
+	rows, err := r.db.Query(
+		`SELECT storage_key, COUNT(*) AS ref_count FROM backup_files GROUP BY storage_key`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list all backup file storage keys: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[string]int)
+	for rows.Next() {
+		var (
+			key      string
+			refCount int
+		)
+		if err := rows.Scan(&key, &refCount); err != nil {
+			return nil, fmt.Errorf("scan storage key row: %w", err)
+		}
+		result[key] = refCount
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate backup file storage keys: %w", err)
+	}
+	return result, nil
+}
+
+// DeleteBackupFilesByStorageKey removes all backup_files rows referencing the
+// given storage_key. Used by the reconciler when the storage_key has no
+// corresponding OSS object AND no hash_index entry (fully orphaned backup_files).
+func (r *BackupRepository) DeleteBackupFilesByStorageKey(storageKey string) (int64, error) {
+	res, err := r.db.Exec(
+		`DELETE FROM backup_files WHERE storage_key = ?`, storageKey,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("delete backup files by storage_key %q: %w", storageKey, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("rows affected after delete backup files by storage_key %q: %w", storageKey, err)
+	}
+	return affected, nil
+}

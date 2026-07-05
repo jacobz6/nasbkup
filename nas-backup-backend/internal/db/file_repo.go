@@ -396,3 +396,36 @@ func (r *FileRepository) GetByID(id int64) (*models.FileRecord, error) {
         }
         return rec, nil
 }
+
+// CountActiveByHash returns a map of hash → count of active files referencing
+// that hash. Used by the reconciler to rebuild ref_count for hash_index: the
+// expected ref_count for a hash equals the number of active files with that hash.
+// Hashes with empty hash value are excluded.
+func (r *FileRepository) CountActiveByHash() (map[string]int, error) {
+        rows, err := r.db.Query(`
+                SELECT hash, COUNT(*) AS cnt
+                FROM files
+                WHERE status = 'active' AND hash <> ''
+                GROUP BY hash
+        `)
+        if err != nil {
+                return nil, fmt.Errorf("count active files by hash: %w", err)
+        }
+        defer rows.Close()
+
+        result := make(map[string]int)
+        for rows.Next() {
+                var (
+                        hash string
+                        cnt  int
+                )
+                if err := rows.Scan(&hash, &cnt); err != nil {
+                        return nil, fmt.Errorf("scan count by hash row: %w", err)
+                }
+                result[hash] = cnt
+        }
+        if err := rows.Err(); err != nil {
+                return nil, fmt.Errorf("iterate count by hash: %w", err)
+        }
+        return result, nil
+}

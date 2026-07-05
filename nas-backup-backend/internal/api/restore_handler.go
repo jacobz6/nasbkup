@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/nas-backup/internal/models"
@@ -84,4 +86,84 @@ func (r *Router) handleGarbageCollection(w http.ResponseWriter, req *http.Reques
 	}()
 
 	r.jsonResponse(w, map[string]string{"status": "started"}, http.StatusAccepted)
+}
+
+// handleReconcile runs a single reconciliation pass that syncs OSS objects,
+// hash_index, backup_files, and backup status. The endpoint is synchronous
+// because reconcile produces a detailed report that the operator wants to
+// inspect immediately; long-running reconciles over very large OSS buckets
+// are still bounded by the request context.
+//
+// Query parameters:
+//   dry_run=true|false  override cfg.Reconcile.DryRun for this call.
+//                       If omitted, the config default is used.
+//
+// If a backup is currently running, reconcile returns 409 Conflict so the
+// caller can retry after the backup finishes.
+func (r *Router) handleReconcile(w http.ResponseWriter, req *http.Request) {
+	dryRun := r.config.Reconcile.DryRun
+	if v := req.URL.Query().Get("dry_run"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			r.jsonError(w, "invalid dry_run query parameter (use true/false)", http.StatusBadRequest)
+			return
+		}
+		dryRun = b
+	}
+
+	report, err := r.engine.Reconcile(req.Context(), dryRun)
+	if err != nil {
+		// A running backup returns an error; surface it as 409 so the client
+		// can distinguish from a real failure.
+		if report != nil && len(report.Errors) > 0 && containsAny(report.Errors, "currently running") {
+			r.jsonError(w, err.Error(), http.StatusConflict)
+			return
+		}
+		slog.Error("reconcile failed", "dry_run", dryRun, "error", err)
+		_ = r.db.LogRepo.Insert(nil, models.LogLevelError,
+			"reconcile failed", err.Error())
+		// Even on error we return the partial report so the operator can see
+		// what was discovered before the failure.
+		if report != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(models.APIResponse{
+				Success: false,
+				Error:   err.Error(),
+				Data:    report,
+			})
+			return
+		}
+		r.jsonError(w, fmt.Sprintf("reconcile failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	level := models.LogLevelInfo
+	msg := "reconcile completed (dry-run, no fixes applied)"
+	if !dryRun {
+		msg = fmt.Sprintf("reconcile completed: %d fixes applied", len(report.AppliedFixes))
+	}
+	_ = r.db.LogRepo.Insert(nil, level, msg,
+		fmt.Sprintf("oss_orphans=%d dangling_ref0=%d dangling_refn=%d orphan_bf=%d ref_mismatch=%d failed_with_files=%d completed_no_files=%d errors=%d",
+			len(report.OSSOnlyOrphans),
+			len(report.DanglingHashIndexesRefZero),
+			len(report.DanglingHashIndexesRefNonZero),
+			len(report.OrphanBackupFiles),
+			len(report.RefCountMismatches),
+			len(report.FailedBackupsWithFiles),
+			len(report.CompletedBackupsNoFiles),
+			len(report.Errors),
+		))
+
+	r.jsonResponse(w, report, http.StatusOK)
+}
+
+// containsAny reports whether any string in haystack contains substr.
+func containsAny(haystack []string, substr string) bool {
+	for _, s := range haystack {
+		if strings.Contains(s, substr) {
+			return true
+		}
+	}
+	return false
 }
