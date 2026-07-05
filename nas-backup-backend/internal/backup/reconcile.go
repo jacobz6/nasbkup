@@ -98,9 +98,24 @@ type ReconcileReport struct {
 // it is safe: it only mutates rows belonging to failed/completed backups and
 // orphan hash_index entries (ref_count=0), never running/pending ones.
 func (e *Engine) Reconcile(ctx context.Context, dryRun bool) (*ReconcileReport, error) {
+	// Initialize all slices as non-empty so they serialize to JSON as [] rather
+	// than null. Without this, dry-run reports (which never call append on
+	// AppliedFixes) would produce "applied_fixes": null and crash the frontend
+	// when it tries to read .length.
 	report := &ReconcileReport{
-		StartedAt: time.Now(),
-		DryRun:    dryRun,
+		StartedAt:                            time.Now(),
+		DryRun:                               dryRun,
+		OSSOnlyOrphans:                       []string{},
+		DanglingHashIndexesRefZero:           []string{},
+		DanglingHashIndexesRefNonZero:       []string{},
+		OrphanBackupFiles:                    []string{},
+		BackupFilesMissingHashIndexButInOSS: []string{},
+		RefCountMismatches:                   []RefCountMismatch{},
+		FailedBackupsWithFiles:               []BackupStatusFix{},
+		CompletedBackupsNoFiles:              []BackupStatusFix{},
+		AppliedFixes:                         []string{},
+		SkippedFixes:                         []string{},
+		Errors:                               []string{},
 	}
 	defer func() {
 		report.FinishedAt = time.Now()
@@ -155,7 +170,7 @@ func (e *Engine) Reconcile(ctx context.Context, dryRun bool) (*ReconcileReport, 
 	}
 
 	e.logger.Info("reconciliation completed",
-		"dry_run", dryRun, "duration", report.Duration,
+		"dry_run", dryRun, "duration", time.Since(report.StartedAt).String(),
 		"oss_only_orphans", len(report.OSSOnlyOrphans),
 		"dangling_ref_zero", len(report.DanglingHashIndexesRefZero),
 		"dangling_ref_nonzero", len(report.DanglingHashIndexesRefNonZero),

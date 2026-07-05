@@ -123,11 +123,25 @@ export function Reconcile() {
     try {
       const res = await reconcileApi.run(dryRun);
       if (res.success && res.data) {
-        setReport(res.data);
+        // Normalize nullable arrays: Go nil slices serialize as JSON null,
+        // which would crash .length / .map accesses below. Coalesce to [].
+        const r = res.data;
+        r.oss_only_orphans ??= [];
+        r.dangling_hash_indexes_ref_zero ??= [];
+        r.dangling_hash_indexes_ref_nonzero ??= [];
+        r.orphan_backup_files ??= [];
+        r.backup_files_missing_hash_index_but_in_oss ??= [];
+        r.ref_count_mismatches ??= [];
+        r.failed_backups_with_files ??= [];
+        r.completed_backups_no_files ??= [];
+        r.applied_fixes ??= [];
+        r.skipped_fixes ??= [];
+        r.errors ??= [];
+        setReport(r);
         if (dryRun) {
           addToast({ type: 'success', message: '对账扫描完成（预览模式，未做任何修改）' });
         } else {
-          addToast({ type: 'success', message: `对账完成：应用 ${res.data.applied_fixes?.length ?? 0} 项修复` });
+          addToast({ type: 'success', message: `对账完成：应用 ${r.applied_fixes.length} 项修复` });
         }
       } else {
         addToast({ type: 'error', message: res.error || '对账失败' });
