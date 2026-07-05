@@ -204,6 +204,12 @@ func (e *Engine) reconcileGatherAndCompare(ctx context.Context, report *Reconcil
 	}
 	ossSet := make(map[string]struct{}, len(ossKeys))
 	for _, k := range ossKeys {
+		// Defensive: skip directory markers (keys ending with "/").
+		// List uses --files-only so this should not happen, but guard
+		// against future rclone behavior changes or alternative callers.
+		if strings.HasSuffix(k, "/") {
+			continue
+		}
 		ossSet[k] = struct{}{}
 	}
 	e.logger.Info("reconcile: listed OSS objects", "count", len(ossKeys))
@@ -238,7 +244,10 @@ func (e *Engine) reconcileGatherAndCompare(ctx context.Context, report *Reconcil
 
 	// ── Compare: OSS ↔ hash_index ──────────────────────────────────────
 	// OSS-only orphans: in ossSet but not in hashByStorageKey.
-	for _, k := range ossKeys {
+	// Iterate ossSet (not ossKeys) so directory markers filtered out above
+	// are excluded — otherwise reconcile "fix" would try to delete directory
+	// paths, which rclone may interpret as recursive directory deletion.
+	for k := range ossSet {
 		if _, ok := hashByStorageKey[k]; !ok {
 			report.OSSOnlyOrphans = append(report.OSSOnlyOrphans, k)
 		}

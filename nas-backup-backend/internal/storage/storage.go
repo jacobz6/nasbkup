@@ -440,6 +440,11 @@ func (sm *StorageManager) Delete(ctx context.Context, remoteKey string) error {
 	if sm.rcloneBin == "" {
 		return fmt.Errorf("rclone binary not found")
 	}
+	// Reject directory paths: rclone delete on a directory path would
+	// recursively delete the entire directory tree, causing data loss.
+	if strings.HasSuffix(remoteKey, "/") {
+		return fmt.Errorf("delete rejected: storage_key %q looks like a directory (trailing slash)", remoteKey)
+	}
 
 	remoteSpec := fmt.Sprintf("%s:%s", sm.remoteName, remoteKey)
 	return sm.withRetry(ctx, defaultRetryCount, func() error {
@@ -658,6 +663,7 @@ func (sm *StorageManager) List(ctx context.Context, prefix string) ([]string, er
 		"lsf", remoteSpec,
 		"--config", sm.rcloneConf,
 		"--recursive",
+		"--files-only",
 	)
 
 	var (
