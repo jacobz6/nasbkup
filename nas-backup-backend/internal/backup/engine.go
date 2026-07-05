@@ -307,6 +307,14 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 				e.progress.PublishPhase(backupID, models.PhaseCompleted, "备份完成")
 			}
 		}
+		// 备份结束后延迟清空历史缓冲，让已连接的客户端有时间收到结束事件，
+		// 同时避免下次新连接回放过期的历史事件。
+		if e.progress != nil {
+			go func() {
+				time.Sleep(30 * time.Second)
+				e.progress.ClearHistory()
+			}()
+		}
 	}()
 
 	// ── Phase 1: Update status to running ──────────────────────────────
@@ -322,12 +330,17 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 
 	// ── Phase 2: Scan directories ──────────────────────────────────────
 	scanStart := time.Now()
+	e.logEvent(backupID, models.LogLevelInfo, "开始扫描目录", "")
 	scanResult, err := e.scanner.ScanWithProgress(func(scanned int) {
-		if e.progress != nil && scanned%200 == 0 {
-			// 扫描阶段无法预知总文件数，用对数曲线估算 0-5% 的进度，
-			// 让进度条有视觉反馈而非卡在 0%。
+		if e.progress != nil {
+			// 扫描阶段无法预知总文件数，用对数曲线估算 0-5% 的进度
 			pct := 5.0 * (1.0 - 1.0/float64(scanned/100+1))
 			e.progress.PublishProgress(backupID, models.PhaseScanning, scanned, 0, pct)
+			e.progress.PublishFile(backupID, models.PhaseScanning, fmt.Sprintf("已扫描 %d 个文件", scanned), 0)
+			if scanned%500 == 0 {
+				e.logEvent(backupID, models.LogLevelInfo, "扫描进行中",
+					fmt.Sprintf("已扫描 %d 个文件", scanned))
+			}
 		}
 	})
 	if err != nil {
@@ -338,8 +351,8 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 		"scanned", scanResult.TotalScanned,
 		"errors", len(scanResult.Errors),
 		"duration", time.Since(scanStart))
-	e.logEvent(backupID, models.LogLevelInfo, "scan completed",
-		fmt.Sprintf("changes=%d scanned=%d errors=%d duration=%s",
+	e.logEvent(backupID, models.LogLevelInfo, "扫描完成",
+		fmt.Sprintf("变更=%d 已扫描=%d 错误=%d 耗时=%s",
 			len(scanResult.Changes), scanResult.TotalScanned,
 			len(scanResult.Errors), time.Since(scanStart)))
 	if e.progress != nil {
@@ -360,26 +373,37 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 
 	// ── Phase 3: Compute hashes ────────────────────────────────────────
 	hashStart := time.Now()
+	if filesToHash == 0 {
+		e.logEvent(backupID, models.LogLevelInfo, "无需计算哈希", "没有新增或修改的文件")
+	} else {
+		e.logEvent(backupID, models.LogLevelInfo, "开始计算哈希",
+			fmt.Sprintf("共 %d 个文件需要计算", filesToHash))
+	}
 	if e.progress != nil {
-		e.progress.PublishPhase(backupID, models.PhaseHashing, fmt.Sprintf("正在计算 %d 个文件的哈希...", filesToHash))
+		e.progress.PublishPhase(backupID, models.PhaseHashing,
+			fmt.Sprintf("正在计算 %d 个文件的哈希...", filesToHash))
 	}
 	hashedCount := 0
-	if err := e.scanner.ComputeHashes(scanResult, func(done int) {
+	if err := e.scanner.ComputeHashes(scanResult, func(done, total int, path string, size int64) {
 		hashedCount = done
 		if e.progress != nil {
 			pct := 5.0
-			if filesToHash > 0 {
-				// 哈希阶段占 5%-30%（25% 权重，从扫描结束的 5% 开始）
-				pct = 5.0 + float64(done)/float64(filesToHash)*25
+			if total > 0 {
+				pct = 5.0 + float64(done)/float64(total)*25
 			}
-			e.progress.PublishProgress(backupID, models.PhaseHashing, done, filesToHash, pct)
+			e.progress.PublishProgress(backupID, models.PhaseHashing, done, total, pct)
+			e.progress.PublishFile(backupID, models.PhaseHashing, path, size)
+			// 逐文件哈希是高频事件，仅推送SSE实时面板，不写DB避免拖慢备份
+			e.progress.PublishLog(backupID, "info", "哈希计算",
+				fmt.Sprintf("[%d/%d] %s (%s)", done, total, path, formatSize(size)))
 		}
 	}); err != nil {
 		return fmt.Errorf("compute hashes: %w", err)
 	}
-	e.logger.Info("hash computation completed", "duration", time.Since(hashStart))
-	e.logEvent(backupID, models.LogLevelInfo, "hash computation completed",
-		fmt.Sprintf("files_hashed=%d duration=%s", hashedCount, time.Since(hashStart)))
+	if filesToHash > 0 {
+		e.logEvent(backupID, models.LogLevelInfo, "哈希计算完成",
+			fmt.Sprintf("已哈希 %d 个文件 耗时=%s", hashedCount, time.Since(hashStart)))
+	}
 
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -391,7 +415,6 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 		deletedPaths []string
 		skippedInc   int
 	)
-	// Build a path→FileChange map for later lookups (e.g. dedup skipped files).
 	fileChangeMap := make(map[string]scanner.FileChange)
 	for _, change := range scanResult.Changes {
 		fileChangeMap[change.Path] = change
@@ -403,15 +426,14 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 				skippedInc++
 				continue
 			}
-			// For full backups, include unchanged files so their ref counts
-			// and backup_files entries are refreshed.
 			changedFiles = append(changedFiles, change)
 		case scanner.Added, scanner.Modified:
 			changedFiles = append(changedFiles, change)
 		}
 	}
 	if skippedInc > 0 {
-		e.logger.Info("skipped unchanged files (incremental)", "count", skippedInc)
+		e.logEvent(backupID, models.LogLevelInfo, "增量备份跳过未变更文件",
+			fmt.Sprintf("count=%d", skippedInc))
 	}
 
 	if ctx.Err() != nil {
@@ -420,8 +442,10 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 
 	// ── Phase 5: Deduplicate ───────────────────────────────────────────
 	dedupStart := time.Now()
+	e.logEvent(backupID, models.LogLevelInfo, "开始去重分析",
+		fmt.Sprintf("待分析文件数=%d", len(changedFiles)))
 	if e.progress != nil {
-		e.progress.PublishPhase(backupID, models.PhaseDeduplicating, "正在进行去重分析...")
+		e.progress.PublishPhase(backupID, models.PhaseDeduplicating, "正在去重分析...")
 	}
 	dedupResult, err := e.dedup.Deduplicate(changedFiles)
 	if err != nil {
@@ -432,10 +456,10 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 		"skipped_dedup", len(dedupResult.Skipped),
 		"dedup_saved_bytes", dedupResult.TotalSaved,
 		"duration", time.Since(dedupStart))
-	e.logEvent(backupID, models.LogLevelInfo, "deduplication completed",
-		fmt.Sprintf("to_upload=%d skipped_dedup=%d dedup_saved_bytes=%d duration=%s",
+	e.logEvent(backupID, models.LogLevelInfo, "去重分析完成",
+		fmt.Sprintf("待上传=%d 去重跳过=%d 节省=%s 耗时=%s",
 			len(dedupResult.ToUpload), len(dedupResult.Skipped),
-			dedupResult.TotalSaved, time.Since(dedupStart)))
+			formatSize(dedupResult.TotalSaved), time.Since(dedupStart)))
 	if e.progress != nil {
 		e.progress.PublishProgress(backupID, models.PhaseDeduplicating, len(changedFiles), len(changedFiles), 35)
 	}
@@ -446,10 +470,17 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 
 	// ── Phase 6: Process files to upload (compress → encrypt → upload) ─
 	processStart := time.Now()
+	totalToProcess := len(dedupResult.ToUpload) + len(dedupResult.Skipped)
+	if totalToProcess == 0 {
+		e.logEvent(backupID, models.LogLevelInfo, "没有文件需要上传", "")
+	} else {
+		e.logEvent(backupID, models.LogLevelInfo, "开始处理文件",
+			fmt.Sprintf("待上传=%d 去重跳过=%d", len(dedupResult.ToUpload), len(dedupResult.Skipped)))
+	}
 	if e.progress != nil {
-		totalFiles := len(dedupResult.ToUpload) + len(dedupResult.Skipped)
-		if totalFiles > 0 {
-			e.progress.PublishPhase(backupID, models.PhaseUploading, fmt.Sprintf("正在上传 %d 个文件（%d 个去重跳过）...", len(dedupResult.ToUpload), len(dedupResult.Skipped)))
+		if totalToProcess > 0 {
+			e.progress.PublishPhase(backupID, models.PhaseUploading,
+				fmt.Sprintf("正在上传 %d 个文件（%d 个去重跳过）", len(dedupResult.ToUpload), len(dedupResult.Skipped)))
 		} else {
 			e.progress.PublishPhase(backupID, models.PhaseUploading, "没有文件需要上传")
 		}
@@ -468,23 +499,19 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 		backupFiles       []*models.BackupFileRecord
 	)
 
-	totalToProcess := len(dedupResult.ToUpload) + len(dedupResult.Skipped)
 	for i := range dedupResult.ToUpload {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		entry := &dedupResult.ToUpload[i]
 
-		// 降频发布 file 事件：首个文件立即发布，之后每 50 个发布一次，
-		// 避免大量小文件时事件洪流导致前端频繁 re-render。
-		if e.progress != nil && (i == 0 || i%50 == 0) {
-			e.progress.PublishFile(backupID, models.PhaseUploading, entry.Path, entry.Size)
-		}
+		e.progress.PublishLog(backupID, "info", "开始处理文件",
+			fmt.Sprintf("[%d/%d] %s (%s)", i+1, len(dedupResult.ToUpload), entry.Path, formatSize(entry.Size)))
 
 		fileID, origSize, storedSize, compressType, storageKey, encIV, err := e.processAndUploadFile(
-			entry, backupType, tmpDir)
+			entry, backupType, tmpDir, backupID)
 		if err != nil {
-			e.logEvent(backupID, models.LogLevelError, "file upload failed",
+			e.logEvent(backupID, models.LogLevelError, "文件处理失败",
 				fmt.Sprintf("path=%s error=%v", entry.Path, err))
 			return fmt.Errorf("process file %q: %w", entry.Path, err)
 		}
@@ -493,9 +520,9 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 		totalUploadedSize += storedSize
 
 		if compressType == "zstd" && origSize > 0 {
-			compressSaved += origSize - storedSize
-			if compressSaved < 0 {
-				compressSaved = 0
+			saved := origSize - storedSize
+			if saved > 0 {
+				compressSaved += saved
 			}
 		}
 
@@ -510,23 +537,19 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 			StoredSize:   storedSize,
 		})
 
-		e.logger.Info("file uploaded",
-			"path", entry.Path,
-			"storage_key", storageKey,
-			"original_size", origSize,
-			"stored_size", storedSize,
-			"compress_type", compressType)
-		e.logEvent(backupID, models.LogLevelInfo, "file uploaded",
-			fmt.Sprintf("path=%s size=%d stored=%d", entry.Path, origSize, storedSize))
+		e.progress.PublishLog(backupID, "info", "文件处理完成",
+			fmt.Sprintf("[%d/%d] %s 原始=%s 存储=%s 压缩=%s",
+				i+1, len(dedupResult.ToUpload), entry.Path,
+				formatSize(origSize), formatSize(storedSize), compressType))
 
 		if e.progress != nil {
 			processed := i + 1
 			pct := 35.0
 			if totalToProcess > 0 {
-				// 上传阶段占 35%-95%（60% 权重）
 				pct = 35.0 + float64(processed)/float64(totalToProcess)*60.0
 			}
 			e.progress.PublishProgress(backupID, models.PhaseUploading, processed, totalToProcess, pct)
+			e.progress.PublishFile(backupID, models.PhaseUploading, entry.Path, entry.Size)
 		}
 	}
 
@@ -535,13 +558,17 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if e.progress != nil && i%50 == 0 {
+		e.progress.PublishLog(backupID, "info", "去重跳过文件",
+			fmt.Sprintf("[%d/%d] %s (已存在)", i+1, len(dedupResult.Skipped), skipped.Path))
+
+		if e.progress != nil {
 			processed := len(dedupResult.ToUpload) + i + 1
 			pct := 35.0
 			if totalToProcess > 0 {
 				pct = 35.0 + float64(processed)/float64(totalToProcess)*60.0
 			}
 			e.progress.PublishProgress(backupID, models.PhaseUploading, processed, totalToProcess, pct)
+			e.progress.PublishFile(backupID, models.PhaseUploading, skipped.Path, 0)
 		}
 
 		var fileID int64
@@ -599,14 +626,10 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 		totalOriginalSize += origSize
 	}
 
-	e.logger.Info("file processing completed",
-		"files_uploaded", len(dedupResult.ToUpload),
-		"total_uploaded_size", totalUploadedSize,
-		"compress_saved", compressSaved,
-		"duration", time.Since(processStart))
-	e.logEvent(backupID, models.LogLevelInfo, "file processing completed",
-		fmt.Sprintf("files_uploaded=%d total_uploaded_size=%d compress_saved=%d duration=%s",
-			len(dedupResult.ToUpload), totalUploadedSize, compressSaved, time.Since(processStart)))
+	e.logEvent(backupID, models.LogLevelInfo, "文件处理全部完成",
+		fmt.Sprintf("已上传=%d 总上传量=%s 压缩节省=%s 耗时=%s",
+			len(dedupResult.ToUpload), formatSize(totalUploadedSize),
+			formatSize(compressSaved), time.Since(processStart)))
 
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -615,6 +638,8 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 	// ── Phase 7: Handle dedup-only files already done above ────────────
 
 	// ── Phase 8: Add all backup_files entries ──────────────────────────
+	e.logEvent(backupID, models.LogLevelInfo, "更新备份索引",
+		fmt.Sprintf("共 %d 条记录", len(backupFiles)))
 	if e.progress != nil {
 		e.progress.PublishPhase(backupID, models.PhaseFinalizing, "正在更新备份索引...")
 		e.progress.PublishProgress(backupID, models.PhaseFinalizing, 0, 1, 95)
@@ -627,11 +652,16 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 
 	// ── Phase 9: Mark deleted files and decrement ref counts ───────────
 	if len(deletedPaths) > 0 {
+		e.logEvent(backupID, models.LogLevelInfo, "标记已删除文件",
+			fmt.Sprintf("count=%d", len(deletedPaths)))
 		if err := e.db.FileRepo.MarkDeletedBatch(deletedPaths); err != nil {
 			return fmt.Errorf("mark deleted files: %w", err)
 		}
 
 		for _, path := range deletedPaths {
+			if e.progress != nil {
+				e.progress.PublishLog(backupID, "info", "标记删除", path)
+			}
 			fileRec, err := e.db.FileRepo.GetByPath(path)
 			if err != nil {
 				e.logger.Error("get file record for deleted path",
@@ -646,6 +676,14 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 				} else {
 					e.logger.Info("decremented ref count for deleted file",
 						"hash", fileRec.Hash, "new_ref_count", newRefCount, "path", path)
+					if e.progress != nil {
+						hashShort := fileRec.Hash
+						if len(hashShort) > 8 {
+							hashShort = hashShort[:8]
+						}
+						e.progress.PublishLog(backupID, "info", "引用计数递减",
+							fmt.Sprintf("%s hash=%s ref=%d", path, hashShort, newRefCount))
+					}
 				}
 			}
 		}
@@ -653,6 +691,9 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 
 	// ── Phase 10: Update backup stats ──────────────────────────────────
 	totalFiles := len(dedupResult.ToUpload) + len(dedupResult.Skipped)
+	e.logEvent(backupID, models.LogLevelInfo, "更新备份统计",
+		fmt.Sprintf("total_files=%d total_size=%s uploaded=%s",
+			totalFiles, formatSize(totalOriginalSize), formatSize(totalUploadedSize)))
 	if err := e.db.BackupRepo.UpdateStats(backupID,
 		totalFiles,
 		int(totalOriginalSize),
@@ -686,6 +727,7 @@ func (e *Engine) processAndUploadFile(
 	entry *dedup.DedupFileEntry,
 	backupType models.BackupType,
 	tmpDir string,
+	backupID int64,
 ) (fileID int64, originalSize int64, storedSize int64, compressType string, storageKey string, encIV string, err error) {
 
 	// Upsert file record first to get the file ID.
@@ -708,16 +750,26 @@ func (e *Engine) processAndUploadFile(
 
 	// Compress if applicable.
 	if e.compressor.ShouldCompress(entry.Path) {
+		if e.progress != nil {
+			e.progress.PublishLog(backupID, "info", "压缩文件", entry.Path)
+		}
 		_, compressedSize, compErr := e.compressor.Compress(entry.Path, compressedPath)
 		if compErr != nil {
 			return 0, 0, 0, "", "", "", fmt.Errorf("compress file: %w", compErr)
 		}
 		workingPath = compressedPath
 		compressType = "zstd"
+		if e.progress != nil {
+			e.progress.PublishLog(backupID, "info", "压缩完成",
+				fmt.Sprintf("%s %s→%s", entry.Path, formatSize(entry.Size), formatSize(compressedSize)))
+		}
 		_ = compressedSize
 	}
 
 	// Encrypt.
+	if e.progress != nil {
+		e.progress.PublishLog(backupID, "info", "加密文件", entry.Path)
+	}
 	encIV, err = e.encryptor.EncryptFile(workingPath, encryptedPath)
 	if err != nil {
 		return 0, 0, 0, "", "", "", fmt.Errorf("encrypt file: %w", err)
@@ -734,11 +786,18 @@ func (e *Engine) processAndUploadFile(
 	storageKey = e.generateStorageKey(backupType, entry.NewHash)
 
 	// Upload.
+	if e.progress != nil {
+		e.progress.PublishLog(backupID, "info", "上传文件",
+			fmt.Sprintf("%s → %s", entry.Path, storageKey))
+	}
 	if err := e.storage.Upload(encryptedPath, storageKey); err != nil {
 		return 0, 0, 0, "", "", "", fmt.Errorf("upload file: %w", err)
 	}
 
 	// Verify upload.
+	if e.progress != nil {
+		e.progress.PublishLog(backupID, "info", "验证上传", storageKey)
+	}
 	exists, verifyErr := e.storage.Exists(storageKey)
 	if verifyErr != nil {
 		return 0, 0, 0, "", "", "", fmt.Errorf("verify upload: %w", verifyErr)
@@ -748,6 +807,9 @@ func (e *Engine) processAndUploadFile(
 	}
 
 	// Upsert hash index record.
+	if e.progress != nil {
+		e.progress.PublishLog(backupID, "info", "更新哈希索引", entry.Path)
+	}
 	if _, hashErr := e.db.HashRepo.Upsert(entry.NewHash, entry.Size, storageKey); hashErr != nil {
 		return 0, 0, 0, "", "", "", fmt.Errorf("upsert hash record: %w", hashErr)
 	}
@@ -766,4 +828,23 @@ func (e *Engine) generateStorageKey(backupType models.BackupType, hash string) s
 	}
 
 	return fmt.Sprintf("data/%s-%s/%s/%s.enc", dateStr, typeStr, hashPrefix, hash)
+}
+
+// formatSize 将字节数格式化为人类可读的字符串。
+func formatSize(bytes int64) string {
+	const (
+		KB = 1024
+		MB = KB * 1024
+		GB = MB * 1024
+	)
+	switch {
+	case bytes >= GB:
+		return fmt.Sprintf("%.2fGB", float64(bytes)/float64(GB))
+	case bytes >= MB:
+		return fmt.Sprintf("%.2fMB", float64(bytes)/float64(MB))
+	case bytes >= KB:
+		return fmt.Sprintf("%.1fKB", float64(bytes)/float64(KB))
+	default:
+		return fmt.Sprintf("%dB", bytes)
+	}
 }

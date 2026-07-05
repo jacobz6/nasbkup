@@ -114,9 +114,10 @@ func (r *Router) handleBackupProgressStream(w http.ResponseWriter, req *http.Req
 	w.Header().Set("X-Accel-Buffering", "no")
 
 	pb := r.engine.ProgressBroker()
-	ch, unsub := pb.Subscribe()
+	ch, history, unsub := pb.Subscribe()
 	defer unsub()
 
+	// 1. 发送 connected 事件，前端据此重置状态准备接收历史
 	connectedEvent := models.ProgressEvent{
 		Type:      "connected",
 		Message:   "connected",
@@ -125,29 +126,17 @@ func (r *Router) handleBackupProgressStream(w http.ResponseWriter, req *http.Req
 	if err := backup.WriteSSEEvent(w, connectedEvent); err != nil {
 		return
 	}
-	_ = rc.Flush()
 
-	runningID, memRunning := r.engine.RunningBackupID()
-	if memRunning && runningID > 0 {
-		rec, dbErr := r.db.BackupRepo.GetByID(runningID)
-		if dbErr != nil {
-			slog.Warn("failed to get running backup record for SSE",
-				"backup_id", runningID, "error", dbErr)
-		}
-		if rec != nil {
-			statusEvent := models.ProgressEvent{
-				Type:      "phase",
-				BackupID:  runningID,
-				Phase:     models.PhaseUploading,
-				PhaseName: "备份运行中",
-				Message:   fmt.Sprintf("备份 #%d 正在运行", runningID),
-				Timestamp: time.Now(),
-			}
-			_ = backup.WriteSSEEvent(w, statusEvent)
-			_ = rc.Flush()
+	// 2. 回放历史事件，让客户端恢复完整的进度和日志状态。
+	//    解决切换页面后回来丢失进度/日志的问题。
+	for _, event := range history {
+		if err := backup.WriteSSEEvent(w, event); err != nil {
+			return
 		}
 	}
+	_ = rc.Flush()
 
+	// 3. 进入实时事件循环
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 

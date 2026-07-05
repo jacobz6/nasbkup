@@ -171,6 +171,11 @@ export function Dashboard() {
     const closeStream = createProgressStream((event: ProgressEvent) => {
       switch (event.type) {
         case 'connected':
+          // SSE 连接建立（包括重连），重置状态准备接收历史事件回放。
+          // 后端会在 connected 之后发送历史事件，前端按顺序应用即可恢复完整状态。
+          setProgress(initialProgress);
+          setLogs([]);
+          logCounter.current = 0;
           break;
         case 'phase': {
           const isEndPhase = event.phase === 'completed' || event.phase === 'failed' || event.phase === 'cancelled';

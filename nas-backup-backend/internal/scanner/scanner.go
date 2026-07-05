@@ -433,11 +433,21 @@ func (s *Scanner) shouldExclude(path string, exclusions []*models.ExclusionRule)
 	return false
 }
 
-// computeHashes computes SHA-256 hashes for all Added and Modified files in
+// ComputeHashes computes SHA-256 hashes for all Added and Modified files in
 // the scan result. After hashing, if the new hash matches the old hash, the
 // change is downgraded to Unchanged (false positive from mtime-only change).
-// The progress callback is invoked with the number of files hashed so far.
-func (s *Scanner) ComputeHashes(result *ScanResult, progress func(int)) error {
+// The progress callback is invoked with (done, total, filePath, fileSize)
+// for every file hashed, allowing fine-grained progress reporting.
+func (s *Scanner) ComputeHashes(result *ScanResult, progress func(done, total int, path string, size int64)) error {
+	// 先统计需要哈希的文件总数
+	total := 0
+	for i := range result.Changes {
+		ch := &result.Changes[i]
+		if (ch.ChangeType == Added || ch.ChangeType == Modified) && ch.NewHash == "" {
+			total++
+		}
+	}
+
 	hashed := 0
 	for i := range result.Changes {
 		change := &result.Changes[i]
@@ -464,7 +474,7 @@ func (s *Scanner) ComputeHashes(result *ScanResult, progress func(int)) error {
 
 		hashed++
 		if progress != nil {
-			progress(hashed)
+			progress(hashed, total, change.Path, change.Size)
 		}
 	}
 	return nil
