@@ -238,6 +238,40 @@ func (e *Engine) RunningBackupID() (int64, bool) {
 	return e.runningBackupID, e.runningBackupID > 0
 }
 
+// NeedsReconcile performs a lightweight check to detect whether the system's
+// data sources (hash_index, backup_files, backups status) have drifted out of
+// sync. It does NOT list OSS objects (that would require a slow rclone call),
+// so it may miss OSS-only orphans — but it catches the most common post-crash
+// inconsistencies: ref_count drift, failed backups with files, and completed
+// backups without files.
+func (e *Engine) NeedsReconcile() bool {
+	// 1. ref_count mismatches between hash_index and active files.
+	mismatch, err := e.db.HashRepo.HasRefCountMismatches()
+	if err != nil {
+		e.logger.Warn("needs-reconcile: check ref_count mismatches failed", "error", err)
+	} else if mismatch {
+		return true
+	}
+
+	// 2. Failed backups that still have backup_files rows.
+	failedWithFiles, err := e.db.BackupRepo.ListFailedBackupsWithFiles()
+	if err != nil {
+		e.logger.Warn("needs-reconcile: list failed backups with files failed", "error", err)
+	} else if len(failedWithFiles) > 0 {
+		return true
+	}
+
+	// 3. Completed backups that have no backup_files rows.
+	completedNoFiles, err := e.db.BackupRepo.ListCompletedBackupsWithoutFiles()
+	if err != nil {
+		e.logger.Warn("needs-reconcile: list completed backups without files failed", "error", err)
+	} else if len(completedNoFiles) > 0 {
+		return true
+	}
+
+	return false
+}
+
 // RunGarbageCollection cleans up orphan data in OSS and the database.
 func (e *Engine) RunGarbageCollection(ctx context.Context) error {
 	e.logger.Info("starting garbage collection")

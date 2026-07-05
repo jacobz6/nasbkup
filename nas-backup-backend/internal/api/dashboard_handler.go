@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/nas-backup/internal/models"
@@ -12,15 +13,26 @@ import (
 func (r *Router) handleDashboardStats(w http.ResponseWriter, req *http.Request) {
 	activeFiles, _ := r.db.FileRepo.CountByStatus(models.FileStatusActive)
 	activeSize, _ := r.db.FileRepo.TotalSizeByStatus(models.FileStatusActive)
-	dedupSaved, _ := r.db.HashRepo.TotalDedupSaved()
 	ossUsed, _ := r.db.HashRepo.OSSStorageUsed()
-	// Backed-up files = distinct files that have a corresponding backup_files
-	// entry (i.e. their content has been uploaded to OSS at least once).
-	backedUpFiles, _ := r.db.FileRepo.CountBackedUp()
+	uniqueHashes, _ := r.db.HashRepo.CountActiveHashes()
+	backupCount, _ := r.db.BackupRepo.CountByStatus(models.BackupStatusCompleted)
 	latestBackup, _ := r.db.BackupRepo.GetLatestCompleted()
 	dbRunning, _ := r.db.BackupRepo.IsRunning()
 	_, memRunning := r.engine.RunningBackupID()
 	isRunning := dbRunning || memRunning
+
+	// OSS quota is stored in config_kv (set via the Strategy page upload config).
+	ossQuotaBytes := int64(0)
+	if quotaStr, _ := r.db.ConfigRepo.Get("upload.oss_quota_bytes"); quotaStr != "" {
+		if v, err := strconv.ParseInt(quotaStr, 10, 64); err == nil {
+			ossQuotaBytes = v
+		}
+	}
+	// Storage class is also stored in config_kv; fall back to the YAML config.
+	storageClass, _ := r.db.ConfigRepo.Get("upload.storage_class")
+	if storageClass == "" {
+		storageClass = r.config.OSS.StorageClass
+	}
 
 	var lastBackupTime *time.Time
 	var lastBackupStatus models.BackupStatus
@@ -40,14 +52,22 @@ func (r *Router) handleDashboardStats(w http.ResponseWriter, req *http.Request) 
 	stats := &models.DashboardStats{
 		TotalFiles:          activeFiles,
 		TotalSize:           activeSize,
-		BackedUpFiles:       backedUpFiles,
-		BackedUpSize:        ossUsed,
+		OSSStorageUsed:      ossUsed,
+		OSSQuotaBytes:       ossQuotaBytes,
+		BackupCount:         backupCount,
+		UniqueHashCount:     uniqueHashes,
+		NeedsReconcile:      r.engine.NeedsReconcile(),
+		OSSInfo: models.OSSInfo{
+			StorageClass: storageClass,
+			Endpoint:     r.config.OSS.Endpoint,
+			Bucket:       r.config.OSS.Bucket,
+			RemoteName:   r.config.Rclone.RemoteName,
+			Region:       r.config.OSS.Region,
+		},
 		LastBackupTime:      lastBackupTime,
 		LastBackupStatus:    lastBackupStatus,
 		NextBackupTime:      nextBackupTime,
-		SavedByDedup:        dedupSaved,
 		ActiveBackupRunning: isRunning,
-		OSSStorageUsed:      ossUsed,
 	}
 
 	r.jsonResponse(w, stats, http.StatusOK)

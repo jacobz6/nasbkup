@@ -179,17 +179,26 @@ export const reconcileApi = {
 };
 
 // Types
+export interface OSSInfo {
+  storage_class: string;
+  endpoint: string;
+  bucket: string;
+  remote_name: string;
+  region: string;
+}
+
 export interface DashboardStats {
   total_files: number;
   total_size: number;
-  backed_up_files: number;
-  backed_up_size: number;
   oss_storage_used: number;
+  oss_quota_bytes: number;
+  backup_count: number;
+  unique_hash_count: number;
+  needs_reconcile: boolean;
+  oss_info: OSSInfo;
   last_backup_time: string | null;
   last_backup_status: string | null;
   next_backup_time: string | null;
-  saved_by_dedup: number;
-  saved_by_compress: number;
   active_backup_running: boolean;
 }
 
@@ -249,6 +258,7 @@ export interface UploadConfig {
   chunk_size_mb: number;
   retry_count: number;
   retry_delay_sec: number;
+  oss_quota_bytes: number;
 }
 
 export interface RetentionConfig {

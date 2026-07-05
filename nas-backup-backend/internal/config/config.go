@@ -340,6 +340,7 @@ func (c *AppConfig) ToModelsUploadConfig() models.UploadConfig {
 		ChunkSizeMB:    64,
 		RetryCount:     3,
 		RetryDelaySec:  5,
+		OSSQuotaBytes:  0, // 0 = unlimited; user sets via Strategy page
 	}
 }
 

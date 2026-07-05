@@ -5,6 +5,7 @@ import { useAppStore } from '@/store/useAppStore';
 import { TIMEZONE_OPTIONS, STORAGE_CLASS_MAP } from '@/utils/constants';
 import { LoadingSkeleton } from '@/components/shared/LoadingSkeleton';
 import { cn } from '@/lib/utils';
+import { formatFileSize } from '@/utils/format';
 
 export function Strategy() {
   const addToast = useAppStore((s) => s.addToast);
@@ -110,11 +111,15 @@ export function Strategy() {
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             <label className="space-y-1"><span className="text-sm text-slate-400">存储类型</span><select className="input-field" value={upload.storage_class} onChange={e => setUpload(d => ({ ...d, storage_class: e.target.value as UploadConfig['storage_class'] }))}>{Object.entries(STORAGE_CLASS_MAP).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}</select></label>
+            <label className="space-y-1"><span className="text-sm text-slate-400">OSS存储配额(MB) <span className="text-slate-600">(0=不限)</span></span><input type="number" min={0} className="input-field" value={Math.round(upload.oss_quota_bytes / (1024 * 1024))} onChange={e => setUpload(d => ({ ...d, oss_quota_bytes: +e.target.value * 1024 * 1024 }))} /></label>
             <label className="space-y-1"><span className="text-sm text-slate-400">并发数</span><input type="number" className="input-field" value={upload.max_concurrency} onChange={e => setUpload(d => ({ ...d, max_concurrency: +e.target.value }))} /></label>
             <label className="space-y-1"><span className="text-sm text-slate-400">分块大小(MB)</span><input type="number" className="input-field" value={upload.chunk_size_mb} onChange={e => setUpload(d => ({ ...d, chunk_size_mb: +e.target.value }))} /></label>
             <label className="space-y-1"><span className="text-sm text-slate-400">重试次数</span><input type="number" className="input-field" value={upload.retry_count} onChange={e => setUpload(d => ({ ...d, retry_count: +e.target.value }))} /></label>
             <label className="space-y-1"><span className="text-sm text-slate-400">重试延迟(秒)</span><input type="number" className="input-field" value={upload.retry_delay_sec} onChange={e => setUpload(d => ({ ...d, retry_delay_sec: +e.target.value }))} /></label>
           </div>
+          {upload.oss_quota_bytes > 0 && (
+            <p className="text-xs text-slate-500 mt-2">当前配额: {formatFileSize(upload.oss_quota_bytes)} (在仪表盘"OSS存储百分比"中作为分母使用)</p>
+          )}
         </div>
       )}
 

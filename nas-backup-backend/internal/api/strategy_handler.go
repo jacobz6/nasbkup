@@ -167,6 +167,7 @@ func (r *Router) handleGetUpload(w http.ResponseWriter, req *http.Request) {
 	chunkSizeStr, _ := r.db.ConfigRepo.Get("upload.chunk_size_mb")
 	retryCountStr, _ := r.db.ConfigRepo.Get("upload.retry_count")
 	retryDelayStr, _ := r.db.ConfigRepo.Get("upload.retry_delay_sec")
+	quotaStr, _ := r.db.ConfigRepo.Get("upload.oss_quota_bytes")
 
 	cfg := &models.UploadConfig{
 		StorageClass: storageClass,
@@ -183,10 +184,19 @@ func (r *Router) handleGetUpload(w http.ResponseWriter, req *http.Request) {
 	if retryDelayStr != "" {
 		cfg.RetryDelaySec, _ = strconv.Atoi(retryDelayStr)
 	}
+	if quotaStr != "" {
+		cfg.OSSQuotaBytes, _ = strconv.ParseInt(quotaStr, 10, 64)
+	}
 
 	// Fallback to app config defaults.
 	if cfg.StorageClass == "" {
 		fallback := r.config.ToModelsUploadConfig()
+		// Preserve user-set fields from DB (they take priority over defaults).
+		fallback.OSSQuotaBytes = cfg.OSSQuotaBytes
+		fallback.MaxConcurrency = cfg.MaxConcurrency
+		fallback.ChunkSizeMB = cfg.ChunkSizeMB
+		fallback.RetryCount = cfg.RetryCount
+		fallback.RetryDelaySec = cfg.RetryDelaySec
 		cfg = &fallback
 	}
 
@@ -207,6 +217,7 @@ func (r *Router) handleUpdateUpload(w http.ResponseWriter, req *http.Request) {
 		"upload.chunk_size_mb":   strconv.Itoa(cfg.ChunkSizeMB),
 		"upload.retry_count":     strconv.Itoa(cfg.RetryCount),
 		"upload.retry_delay_sec": strconv.Itoa(cfg.RetryDelaySec),
+		"upload.oss_quota_bytes": strconv.FormatInt(cfg.OSSQuotaBytes, 10),
 	}
 
 	for key, value := range kvPairs {

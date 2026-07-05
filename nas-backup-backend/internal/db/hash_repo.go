@@ -277,6 +277,40 @@ func (r *HashRepository) OSSStorageUsed() (int64, error) {
 	return total.Int64, nil
 }
 
+// CountActiveHashes returns the number of hash_index records with ref_count > 0,
+// i.e. unique content hashes currently referenced by at least one active file.
+func (r *HashRepository) CountActiveHashes() (int64, error) {
+	var count int64
+	err := r.db.QueryRow(`SELECT COUNT(*) FROM hash_index WHERE ref_count > 0`).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count active hash records: %w", err)
+	}
+	return count, nil
+}
+
+// HasRefCountMismatches returns true if any hash_index.ref_count disagrees with
+// the actual number of active files referencing that hash. This is a lightweight
+// single-query check used by the dashboard's "needs reconcile" indicator.
+func (r *HashRepository) HasRefCountMismatches() (bool, error) {
+	var exists int
+	err := r.db.QueryRow(`
+		SELECT EXISTS(
+			SELECT 1 FROM hash_index hi
+			LEFT JOIN (
+				SELECT hash, COUNT(*) AS cnt
+				FROM files
+				WHERE status = 'active' AND hash <> ''
+				GROUP BY hash
+			) fc ON hi.hash = fc.hash
+			WHERE COALESCE(fc.cnt, 0) <> hi.ref_count
+		)
+	`).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check ref_count mismatches: %w", err)
+	}
+	return exists == 1, nil
+}
+
 // GetAllStorageKeys retrieves all storage_key values from the hash index.
 // This is used for garbage collection to compare against objects in OSS storage.
 func (r *HashRepository) GetAllStorageKeys() ([]string, error) {

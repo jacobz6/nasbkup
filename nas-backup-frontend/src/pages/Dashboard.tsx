@@ -1,8 +1,9 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import {
   Play, Square, Trash2, Files, HardDrive,
-  FileCheck, ArrowDownToLine, RefreshCw, CheckCircle, Clock,
+  RefreshCw, CheckCircle, Clock,
   Activity, Terminal, XCircle, AlertCircle, Info,
+  Database, Cloud, Server,
 } from 'lucide-react';
 import {
   dashboardApi, backupApi, gcApi, createProgressStream,
@@ -17,7 +18,7 @@ import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { LoadingSkeleton, CardSkeleton } from '@/components/shared/LoadingSkeleton';
 import { useAppStore } from '@/store/useAppStore';
 import { formatFileSize, formatDateTime, formatRelativeTime } from '@/utils/format';
-import { BACKUP_TYPE_MAP } from '@/utils/constants';
+import { BACKUP_TYPE_MAP, STORAGE_CLASS_MAP } from '@/utils/constants';
 import { usePolling } from '@/hooks/usePolling';
 
 const historyColumns: Column<BackupRecord>[] = [
@@ -96,15 +97,22 @@ export function Dashboard() {
   const [stats, setStats] = useState<DashboardStats>({
     total_files: 0,
     total_size: 0,
-    backed_up_files: 0,
-    backed_up_size: 0,
     oss_storage_used: 0,
-    saved_by_dedup: 0,
-    saved_by_compress: 0,
-    active_backup_running: false,
+    oss_quota_bytes: 0,
+    backup_count: 0,
+    unique_hash_count: 0,
+    needs_reconcile: false,
+    oss_info: {
+      storage_class: '',
+      endpoint: '',
+      bucket: '',
+      remote_name: '',
+      region: '',
+    },
     last_backup_time: null,
     last_backup_status: '',
     next_backup_time: null,
+    active_backup_running: false,
   });
   const [history, setHistory] = useState<BackupRecord[]>([]);
   const [total, setTotal] = useState(0);
@@ -433,25 +441,140 @@ export function Dashboard() {
         </div>
       )}
 
-      {/* Gauge Charts */}
-      <div className="grid grid-cols-3 gap-4">
-        <div className="card p-6 flex items-center justify-center">
-          <GaugeChart value={stats.oss_storage_used} max={stats.total_size} label="OSS 存储使用" color="#38bdf8" />
+      {/* Dashboard: OSS Info Panel + 2 Gauges (3 columns) */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        {/* OSS Storage Info Panel */}
+        <div className="card p-6">
+          <div className="flex items-center gap-2 mb-4">
+            <Server size={18} className="text-brand-400" />
+            <h2 className="text-base font-semibold text-white">OSS 存储信息</h2>
+          </div>
+          <div className="space-y-3 text-sm">
+            <div className="flex items-center justify-between">
+              <span className="text-slate-400">归档类型</span>
+              <span className="text-slate-200 font-mono">
+                {STORAGE_CLASS_MAP[stats.oss_info.storage_class]?.label || stats.oss_info.storage_class || '默认'}
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-slate-400">节点地址</span>
+              <span className="text-slate-200 font-mono text-xs">{stats.oss_info.endpoint || '-'}</span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-slate-400">桶名称</span>
+              <span className="text-slate-200 font-mono text-xs">{stats.oss_info.bucket || '-'}</span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-slate-400">rclone 远程</span>
+              <span className="text-slate-200 font-mono text-xs">{stats.oss_info.remote_name || '-'}</span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-slate-400">区域</span>
+              <span className="text-slate-200 font-mono text-xs">{stats.oss_info.region || '-'}</span>
+            </div>
+          </div>
         </div>
-        <div className="card p-6 flex items-center justify-center">
-          <GaugeChart value={stats.saved_by_dedup} max={stats.total_size} label="去重节省" color="#34d399" />
+
+        {/* OSS Storage Percentage Gauge */}
+        <div className="card p-6 flex flex-col items-center justify-center">
+          <h2 className="text-base font-semibold text-white mb-2">OSS 存储百分比</h2>
+          {stats.oss_quota_bytes > 0 ? (
+            <GaugeChart
+              value={stats.oss_storage_used}
+              max={stats.oss_quota_bytes}
+              label="已用 / 配额"
+              color="#38bdf8"
+            />
+          ) : (
+            <div className="flex flex-col items-center gap-2 py-8">
+              <Cloud size={48} className="text-slate-600" />
+              <span className="text-sm text-slate-500">未设置存储配额</span>
+              <span className="text-xs text-slate-600">请在「策略设置 → 上传配置」中设置</span>
+            </div>
+          )}
+          {stats.oss_quota_bytes > 0 && (
+            <p className="text-xs text-slate-500 mt-2 text-center">
+              {formatFileSize(stats.oss_storage_used)} / {formatFileSize(stats.oss_quota_bytes)}
+            </p>
+          )}
         </div>
-        <div className="card p-6 flex items-center justify-center">
-          <GaugeChart value={stats.saved_by_compress} max={stats.total_size} label="压缩节省" color="#a78bfa" />
+
+        {/* Optimization Space Percentage Gauge */}
+        <div className="card p-6 flex flex-col items-center justify-center">
+          <h2 className="text-base font-semibold text-white mb-2">优化空间百分比</h2>
+          <GaugeChart
+            value={stats.oss_storage_used}
+            max={stats.total_size}
+            label="OSS占用 / 原始大小"
+            color="#34d399"
+          />
+          <p className="text-xs text-slate-500 mt-2 text-center">
+            {formatFileSize(stats.oss_storage_used)} / {formatFileSize(stats.total_size)}
+          </p>
         </div>
       </div>
 
-      {/* Stat Cards */}
-      <div className="grid grid-cols-4 gap-4">
-        <StatCard icon={Files} label="活跃文件" value={stats.total_files} iconColor="text-brand-400" />
-        <StatCard icon={FileCheck} label="已备份文件" value={stats.backed_up_files} iconColor="text-emerald-400" />
-        <StatCard icon={HardDrive} label="总文件大小" value={formatFileSize(stats.total_size)} iconColor="text-violet-400" />
-        <StatCard icon={ArrowDownToLine} label="已备份大小" value={formatFileSize(stats.backed_up_size)} iconColor="text-amber-400" />
+      {/* Stat Cards: 4 columns */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        {/* DB Info Card */}
+        <div className="card-hover p-5">
+          <div className="flex items-start justify-between mb-3">
+            <div className="space-y-2">
+              <p className="text-sm text-slate-400">数据库信息</p>
+              <p className="text-2xl font-mono font-bold text-white">{stats.backup_count} <span className="text-sm text-slate-400">次备份</span></p>
+            </div>
+            <div className="p-2.5 rounded-lg bg-surface-2 text-brand-400">
+              <Database size={20} />
+            </div>
+          </div>
+          <div className="space-y-1.5 text-xs">
+            <div className="flex items-center justify-between">
+              <span className="text-slate-500">唯一哈希记录</span>
+              <span className="text-slate-300 font-mono">{stats.unique_hash_count}</span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-slate-500">对账状态</span>
+              {stats.needs_reconcile ? (
+                <span className="flex items-center gap-1.5 text-rose-400">
+                  <span className="w-2 h-2 rounded-full bg-rose-500" />
+                  需要修复
+                </span>
+              ) : (
+                <span className="flex items-center gap-1.5 text-emerald-400">
+                  <span className="w-2 h-2 rounded-full bg-emerald-500" />
+                  正常
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* OSS Used Size */}
+        <StatCard
+          icon={Cloud}
+          label="OSS 占用大小"
+          value={formatFileSize(stats.oss_storage_used)}
+          subValue="优化空间百分比的分子"
+          iconColor="text-sky-400"
+        />
+
+        {/* Total File Size */}
+        <StatCard
+          icon={HardDrive}
+          label="总文件大小"
+          value={formatFileSize(stats.total_size)}
+          subValue="优化空间百分比的分母"
+          iconColor="text-violet-400"
+        />
+
+        {/* Backup File Count */}
+        <StatCard
+          icon={Files}
+          label="备份文件数"
+          value={stats.total_files}
+          subValue="NAS 备份范围内有效文件"
+          iconColor="text-brand-400"
+        />
       </div>
 
       {/* Action Buttons */}

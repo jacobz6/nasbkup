@@ -147,19 +147,29 @@ type ConfigRecord struct {
 
 // --- Dashboard ---
 
+// OSSInfo displays the rclone/OSS configuration details shown on the dashboard.
+type OSSInfo struct {
+	StorageClass string `json:"storage_class"` // configured storage class (e.g. "ColdArchive", "Archive")
+	Endpoint     string `json:"endpoint"`       // OSS endpoint, e.g. "oss-cn-hangzhou.aliyuncs.com"
+	Bucket       string `json:"bucket"`         // OSS bucket name
+	RemoteName   string `json:"remote_name"`    // rclone remote name, e.g. "oss-crypt"
+	Region       string `json:"region"`         // OSS region, e.g. "cn-hangzhou"
+}
+
 // DashboardStats aggregates the key metrics displayed on the dashboard.
 type DashboardStats struct {
-	TotalFiles         int64   `json:"total_files"`
-	TotalSize          int64   `json:"total_size"`
-	BackedUpFiles      int64   `json:"backed_up_files"`
-	BackedUpSize       int64   `json:"backed_up_size"`
-	OSSStorageUsed     int64   `json:"oss_storage_used"`
-	LastBackupTime     *time.Time `json:"last_backup_time,omitempty"`
-	LastBackupStatus   BackupStatus `json:"last_backup_status"`
-	NextBackupTime     *time.Time `json:"next_backup_time,omitempty"`
-	SavedByDedup       int64   `json:"saved_by_dedup"`
-	SavedByCompress    int64   `json:"saved_by_compress"`
-	ActiveBackupRunning bool   `json:"active_backup_running"`
+	TotalFiles          int64        `json:"total_files"`
+	TotalSize           int64        `json:"total_size"`
+	OSSStorageUsed      int64        `json:"oss_storage_used"`
+	OSSQuotaBytes       int64        `json:"oss_quota_bytes"`
+	BackupCount         int64        `json:"backup_count"`
+	UniqueHashCount     int64        `json:"unique_hash_count"`
+	NeedsReconcile      bool         `json:"needs_reconcile"`
+	OSSInfo             OSSInfo      `json:"oss_info"`
+	LastBackupTime      *time.Time   `json:"last_backup_time,omitempty"`
+	LastBackupStatus    BackupStatus `json:"last_backup_status"`
+	NextBackupTime      *time.Time   `json:"next_backup_time,omitempty"`
+	ActiveBackupRunning bool         `json:"active_backup_running"`
 }
 
 // --- Content selection ---
@@ -218,6 +228,7 @@ type UploadConfig struct {
 	ChunkSizeMB     int    `json:"chunk_size_mb"`
 	RetryCount      int    `json:"retry_count"`
 	RetryDelaySec   int    `json:"retry_delay_sec"`
+	OSSQuotaBytes   int64  `json:"oss_quota_bytes"`  // user-defined OSS storage quota in bytes; 0 = unlimited
 }
 
 // RetentionConfig defines how long to keep old data.

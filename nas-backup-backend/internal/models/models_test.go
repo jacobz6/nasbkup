@@ -227,14 +227,21 @@ func TestDashboardStats(t *testing.T) {
 	stats := DashboardStats{
 		TotalFiles:          1000,
 		TotalSize:           1024 * 1024 * 500,
-		BackedUpFiles:       800,
-		BackedUpSize:        1024 * 1024 * 400,
 		OSSStorageUsed:      1024 * 1024 * 300,
+		OSSQuotaBytes:       1024 * 1024 * 1024,
+		BackupCount:         15,
+		UniqueHashCount:     800,
+		NeedsReconcile:      false,
+		OSSInfo: OSSInfo{
+			StorageClass: "ColdArchive",
+			Endpoint:     "oss-cn-hangzhou.aliyuncs.com",
+			Bucket:       "my-bucket",
+			RemoteName:   "oss-crypt",
+			Region:       "cn-hangzhou",
+		},
 		LastBackupTime:      &now,
 		LastBackupStatus:    BackupStatusCompleted,
 		NextBackupTime:      &now,
-		SavedByDedup:        1024 * 1024 * 100,
-		SavedByCompress:     1024 * 1024 * 50,
 		ActiveBackupRunning: false,
 	}
 
