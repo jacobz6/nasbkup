@@ -422,8 +422,10 @@ func (r *BackupRepository) IsRunning() (bool, error) {
 
 // GetRunning returns the currently running backup record, or nil if none.
 func (r *BackupRepository) GetRunning() (*models.BackupRecord, error) {
-	row := r.db.QueryRow(`SELECT id, type, status, base_backup_id, created_at, started_at, completed_at,
-		total_files, total_size, uploaded_size, dedup_skipped, inc_skipped, compress_saved, error_message
+	row := r.db.QueryRow(`SELECT id, type, status, base_backup_id,
+		total_files, total_size, uploaded_size,
+		skipped_dedup, skipped_inc, compress_saved,
+		started_at, completed_at, error_message, created_at
 		FROM backups WHERE status = 'running' LIMIT 1`)
 	rec, err := scanBackupRecord(row)
 	if err != nil {
