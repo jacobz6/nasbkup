@@ -55,7 +55,20 @@ func (r *Router) handleRestoreCreate(w http.ResponseWriter, req *http.Request) {
 	// Delegate to RestoreJobManager for async job creation + start.
 	job, err := r.restoreJobMgr.CreateJob(&restoreReq)
 	if err != nil {
-		r.jsonError(w, err.Error(), http.StatusConflict)
+		errMsg := err.Error()
+		// Classify errors: validation/bad request vs conflict vs internal.
+		statusCode := http.StatusInternalServerError
+		if strings.Contains(errMsg, "currently running") || strings.Contains(errMsg, "already running") {
+			statusCode = http.StatusConflict
+		} else if strings.Contains(errMsg, "not under any allowed") ||
+			strings.Contains(errMsg, "no files found") ||
+			strings.Contains(errMsg, "output_dir is required") ||
+			strings.Contains(errMsg, "paths or pattern is required") ||
+			strings.Contains(errMsg, "exists but is not a directory") ||
+			strings.Contains(errMsg, "create output directory") {
+			statusCode = http.StatusBadRequest
+		}
+		r.jsonError(w, errMsg, statusCode)
 		return
 	}
 

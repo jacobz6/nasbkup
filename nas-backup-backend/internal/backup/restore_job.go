@@ -60,8 +60,8 @@ func (m *RestoreJobManager) CreateJob(req *models.RestoreRequest) (*models.Resto
 		return nil, err
 	}
 
-	// --- ensure output dir exists ---
-	if _, err := os.Stat(req.OutputDir); err != nil {
+	// --- ensure output dir exists and is a directory ---
+	if fi, err := os.Stat(req.OutputDir); err != nil {
 		if os.IsNotExist(err) {
 			if err := os.MkdirAll(req.OutputDir, 0755); err != nil {
 				return nil, fmt.Errorf("create output directory %q: %w", req.OutputDir, err)
@@ -69,6 +69,8 @@ func (m *RestoreJobManager) CreateJob(req *models.RestoreRequest) (*models.Resto
 		} else {
 			return nil, fmt.Errorf("stat output directory %q: %w", req.OutputDir, err)
 		}
+	} else if !fi.IsDir() {
+		return nil, fmt.Errorf("output path %q exists but is not a directory", req.OutputDir)
 	}
 
 	// --- resolve files to get total count/size ---
@@ -160,6 +162,13 @@ func (m *RestoreJobManager) executeJob(ctx context.Context, cancel context.Cance
 		cancel()
 	}()
 
+	// Fetch the job record to get total counts (captured once at start).
+	job, err := m.db.RestoreJobRepo.GetByID(jobID)
+	if err != nil || job == nil {
+		slog.Error("failed to load restore job for execution", "job_id", jobID, "error", err)
+		return
+	}
+
 	// Mark as running.
 	if err := m.db.RestoreJobRepo.UpdateStatus(jobID, models.RestoreJobStatusRunning, ""); err != nil {
 		slog.Error("failed to mark restore job as running", "job_id", jobID, "error", err)
@@ -172,11 +181,15 @@ func (m *RestoreJobManager) executeJob(ctx context.Context, cancel context.Cance
 
 	// Track progress in real-time via callback.
 	var (
-		mu             sync.Mutex
+		mu          sync.Mutex
 		restoredCount int
 		restoredSize  int64
-		failedPaths    []string
+		failedPaths   []string
 	)
+
+	// Capture total values once at start to avoid per-file DB queries.
+	totalFiles := job.TotalFiles
+	totalSize := job.TotalSize
 
 	onProgress := func(filePath string, fileSize int64, restored bool, err error) {
 		mu.Lock()
@@ -195,17 +208,16 @@ func (m *RestoreJobManager) executeJob(ctx context.Context, cancel context.Cance
 			m.progress.PublishLog(jobID, "error", msg, "")
 		}
 
-		// Get total from the job record.
-		job, _ := m.db.RestoreJobRepo.GetByID(jobID)
-		total := job.TotalFiles
 		var percent float64
-		if total > 0 {
-			percent = float64(restoredCount) / float64(total) * 100
+		if totalFiles > 0 {
+			percent = float64(restoredCount) / float64(totalFiles) * 100
 		}
-		m.progress.PublishProgress(jobID, restoredCount, total, percent, restoredSize, job.TotalSize)
+		m.progress.PublishProgress(jobID, restoredCount, totalFiles, percent, restoredSize, totalSize)
 
-		// Update DB periodically.
-		_ = m.db.RestoreJobRepo.UpdateProgress(jobID, restoredCount, restoredSize, failedPaths)
+		// Update DB periodically (every 10 files or on failure to reduce write pressure).
+		if restoredCount%10 == 0 || !restored {
+			_ = m.db.RestoreJobRepo.UpdateProgress(jobID, restoredCount, restoredSize, failedPaths)
+		}
 	}
 
 	opts := &RestoreOptions{
@@ -221,9 +233,16 @@ func (m *RestoreJobManager) executeJob(ctx context.Context, cancel context.Cance
 	mu.Lock()
 	finalFailed := make([]string, len(failedPaths))
 	copy(finalFailed, failedPaths)
-	finalRestored := restoredCount
-	finalRestoredSize := restoredSize
 	mu.Unlock()
+
+	// Collect final counters from result (if available), otherwise fall back to callback-tracked values.
+	finalRestoredFiles := restoredCount
+	finalRestoredSize := restoredSize
+	if result != nil {
+		finalRestoredFiles = result.RestoredFiles
+		finalRestoredSize = result.TotalSize
+		finalFailed = append(finalFailed, result.FailedFiles...)
+	}
 
 	if err != nil {
 		if ctx.Err() != nil {
@@ -234,16 +253,17 @@ func (m *RestoreJobManager) executeJob(ctx context.Context, cancel context.Cance
 			_ = m.db.RestoreJobRepo.UpdateStatus(jobID, models.RestoreJobStatusFailed, err.Error())
 			m.progress.PublishPhase(jobID, models.RestorePhaseFailed, fmt.Sprintf("恢复失败: %v", err))
 		}
-		_ = m.db.RestoreJobRepo.UpdateCompleted(jobID, finalRestored, finalRestoredSize, elapsedMs, finalFailed)
+		_ = m.db.RestoreJobRepo.UpdateCompleted(jobID, finalRestoredFiles, finalRestoredSize, elapsedMs, finalFailed)
 		return
 	}
 
-	// Merge result failed files.
-	allFailed := append(finalFailed, result.FailedFiles...)
-	_ = m.db.RestoreJobRepo.UpdateCompleted(jobID, result.RestoredFiles, result.TotalSize, elapsedMs, allFailed)
+	// Flush final progress and mark completed.
+	_ = m.db.RestoreJobRepo.UpdateProgress(jobID, finalRestoredFiles, finalRestoredSize, finalFailed)
+	_ = m.db.RestoreJobRepo.UpdateCompleted(jobID, finalRestoredFiles, finalRestoredSize, elapsedMs, finalFailed)
 	_ = m.db.RestoreJobRepo.UpdateStatus(jobID, models.RestoreJobStatusCompleted, "")
+	m.progress.PublishProgress(jobID, finalRestoredFiles, totalFiles, 100, finalRestoredSize, totalSize)
 	m.progress.PublishPhase(jobID, models.RestorePhaseCompleted,
-		fmt.Sprintf("恢复完成: %d/%d 个文件, %d 个失败", result.RestoredFiles, result.TotalFiles, len(allFailed)))
+		fmt.Sprintf("恢复完成: %d/%d 个文件, %d 个失败", finalRestoredFiles, totalFiles, len(finalFailed)))
 }
 
 // CancelJob cancels a running restore job.

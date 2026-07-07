@@ -60,7 +60,14 @@ func setupTestEnv(t *testing.T) *testEnv {
 	pb := backup.NewProgressBroker()
 	engine := backup.NewEngine(database, nil, nil, nil, nil, nil, cfg, pb)
 
-	router := NewRouter(engine, nil, nil, database, cfg)
+	// Create a Restorer with nil storage/encryptor/compressor — only DB
+	// operations (file listing) work, which is enough for validation tests
+	// that never trigger an actual restore.
+	restorer := backup.NewRestorer(database, nil, nil, nil, cfg)
+	restorePB := backup.NewRestoreProgressBroker()
+	restoreJobMgr := backup.NewRestoreJobManager(database, restorer, restorePB, cfg)
+
+	router := NewRouter(engine, restorer, restoreJobMgr, nil, database, cfg)
 	handler := router.Setup()
 	server := httptest.NewServer(handler)
 

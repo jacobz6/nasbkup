@@ -28,6 +28,7 @@ func scanRestoreJob(s scanner) (*models.RestoreJobRecord, error) {
 		backupID       sql.NullInt64
 		failedJSON     sql.NullString
 		errorMsg       sql.NullString
+		elapsedMs      sql.NullInt64
 		startedAt      sql.NullString
 		completedAt    sql.NullString
 		createdAt      string
@@ -37,7 +38,7 @@ func scanRestoreJob(s scanner) (*models.RestoreJobRecord, error) {
 		&rec.ID, &rec.Status, &pathsJSON, &pattern, &backupID,
 		&rec.OutputDir, &rec.Expedited, &rec.ConflictStrategy,
 		&rec.TotalFiles, &rec.RestoredFiles, &failedJSON,
-		&rec.TotalSize, &rec.RestoredSize, &rec.ElapsedMs,
+		&rec.TotalSize, &rec.RestoredSize, &elapsedMs,
 		&errorMsg, &createdAt, &startedAt, &completedAt,
 	); err != nil {
 		return nil, err
@@ -61,6 +62,9 @@ func scanRestoreJob(s scanner) (*models.RestoreJobRecord, error) {
 	}
 	if errorMsg.Valid {
 		rec.ErrorMessage = errorMsg.String
+	}
+	if elapsedMs.Valid {
+		rec.ElapsedMs = elapsedMs.Int64
 	}
 
 	t, err := time.Parse(time.RFC3339, createdAt)
