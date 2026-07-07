@@ -5,6 +5,7 @@ import { Content } from '@/pages/Content';
 import { Strategy } from '@/pages/Strategy';
 import { Logs } from '@/pages/Logs';
 import { Reconcile } from '@/pages/Reconcile';
+import { Restore } from '@/pages/Restore';
 
 function App() {
   return (
@@ -16,6 +17,7 @@ function App() {
           <Route path="/strategy" element={<Strategy />} />
           <Route path="/logs" element={<Logs />} />
           <Route path="/reconcile" element={<Reconcile />} />
+          <Route path="/restore" element={<Restore />} />
         </Route>
       </Routes>
     </BrowserRouter>

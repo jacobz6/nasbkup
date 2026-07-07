@@ -19,12 +19,13 @@ var migrationFS embed.FS
 
 // Database wraps a sql.DB connection and provides access to all repositories.
 type Database struct {
-	db         *sql.DB
-	FileRepo   *FileRepository
-	BackupRepo *BackupRepository
-	HashRepo   *HashRepository
-	LogRepo    *LogRepository
-	ConfigRepo *ConfigRepository
+	db              *sql.DB
+	FileRepo        *FileRepository
+	BackupRepo      *BackupRepository
+	HashRepo        *HashRepository
+	LogRepo         *LogRepository
+	ConfigRepo      *ConfigRepository
+	RestoreJobRepo  *RestoreJobRepository
 }
 
 // Open creates or opens the SQLite database at the given path and runs
@@ -69,6 +70,7 @@ func Open(dbPath string) (*Database, error) {
 	d.HashRepo = NewHashRepository(db)
 	d.LogRepo = NewLogRepository(db)
 	d.ConfigRepo = NewConfigRepository(db)
+	d.RestoreJobRepo = NewRestoreJobRepository(db)
 
 	return d, nil
 }

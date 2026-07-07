@@ -65,6 +65,12 @@ func (e *Engine) ProgressBroker() *ProgressBroker {
 // RunFullBackup executes a full backup synchronously.
 func (e *Engine) RunFullBackup(ctx context.Context) error {
 	e.mu.Lock()
+	// Mutual exclusion: check no restore is running.
+	restoreRunning, _ := e.db.RestoreJobRepo.IsRunning()
+	if restoreRunning {
+		e.mu.Unlock()
+		return fmt.Errorf("a restore is currently running; backup and restore cannot run concurrently")
+	}
 	if e.runningBackupID > 0 {
 		e.mu.Unlock()
 		return fmt.Errorf("a backup is already running")
@@ -92,6 +98,12 @@ func (e *Engine) RunFullBackup(ctx context.Context) error {
 // RunIncrementalBackup executes an incremental backup synchronously.
 func (e *Engine) RunIncrementalBackup(ctx context.Context) error {
 	e.mu.Lock()
+	// Mutual exclusion: check no restore is running.
+	restoreRunning, _ := e.db.RestoreJobRepo.IsRunning()
+	if restoreRunning {
+		e.mu.Unlock()
+		return fmt.Errorf("a restore is currently running; backup and restore cannot run concurrently")
+	}
 	if e.runningBackupID > 0 {
 		e.mu.Unlock()
 		return fmt.Errorf("a backup is already running")
@@ -159,6 +171,12 @@ func (e *Engine) determineBackupType() (models.BackupType, *int64, error) {
 // Use BackupTypeAuto to let the system automatically determine full vs incremental.
 func (e *Engine) StartBackup(backupType models.BackupType) (int64, error) {
 	e.mu.Lock()
+	// Mutual exclusion: check no restore is running.
+	restoreRunning, _ := e.db.RestoreJobRepo.IsRunning()
+	if restoreRunning {
+		e.mu.Unlock()
+		return 0, fmt.Errorf("a restore is currently running; backup and restore cannot run concurrently")
+	}
 	if e.runningBackupID > 0 {
 		e.mu.Unlock()
 		return 0, fmt.Errorf("a backup is already running")

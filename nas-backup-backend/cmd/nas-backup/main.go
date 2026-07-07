@@ -103,6 +103,17 @@ func main() {
 	engine := backup.NewEngine(database, sc, dd, comp, enc, stor, cfg, pb)
 	restorer := backup.NewRestorer(database, enc, comp, stor, cfg)
 
+	// Initialize restore progress broker and job manager
+	restorePB := backup.NewRestoreProgressBroker()
+	restoreJobMgr := backup.NewRestoreJobManager(database, restorer, restorePB, cfg)
+
+	// Clean up stale running restore jobs from previous crash
+	if restoreCleaned, err := restoreJobMgr.CleanupStaleRunning(); err != nil {
+		logger.Error("Failed to cleanup stale restore jobs: %v", err)
+	} else if restoreCleaned > 0 {
+		logger.Info("Cleaned up %d stale restore job(s)", restoreCleaned)
+	}
+
 	// Initialize scheduler
 	sched := scheduler.NewScheduler(engine, database, cfg)
 	if cfg.Backup.Schedule.Enabled {
@@ -115,7 +126,7 @@ func main() {
 	}
 
 	// Initialize router and setup HTTP handler
-	router := api.NewRouter(engine, restorer, sched, database, cfg)
+	router := api.NewRouter(engine, restorer, restoreJobMgr, sched, database, cfg)
 	handler := router.Setup()
 
 	// Create HTTP server

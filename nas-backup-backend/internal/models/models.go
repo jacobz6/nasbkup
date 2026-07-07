@@ -287,11 +287,12 @@ type BackupTriggerRequest struct {
 
 // RestoreRequest specifies what to restore and where.
 type RestoreRequest struct {
-	Paths      []string `json:"paths"`       // file/directory paths to restore
-	Pattern    string   `json:"pattern,omitempty"` // glob pattern for batch restore
-	BackupID   *int64   `json:"backup_id,omitempty"` // specific backup to restore from
-	OutputDir  string   `json:"output_dir"`   // where to place restored files
-	Expedited  bool     `json:"expedited"`    // use expedited OSS thaw
+	Paths            []string `json:"paths"`                      // file/directory paths to restore
+	Pattern          string   `json:"pattern,omitempty"`           // glob pattern for batch restore
+	BackupID         *int64   `json:"backup_id,omitempty"`       // specific backup to restore from
+	OutputDir        string   `json:"output_dir"`                 // where to place restored files
+	Expedited        bool     `json:"expedited"`                  // use expedited OSS thaw
+	ConflictStrategy string   `json:"conflict_strategy,omitempty"` // "overwrite" | "skip" | "rename"
 }
 
 // RestoreResult summarizes a restore operation.
@@ -374,4 +375,100 @@ type PaginatedResponse struct {
 	Total   int64       `json:"total"`
 	Page    int         `json:"page"`
 	Size    int         `json:"size"`
+}
+
+// ---------------------------------------------------------------------------
+// Restore job tracking
+// ---------------------------------------------------------------------------
+
+// RestoreJobStatus represents the lifecycle state of a restore job.
+type RestoreJobStatus string
+
+const (
+	RestoreJobStatusPending   RestoreJobStatus = "pending"
+	RestoreJobStatusRunning   RestoreJobStatus = "running"
+	RestoreJobStatusCompleted RestoreJobStatus = "completed"
+	RestoreJobStatusFailed    RestoreJobStatus = "failed"
+	RestoreJobStatusCancelled RestoreJobStatus = "cancelled"
+)
+
+// RestoreJobRecord tracks a single restore operation persisted in the database.
+type RestoreJobRecord struct {
+	ID               int64             `json:"id"`
+	Status           RestoreJobStatus  `json:"status"`
+	Paths            []string          `json:"paths,omitempty"`
+	Pattern          string            `json:"pattern,omitempty"`
+	BackupID         *int64            `json:"backup_id,omitempty"`
+	OutputDir        string            `json:"output_dir"`
+	Expedited        bool              `json:"expedited"`
+	ConflictStrategy string            `json:"conflict_strategy"`
+	TotalFiles       int               `json:"total_files"`
+	RestoredFiles    int               `json:"restored_files"`
+	FailedFiles      []string          `json:"failed_files,omitempty"`
+	TotalSize        int64             `json:"total_size"`
+	RestoredSize     int64             `json:"restored_size"`
+	ElapsedMs        int64             `json:"elapsed_ms,omitempty"`
+	ErrorMessage     string            `json:"error_message,omitempty"`
+	CreatedAt        time.Time         `json:"created_at"`
+	StartedAt        *time.Time        `json:"started_at,omitempty"`
+	CompletedAt      *time.Time        `json:"completed_at,omitempty"`
+}
+
+// RestorePhase represents the current phase of a running restore job.
+type RestorePhase string
+
+const (
+	RestorePhasePreparing   RestorePhase = "preparing"
+	RestorePhaseThawing     RestorePhase = "thawing"
+	RestorePhaseDownloading RestorePhase = "downloading"
+	RestorePhaseDecrypting  RestorePhase = "decrypting"
+	RestorePhaseDecompressing RestorePhase = "decompressing"
+	RestorePhaseVerifying   RestorePhase = "verifying"
+	RestorePhaseMoving      RestorePhase = "moving"
+	RestorePhaseCompleted   RestorePhase = "completed"
+	RestorePhaseFailed      RestorePhase = "failed"
+	RestorePhaseCancelled   RestorePhase = "cancelled"
+)
+
+// RestoreProgressEvent is sent via SSE for restore operations.
+type RestoreProgressEvent struct {
+	Type          string       `json:"type"`                       // "phase", "progress", "file", "log", "connected"
+	JobID         int64        `json:"job_id"`
+	Phase         RestorePhase `json:"phase,omitempty"`
+	PhaseName     string       `json:"phase_name,omitempty"`
+	Current       int          `json:"current,omitempty"`
+	Total         int          `json:"total,omitempty"`
+	Percent       float64      `json:"percent,omitempty"`
+	Message       string       `json:"message,omitempty"`
+	Detail        string       `json:"detail,omitempty"`
+	Level         string       `json:"level,omitempty"`            // for log events
+	FilePath      string       `json:"file_path,omitempty"`
+	FileSize      int64        `json:"file_size,omitempty"`
+	RestoredSize  int64        `json:"restored_size,omitempty"`
+	TotalSize     int64        `json:"total_size,omitempty"`
+	Timestamp     time.Time    `json:"timestamp"`
+}
+
+// FileProgressCallback is invoked by the Restorer after each file is processed
+// during a restore. It enables the RestoreJobManager to relay per-file progress
+// to the SSE broker without coupling the two components directly.
+type FileProgressCallback func(filePath string, fileSize int64, restored bool, err error)
+
+// RestorableFile represents a file that can be restored, enriched with its
+// backup metadata (storage key, compression type, backup count, etc.).
+// Used by GET /api/restore/files to let the frontend browse what is available.
+type RestorableFile struct {
+	ID             int64     `json:"id"`
+	Path           string    `json:"path"`
+	Size           int64     `json:"size"`
+	ModTime        time.Time `json:"mod_time"`
+	Hash           string    `json:"hash,omitempty"`
+	Status         string    `json:"status"`
+	BackupCount    int       `json:"backup_count"`
+	LatestBackupID int64     `json:"latest_backup_id"`
+	LatestBackupAt time.Time `json:"latest_backup_at"`
+	StorageKey     string    `json:"storage_key,omitempty"`
+	CompressType   string    `json:"compress_type,omitempty"`
+	OriginalSize   int64     `json:"original_size"`
+	StoredSize     int64     `json:"stored_size"`
 }

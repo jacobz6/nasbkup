@@ -432,3 +432,126 @@ export interface ReconcileReport {
   skipped_fixes: string[];
   errors: string[];
 }
+
+// ── Restore ───────────────────────────────────────────────────────
+
+export interface RestoreJobRecord {
+  id: number;
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
+  paths: string[];
+  pattern: string;
+  backup_id: number | null;
+  output_dir: string;
+  expedited: boolean;
+  conflict_strategy: string;
+  total_files: number;
+  restored_files: number;
+  failed_files: string[];
+  total_size: number;
+  restored_size: number;
+  elapsed_ms: number;
+  error_message: string;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+export interface RestoreRequest {
+  paths: string[];
+  pattern?: string;
+  backup_id?: number;
+  output_dir: string;
+  expedited?: boolean;
+  conflict_strategy?: 'overwrite' | 'skip' | 'rename';
+}
+
+export interface RestoreCreateResponse {
+  job_id: number;
+  status: string;
+  total_files: number;
+  total_size: number;
+}
+
+export interface RestorableFile {
+  id: number;
+  path: string;
+  size: number;
+  mod_time: string;
+  hash: string;
+  status: string;
+}
+
+export interface RestoreProgressEvent {
+  type: 'phase' | 'progress' | 'file' | 'log' | 'connected';
+  job_id: number;
+  phase?: string;
+  phase_name?: string;
+  current?: number;
+  total?: number;
+  percent?: number;
+  message?: string;
+  detail?: string;
+  file_path?: string;
+  file_size?: number;
+  restored_size?: number;
+  total_size?: number;
+  level?: string;
+  timestamp: string;
+}
+
+export const restoreApi = {
+  trigger: (data: RestoreRequest) =>
+    request<RestoreCreateResponse>('/restore', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  listFiles: (params?: { dir_path?: string; backup_id?: number; search?: string; page?: number; size?: number }) =>
+    paginatedRequest<RestorableFile>('/restore/files', params),
+  listJobs: (params?: { page?: number; size?: number; status?: string }) =>
+    paginatedRequest<RestoreJobRecord>('/restore/jobs', params),
+  getJob: (id: number) => request<RestoreJobRecord>(`/restore/jobs/${id}`),
+  cancelJob: (id: number) =>
+    request<{ status: string }>(`/restore/jobs/${id}/cancel`, { method: 'POST' }),
+  listBackups: (page = 1, size = 50) =>
+    paginatedRequest<BackupRecord>('/backups', { page, size }),
+};
+
+export function createRestoreProgressStream(
+  onEvent: (event: RestoreProgressEvent) => void,
+  onError?: (error: Event) => void
+): () => void {
+  if (typeof window === 'undefined') {
+    return () => {};
+  }
+
+  const es = new EventSource(`${API_BASE}/restore/progress/stream`);
+
+  const handleMessage = (e: MessageEvent) => {
+    try {
+      const event: RestoreProgressEvent = JSON.parse(e.data);
+      onEvent(event);
+    } catch (err) {
+      console.error('Failed to parse restore progress event:', err);
+    }
+  };
+
+  es.addEventListener('phase', handleMessage);
+  es.addEventListener('progress', handleMessage);
+  es.addEventListener('file', handleMessage);
+  es.addEventListener('log', handleMessage);
+  es.addEventListener('connected', handleMessage);
+
+  es.onerror = (e) => {
+    console.error('Restore progress stream error:', e);
+    if (onError) onError(e);
+  };
+
+  return () => {
+    es.removeEventListener('phase', handleMessage);
+    es.removeEventListener('progress', handleMessage);
+    es.removeEventListener('file', handleMessage);
+    es.removeEventListener('log', handleMessage);
+    es.removeEventListener('connected', handleMessage);
+    es.close();
+  };
+}

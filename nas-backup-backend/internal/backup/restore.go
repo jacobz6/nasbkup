@@ -38,6 +38,19 @@ type Restorer struct {
 	concurrency int // worker count for concurrent restore
 }
 
+// RestoreOptions configures a single restore operation.
+type RestoreOptions struct {
+	// ConflictStrategy controls behavior when the target file already exists.
+	// "skip" (default): skip the file, record as failed.
+	// "overwrite": delete the existing file and write the restored version.
+	// "rename": append a timestamp suffix to avoid collision.
+	ConflictStrategy string
+
+	// OnFileProgress is called after each file is processed (success or failure).
+	// Enables the caller to relay per-file progress to an SSE broker.
+	OnFileProgress models.FileProgressCallback
+}
+
 // NewRestorer creates a new Restorer with all required dependencies.
 // concurrency controls the worker pool for concurrent file restore; ≤ 0 falls
 // back to storage.DefaultBatchConcurrency.
@@ -61,6 +74,13 @@ func NewRestorer(database *db.Database, enc *crypto.Encryptor, comp *compress.Co
 // decompresses (if needed), verifies the hash, and moves each file to the output
 // directory.
 func (r *Restorer) Restore(ctx context.Context, req *models.RestoreRequest) (*models.RestoreResult, error) {
+	return r.RestoreWithOptions(ctx, req, nil)
+}
+
+// RestoreWithOptions restores files according to the given request with
+// additional options for conflict handling and progress reporting. When opts is
+// nil, the behaviour is identical to Restore.
+func (r *Restorer) RestoreWithOptions(ctx context.Context, req *models.RestoreRequest, opts *RestoreOptions) (*models.RestoreResult, error) {
 	start := time.Now()
 
 	// 1. Query file records matching the request.
@@ -108,6 +128,18 @@ func (r *Restorer) Restore(ctx context.Context, req *models.RestoreRequest) (*mo
 		TotalFiles: len(files),
 	}
 
+	// Determine conflict strategy from options.
+	conflictStrategy := ""
+	if opts != nil {
+		conflictStrategy = opts.ConflictStrategy
+	}
+
+	// onProgress is a convenience closure that calls the callback when set.
+	var onProgress models.FileProgressCallback
+	if opts != nil && opts.OnFileProgress != nil {
+		onProgress = opts.OnFileProgress
+	}
+
 	// Process files concurrently using a worker pool. restoreFile's pipeline
 	// (thaw → download → decrypt → decompress → verify → move) is self-contained
 	// per file, so parallelizing at the file level is safe. Thaw wait times
@@ -136,27 +168,28 @@ func (r *Restorer) Restore(ctx context.Context, req *models.RestoreRequest) (*mo
 				return
 			}
 
+			var restoreErr error
+
 			bfRec, err := r.resolveBackupFile(fileRec.ID, req.BackupID)
 			if err != nil {
 				slog.Error("resolve backup file record",
 					"path", fileRec.Path, "error", err)
-				mu.Lock()
-				result.FailedFiles = append(result.FailedFiles, fileRec.Path)
-				mu.Unlock()
-				continue
-			}
-			if bfRec == nil {
+				restoreErr = fmt.Errorf("resolve backup file: %w", err)
+			} else if bfRec == nil {
 				slog.Error("no backup file record found",
 					"path", fileRec.Path, "file_id", fileRec.ID)
-				mu.Lock()
-				result.FailedFiles = append(result.FailedFiles, fileRec.Path)
-				mu.Unlock()
-				continue
+				restoreErr = fmt.Errorf("no backup file record for file_id %d", fileRec.ID)
+			} else {
+				restoreErr = r.restoreFile(ctx, fileRec, bfRec, req.OutputDir, stripPrefix, req.Expedited, tmpDir, conflictStrategy)
 			}
 
-			if err := r.restoreFile(ctx, fileRec, bfRec, req.OutputDir, stripPrefix, req.Expedited, tmpDir); err != nil {
+			if onProgress != nil {
+				onProgress(fileRec.Path, fileRec.Size, restoreErr == nil, restoreErr)
+			}
+
+			if restoreErr != nil {
 				slog.Error("restore file failed",
-					"path", fileRec.Path, "error", err)
+					"path", fileRec.Path, "error", restoreErr)
 				mu.Lock()
 				result.FailedFiles = append(result.FailedFiles, fileRec.Path)
 				mu.Unlock()
@@ -222,6 +255,14 @@ func (r *Restorer) GetFileInfo(path string) (*models.FileRecord, *models.BackupF
 	return fileRec, bfRec, nil
 }
 
+// ResolveFilesForPreview queries the database for file records matching the
+// restore request. It is the public-exported version of resolveFiles, intended
+// for use by RestoreJobManager.CreateJob to preview total count/size before
+// persisting the job record.
+func (r *Restorer) ResolveFilesForPreview(req *models.RestoreRequest) ([]*models.FileRecord, error) {
+	return r.resolveFiles(req)
+}
+
 // resolveFiles queries the database for file records matching the restore request.
 func (r *Restorer) resolveFiles(req *models.RestoreRequest) ([]*models.FileRecord, error) {
 	var files []*models.FileRecord
@@ -234,7 +275,15 @@ func (r *Restorer) resolveFiles(req *models.RestoreRequest) ([]*models.FileRecor
 			}
 			if fileRec != nil && fileRec.Status == models.FileStatusActive {
 				files = append(files, fileRec)
+				continue
 			}
+			// GetByPath returned nil — the path may be a directory prefix.
+			// Try to list all active files under that directory.
+			dirFiles, err := r.db.FileRepo.ListActiveByDirectory(path)
+			if err != nil {
+				return nil, fmt.Errorf("list files under directory %q: %w", path, err)
+			}
+			files = append(files, dirFiles...)
 		}
 		return files, nil
 	}
@@ -271,7 +320,7 @@ func (r *Restorer) resolveBackupFile(fileID int64, backupID *int64) (*models.Bac
 }
 
 // restoreFile handles the complete restore pipeline for a single file:
-// thaw (if needed) → download → decrypt → decompress → verify → move.
+// thaw (if needed) → download → decrypt → decompress → verify → conflict check → move.
 func (r *Restorer) restoreFile(
 	ctx context.Context,
 	fileRec *models.FileRecord,
@@ -280,6 +329,7 @@ func (r *Restorer) restoreFile(
 	stripPrefix string,
 	expedited bool,
 	tmpDir string,
+	conflictStrategy string,
 ) error {
 	downloadedPath := filepath.Join(tmpDir, fmt.Sprintf("%d_download.enc", fileRec.ID))
 	decryptedPath := filepath.Join(tmpDir, fmt.Sprintf("%d_decrypted", fileRec.ID))
@@ -391,6 +441,30 @@ func (r *Restorer) restoreFile(
 		relPath = filepath.Base(fileRec.Path)
 	}
 	outputPath := filepath.Join(outputDir, relPath)
+
+	// Step 6a: Handle existing file conflict according to conflictStrategy.
+	if conflictStrategy != "" {
+		if _, statErr := os.Stat(outputPath); statErr == nil {
+			// File already exists at the destination.
+			switch conflictStrategy {
+			case "skip":
+				slog.Info("conflict: skipping existing file",
+					"path", fileRec.Path, "output", outputPath)
+				return fmt.Errorf("conflict: file already exists and strategy is skip: %s", outputPath)
+			case "overwrite":
+				if err := os.Remove(outputPath); err != nil {
+					return fmt.Errorf("conflict: remove existing file %q: %w", outputPath, err)
+				}
+				slog.Info("conflict: removed existing file for overwrite",
+					"path", fileRec.Path, "output", outputPath)
+			case "rename":
+				outputPath = fmt.Sprintf("%s.restored_%d", outputPath, time.Now().UnixMilli())
+				slog.Info("conflict: renamed to avoid collision",
+					"path", fileRec.Path, "new_output", outputPath)
+			}
+		}
+	}
+
 	if err := moveFile(workingPath, outputPath); err != nil {
 		return fmt.Errorf("move file to output directory: %w", err)
 	}
@@ -495,4 +569,22 @@ func longestCommonDirPrefix(files []*models.FileRecord) string {
 		}
 	}
 	return prefix
+}
+
+// ValidateOutputDir checks that outputDir is under one of the allowed base
+// directories. If allowedDirs is empty, no restriction is applied (for backward
+// compatibility). Both outputDir and each entry in allowedDirs are cleaned via
+// filepath.Clean before comparison.
+func ValidateOutputDir(outputDir string, allowedDirs []string) error {
+	if len(allowedDirs) == 0 {
+		return nil
+	}
+	cleaned := filepath.Clean(outputDir)
+	for _, base := range allowedDirs {
+		cleanedBase := filepath.Clean(base)
+		if strings.HasPrefix(cleaned, cleanedBase+string(filepath.Separator)) || cleaned == cleanedBase {
+			return nil
+		}
+	}
+	return fmt.Errorf("output directory %q is not under any allowed base directories %v", outputDir, allowedDirs)
 }

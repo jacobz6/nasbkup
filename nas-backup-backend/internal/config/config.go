@@ -27,10 +27,11 @@ type AppConfig struct {
 
 // ServerConfig defines the HTTP server parameters.
 type ServerConfig struct {
-	Host         string `yaml:"host"`
-	Port         int    `yaml:"port"`
-	ReadTimeout  int    `yaml:"read_timeout_sec"`
-	WriteTimeout int    `yaml:"write_timeout_sec"`
+	Host             string   `yaml:"host"`
+	Port             int      `yaml:"port"`
+	ReadTimeout      int      `yaml:"read_timeout_sec"`
+	WriteTimeout     int      `yaml:"write_timeout_sec"`
+	RestoreBaseDirs  []string `yaml:"restore_base_dirs"`
 }
 
 // DatabaseConfig defines the SQLite database parameters.

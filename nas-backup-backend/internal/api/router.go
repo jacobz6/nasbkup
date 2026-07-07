@@ -20,24 +20,27 @@ import (
 
 // Router registers HTTP routes and provides handler methods.
 type Router struct {
-	engine    *backup.Engine
-	restorer  *backup.Restorer
-	scheduler *scheduler.Scheduler
-	db        *db.Database
-	config    *config.AppConfig
-	mux       *http.ServeMux
+	engine        *backup.Engine
+	restorer      *backup.Restorer
+	restoreJobMgr *backup.RestoreJobManager
+	scheduler     *scheduler.Scheduler
+	db            *db.Database
+	config        *config.AppConfig
+	mux           *http.ServeMux
 }
 
 // NewRouter creates a new Router with all required dependencies.
 func NewRouter(engine *backup.Engine, restorer *backup.Restorer,
+	restoreJobMgr *backup.RestoreJobManager,
 	sched *scheduler.Scheduler, database *db.Database, cfg *config.AppConfig) *Router {
 	return &Router{
-		engine:    engine,
-		restorer:  restorer,
-		scheduler: sched,
-		db:        database,
-		config:    cfg,
-		mux:       http.NewServeMux(),
+		engine:        engine,
+		restorer:      restorer,
+		restoreJobMgr: restoreJobMgr,
+		scheduler:     sched,
+		db:            database,
+		config:        cfg,
+		mux:           http.NewServeMux(),
 	}
 }
 
@@ -91,8 +94,17 @@ func (r *Router) Setup() http.Handler {
 	r.mux.HandleFunc("GET /api/logs", r.handleListLogs)
 	r.mux.HandleFunc("GET /api/logs/{id}", r.handleGetLog)
 
-	// Restore & Garbage Collection
-	r.mux.HandleFunc("POST /api/restore", r.handleRestore)
+	// Restore operations (async job-based)
+	r.mux.HandleFunc("POST /api/restore", r.handleRestoreCreate)
+	r.mux.HandleFunc("GET /api/restore/files", r.handleRestoreListFiles)
+	r.mux.HandleFunc("GET /api/restore/progress/stream", r.handleRestoreProgressStream)
+	r.mux.HandleFunc("GET /api/restore/jobs", r.handleRestoreListJobs)
+	r.mux.HandleFunc("GET /api/restore/jobs/{id}", r.handleRestoreGetJob)
+	r.mux.HandleFunc("POST /api/restore/jobs/{id}/cancel", r.handleRestoreCancelJob)
+
+	// Backups list (for restore version selection)
+	r.mux.HandleFunc("GET /api/backups", r.handleListBackups)
+
 	r.mux.HandleFunc("POST /api/gc", r.handleGarbageCollection)
 	// Reconcile (system sync): keep OSS / hash_index / backup_files consistent.
 	r.mux.HandleFunc("POST /api/reconcile", r.handleReconcile)

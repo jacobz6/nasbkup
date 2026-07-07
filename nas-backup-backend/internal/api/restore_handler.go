@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/nas-backup/internal/backup"
 	"github.com/nas-backup/internal/models"
 )
 
@@ -28,8 +28,16 @@ const restoreTimeout = 4 * time.Hour
 // HTTP server's WriteTimeout (60s).
 const reconcileTimeout = 30 * time.Minute
 
-// handleRestore restores files from backup.
-func (r *Router) handleRestore(w http.ResponseWriter, req *http.Request) {
+// --- Restore handlers (async job-based) ---
+
+// handleRestoreCreate creates an async restore job and starts it.
+// Replaces the old synchronous handleRestore.
+func (r *Router) handleRestoreCreate(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		r.jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	var restoreReq models.RestoreRequest
 	if err := json.NewDecoder(req.Body).Decode(&restoreReq); err != nil {
 		r.jsonError(w, "invalid request body", http.StatusBadRequest)
@@ -44,38 +52,238 @@ func (r *Router) handleRestore(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Validate output directory exists and is a directory.
-	info, err := os.Stat(restoreReq.OutputDir)
+	// Delegate to RestoreJobManager for async job creation + start.
+	job, err := r.restoreJobMgr.CreateJob(&restoreReq)
 	if err != nil {
-		r.jsonError(w, fmt.Sprintf("output_dir does not exist: %v", err), http.StatusBadRequest)
-		return
-	}
-	if !info.IsDir() {
-		r.jsonError(w, "output_dir must be a directory", http.StatusBadRequest)
+		r.jsonError(w, err.Error(), http.StatusConflict)
 		return
 	}
 
-	// Use a detached context with a generous timeout: restore may need to wait
-	// for ColdArchive thaw (up to 30 min/object). Binding to req.Context()
-	// caused the restore to be cancelled when the HTTP client disconnected or
-	// the server's WriteTimeout elapsed, leaving partial/pending restores.
-	ctx, cancel := context.WithTimeout(context.Background(), restoreTimeout)
-	defer cancel()
-
-	result, err := r.restorer.Restore(ctx, &restoreReq)
-	if err != nil {
-		// Client may already be gone; log the failure either way.
-		slog.Error("restore failed",
-			"output_dir", restoreReq.OutputDir, "error", err)
-		r.jsonError(w, fmt.Sprintf("restore failed: %v", err), http.StatusInternalServerError)
+	// Start the job asynchronously.
+	if err := r.restoreJobMgr.StartJob(job.ID); err != nil {
+		r.jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	slog.Info("restore completed",
-		"restored", result.RestoredFiles, "failed", len(result.FailedFiles),
-		"output_dir", restoreReq.OutputDir)
-	r.jsonResponse(w, result, http.StatusOK)
+	r.jsonResponse(w, map[string]interface{}{
+		"job_id":      job.ID,
+		"status":      job.Status,
+		"total_files": job.TotalFiles,
+		"total_size":  job.TotalSize,
+	}, http.StatusAccepted)
 }
+
+// handleRestoreListFiles lists restorable files with pagination and search.
+// GET /api/restore/files?dir_path=...&backup_id=...&search=...&page=1&size=20
+func (r *Router) handleRestoreListFiles(w http.ResponseWriter, req *http.Request) {
+	dirPath := req.URL.Query().Get("dir_path")
+	search := req.URL.Query().Get("search")
+	backupIDStr := req.URL.Query().Get("backup_id")
+	page, size := parsePagination(req)
+
+	var backupID *int64
+	if backupIDStr != "" {
+		id, err := strconv.ParseInt(backupIDStr, 10, 64)
+		if err != nil {
+			r.jsonError(w, "invalid backup_id", http.StatusBadRequest)
+			return
+		}
+		backupID = &id
+	}
+
+	files, err := r.restorer.ListRestorableFiles(dirPath, backupID)
+	if err != nil {
+		r.jsonError(w, fmt.Sprintf("list restorable files: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Filter by search if provided.
+	if search != "" {
+		filtered := make([]*models.FileRecord, 0)
+		for _, f := range files {
+			if containsPath(f.Path, search) {
+				filtered = append(filtered, f)
+			}
+		}
+		files = filtered
+	}
+
+	// Build enriched response with backup metadata.
+	type enrichedFile struct {
+		ID      int64  `json:"id"`
+		Path    string `json:"path"`
+		Size    int64  `json:"size"`
+		ModTime string `json:"mod_time"`
+		Hash    string `json:"hash,omitempty"`
+		Status  string `json:"status"`
+	}
+
+	total := int64(len(files))
+	start := (page - 1) * size
+	end := start + size
+	if start > int(total) {
+		start = int(total)
+	}
+	if end > int(total) {
+		end = int(total)
+	}
+
+	result := make([]enrichedFile, 0, end-start)
+	for _, f := range files[start:end] {
+		result = append(result, enrichedFile{
+			ID:      f.ID,
+			Path:    f.Path,
+			Size:    f.Size,
+			ModTime: f.ModTime.Format(time.RFC3339),
+			Hash:    f.Hash,
+			Status:  string(f.Status),
+		})
+	}
+
+	r.jsonPaginatedResponse(w, result, total, page, size)
+}
+
+// containsPath checks if the path contains the search string (case-insensitive).
+func containsPath(path, search string) bool {
+	return len(search) == 0 ||
+		containsAny([]string{path}, search)
+}
+
+// handleRestoreProgressStream serves SSE for restore job progress.
+func (r *Router) handleRestoreProgressStream(w http.ResponseWriter, req *http.Request) {
+	rc := http.NewResponseController(w)
+	if err := rc.SetWriteDeadline(time.Time{}); err != nil {
+		slog.Warn("failed to disable write deadline for restore SSE", "error", err)
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	pb := r.restoreJobMgr.ProgressBroker()
+	ch, history, unsub := pb.Subscribe()
+	defer unsub()
+
+	// Send connected event.
+	connectedEvent := models.RestoreProgressEvent{
+		Type:      "connected",
+		Message:   "connected",
+		Timestamp: time.Now(),
+	}
+	if err := backup.WriteRestoreSSEEvent(w, connectedEvent); err != nil {
+		return
+	}
+
+	// Replay history.
+	for _, event := range history {
+		if err := backup.WriteRestoreSSEEvent(w, event); err != nil {
+			return
+		}
+	}
+	_ = rc.Flush()
+
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	ctx := req.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			fmt.Fprintf(w, ": heartbeat\n\n")
+			_ = rc.Flush()
+		case event, ok := <-ch:
+			if !ok {
+				return
+			}
+			if err := backup.WriteRestoreSSEEvent(w, event); err != nil {
+				return
+			}
+			_ = rc.Flush()
+		}
+	}
+}
+
+// handleRestoreListJobs lists restore job history.
+// GET /api/restore/jobs?page=1&size=10&status=completed
+func (r *Router) handleRestoreListJobs(w http.ResponseWriter, req *http.Request) {
+	page, size := parsePagination(req)
+	status := req.URL.Query().Get("status")
+
+	jobs, total, err := r.restoreJobMgr.ListJobs(page, size, status)
+	if err != nil {
+		r.jsonError(w, fmt.Sprintf("list restore jobs: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if jobs == nil {
+		jobs = make([]*models.RestoreJobRecord, 0)
+	}
+
+	r.jsonPaginatedResponse(w, jobs, total, page, size)
+}
+
+// handleRestoreGetJob returns a single restore job by ID.
+func (r *Router) handleRestoreGetJob(w http.ResponseWriter, req *http.Request) {
+	idStr := req.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		r.jsonError(w, "invalid job id", http.StatusBadRequest)
+		return
+	}
+
+	job, err := r.restoreJobMgr.GetJob(id)
+	if err != nil {
+		r.jsonError(w, fmt.Sprintf("get restore job: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if job == nil {
+		r.jsonError(w, "restore job not found", http.StatusNotFound)
+		return
+	}
+
+	r.jsonResponse(w, job, http.StatusOK)
+}
+
+// handleRestoreCancelJob cancels a running restore job.
+func (r *Router) handleRestoreCancelJob(w http.ResponseWriter, req *http.Request) {
+	idStr := req.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		r.jsonError(w, "invalid job id", http.StatusBadRequest)
+		return
+	}
+
+	if err := r.restoreJobMgr.CancelJob(id); err != nil {
+		r.jsonError(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	r.jsonResponse(w, map[string]string{"status": "cancelled"}, http.StatusOK)
+}
+
+// handleListBackups lists completed backup sessions for version selection.
+// GET /api/backups?page=1&size=10
+func (r *Router) handleListBackups(w http.ResponseWriter, req *http.Request) {
+	page, size := parsePagination(req)
+	offset := (page - 1) * size
+
+	backups, total, err := r.db.BackupRepo.List(size, offset)
+	if err != nil {
+		r.jsonError(w, fmt.Sprintf("list backups: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if backups == nil {
+		backups = make([]*models.BackupRecord, 0)
+	}
+
+	r.jsonPaginatedResponse(w, backups, total, page, size)
+}
+
+// --- Non-restore handlers (GC, Reconcile, Storage Health) ---
 
 // gcTimeout is the maximum duration for a garbage collection pass. Deleting
 // many orphan OSS objects can take several minutes; use a detached context

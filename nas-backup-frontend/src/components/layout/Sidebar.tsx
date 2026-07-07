@@ -1,11 +1,12 @@
 import { NavLink, useLocation } from 'react-router-dom';
-import { LayoutDashboard, FolderOpen, Settings, ScrollText, ShieldCheck, ChevronLeft, ChevronRight } from 'lucide-react';
+import { LayoutDashboard, FolderOpen, Settings, ScrollText, ShieldCheck, RotateCcw, ChevronLeft, ChevronRight } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useAppStore } from '@/store/useAppStore';
 
 const navItems = [
   { to: '/', icon: LayoutDashboard, label: '全览' },
   { to: '/content', icon: FolderOpen, label: '内容选择' },
+  { to: '/restore', icon: RotateCcw, label: '恢复' },
   { to: '/strategy', icon: Settings, label: '策略设置' },
   { to: '/logs', icon: ScrollText, label: '日志' },
   { to: '/reconcile', icon: ShieldCheck, label: '系统对账' },
