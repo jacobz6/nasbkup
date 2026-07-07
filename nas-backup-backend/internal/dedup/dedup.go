@@ -167,14 +167,18 @@ func (d *Deduplicator) Deduplicate(ctx context.Context, changes []scanner.FileCh
 		// Determine if the OSS object is missing or unverifiable.
 		// Fail-close policy for backup safety:
 		//   - If OSS was NOT checked (storage is nil, e.g. tests), assume exists (legacy behavior).
-		//   - If OSS was checked AND (object not found OR check errored), re-upload.
-		//     This prevents silent data loss when rclone returns an unexpected error
-		//     (e.g. crypt remote not-found messages that don't match our keyword list).
+		//   - If OSS was checked, the object is considered missing unless the
+		//     check explicitly confirmed it exists (checked && exists && !checkFailed).
+		//     This means a key absent from both ossExists and ossCheckFailed
+		//     (e.g. lost during ExistsBatch due to a race) is treated as
+		//     MISSING, not "exists" — preventing silent data loss.
 		var ossMissing bool
 		if !ossCheckPerformed {
 			ossMissing = false
 		} else {
-			ossMissing = checkFailed || (checked && !exists)
+			// Fail-close: only treat as "not missing" when the check
+			// succeeded AND reported exists=true AND no check failure.
+			ossMissing = checkFailed || !checked || !exists
 		}
 
 		if ossMissing {

@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +21,15 @@ import (
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 	"github.com/nas-backup/internal/config"
 )
+
+// truncateForLog returns the first n bytes of s, with a trailing "..." indicator
+// if truncation occurred. Used for safe logging of raw command output.
+func truncateForLog(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
 
 // defaultRetryCount is the default number of retries for rclone operations.
 const defaultRetryCount = 3
@@ -547,9 +557,16 @@ func (sm *StorageManager) Exists(ctx context.Context, remoteKey string) (bool, e
 	// Try to parse as a JSON array to confirm there's at least one entry.
 	var entries []json.RawMessage
 	if err := json.Unmarshal([]byte(out), &entries); err != nil {
-		// Unparseable output but exit code 0 — treat as exists to be safe
-		// (avoid false "missing" when rclone changes output format).
-		return true, nil
+		// Fail-close: unparseable output with exit code 0 is suspicious.
+		// Previously this returned (true, nil) — a fail-open policy that
+		// caused dedup to skip re-upload of missing OSS objects, leading
+		// to restore failures. Return an error so the caller treats the
+		// object as missing/unverifiable and re-uploads to be safe.
+		slog.Warn("storage: rclone lsjson returned unparseable output, treating as missing",
+			"remote_spec", remoteSpec, "stdout_len", len(out),
+			"stdout_preview", truncateForLog(out, 200))
+		return false, fmt.Errorf("rclone lsjson %q: unparseable output (exit 0, %d bytes): %s",
+			remoteSpec, len(out), truncateForLog(out, 200))
 	}
 	return len(entries) > 0, nil
 }
@@ -812,12 +829,18 @@ func (sm *StorageManager) ExistsBatch(ctx context.Context, keys []string, concur
 				}
 				exists, err := sm.Exists(ctx, key)
 
-				pendingMu.Lock()
-				delete(pending, key)
-				pendingMu.Unlock()
-
+				// Send result FIRST, then delete from pending. This prevents
+				// a lost-key window: if we delete from pending before sending
+				// and ctx is cancelled during the send, the key is absent from
+				// both pending and results — causing callers to treat it as
+				// "exists" (fail-open). By sending first, a cancelled send
+				// leaves the key in pending so the collector reports it as
+				// failed (fail-close).
 				select {
 				case results <- result{key: key, exists: exists, err: err}:
+					pendingMu.Lock()
+					delete(pending, key)
+					pendingMu.Unlock()
 				case <-ctx.Done():
 					return
 				}
