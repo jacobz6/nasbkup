@@ -124,11 +124,14 @@ type ReconcileConfig struct {
 }
 
 // OSSConfig defines Alibaba Cloud OSS parameters.
+// AccessKeyID and AccessKeySecret are intentionally NOT mapped to YAML —
+// they are read from environment variables (OSS_ACCESS_KEY_ID,
+// OSS_ACCESS_KEY_SECRET) in the storage layer to avoid secrets in config files.
 type OSSConfig struct {
 	Endpoint        string `yaml:"endpoint"`
 	Bucket          string `yaml:"bucket"`
-	AccessKeyID     string `yaml:"access_key_id"`
-	AccessKeySecret string `yaml:"access_key_secret"`
+	AccessKeyID     string `yaml:"-"` // read from env var OSS_ACCESS_KEY_ID
+	AccessKeySecret string `yaml:"-"` // read from env var OSS_ACCESS_KEY_SECRET
 	StorageClass    string `yaml:"storage_class"`
 	Region          string `yaml:"region"`
 }
@@ -291,8 +294,9 @@ func (c *AppConfig) Validate() error {
 		return fmt.Errorf("version_keep_count must be >= 1")
 	}
 
-	if c.OSS.Bucket == "" && c.OSS.AccessKeyID == "" {
-		// Allow starting without OSS config — will be configured via API.
+	if c.OSS.Bucket == "" {
+		// Allow starting without OSS config — will be configured via API
+		// or environment variables later.
 	}
 
 	return nil

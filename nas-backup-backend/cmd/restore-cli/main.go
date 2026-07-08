@@ -506,7 +506,7 @@ func runBootstrap(cfg *config.AppConfig, targetPath string) {
 		targetPath = cfg.Database.Path
 	}
 
-	svc := backup.NewDBBackupService(enc, stor, cfg)
+	svc := backup.NewDBBackupService(enc, stor, cfg, nil)
 	ctx := context.Background()
 
 	// List available versions.
@@ -536,7 +536,7 @@ func runBootstrap(cfg *config.AppConfig, targetPath string) {
 
 // runDBBackup manually triggers an encrypted database backup upload to OSS.
 func runDBBackup(stor *storage.StorageManager, enc *crypto.Encryptor, cfg *config.AppConfig) {
-	svc := backup.NewDBBackupService(enc, stor, cfg)
+	svc := backup.NewDBBackupService(enc, stor, cfg, nil)
 	ctx := context.Background()
 
 	fmt.Println("Starting database backup to OSS...")

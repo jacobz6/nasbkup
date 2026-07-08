@@ -113,7 +113,7 @@ func main() {
 	// After each successful backup, an encrypted copy of the database is
 	// automatically uploaded to OSS so that a new NAS can be bootstrapped
 	// from cloud backups using only master.key + rclone.conf.
-	dbBackupSvc := backup.NewDBBackupService(enc, stor, cfg)
+	dbBackupSvc := backup.NewDBBackupService(enc, stor, cfg, database.DB())
 	engine.SetDBBackupService(dbBackupSvc)
 
 	restorer := backup.NewRestorer(database, enc, comp, stor, cfg)

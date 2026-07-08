@@ -68,6 +68,10 @@ var validS3StorageClasses = map[string]bool{
 // NewStorageManager creates a StorageManager from the application configuration.
 // It locates the rclone binary at init time but does not fail if rclone is not found.
 // Operations requiring rclone will fail gracefully when invoked.
+//
+// OSS credentials (AccessKeyID, AccessKeySecret) are read from environment
+// variables OSS_ACCESS_KEY_ID and OSS_ACCESS_KEY_SECRET. They are NEVER read
+// from config.yaml to avoid storing secrets in config files.
 func NewStorageManager(cfg *config.AppConfig) (*StorageManager, error) {
 	storageClass := cfg.OSS.StorageClass
 	if storageClass != "" && !validS3StorageClasses[storageClass] {
@@ -77,6 +81,10 @@ func NewStorageManager(cfg *config.AppConfig) (*StorageManager, error) {
 		storageClass = ""
 	}
 
+	// Read OSS credentials from environment variables only — never from config files.
+	akID := os.Getenv("OSS_ACCESS_KEY_ID")
+	akSecret := os.Getenv("OSS_ACCESS_KEY_SECRET")
+
 	sm := &StorageManager{
 		rcloneBinCfg: cfg.Rclone.BinaryPath,
 		rcloneConf:   cfg.Rclone.ConfigPath,
@@ -84,8 +92,8 @@ func NewStorageManager(cfg *config.AppConfig) (*StorageManager, error) {
 		storageClass: storageClass,
 		ossEndpoint:  cfg.OSS.Endpoint,
 		ossBucket:    cfg.OSS.Bucket,
-		ossAKID:      cfg.OSS.AccessKeyID,
-		ossAKSecret:  cfg.OSS.AccessKeySecret,
+		ossAKID:      akID,
+		ossAKSecret:  akSecret,
 	}
 
 	// Try to find rclone binary, but don't fail if not found.

@@ -6,7 +6,9 @@ package backup
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -31,17 +33,22 @@ const (
 type DBBackupService struct {
 	encryptor *crypto.Encryptor
 	storage   *storage.StorageManager
-	dbPath    string // path to the local SQLite database file
+	dbPath    string       // path to the local SQLite database file
+	dbConn    *sql.DB      // raw DB connection for WAL checkpoint
 	config    *config.AppConfig
 	logger    *slog.Logger
 }
 
 // NewDBBackupService creates a new DBBackupService.
-func NewDBBackupService(enc *crypto.Encryptor, stor *storage.StorageManager, cfg *config.AppConfig) *DBBackupService {
+// dbConn is the live *sql.DB connection used to checkpoint the WAL before
+// copying the database file. It may be nil (e.g. in restore-cli bootstrap),
+// in which case WAL checkpoint is skipped.
+func NewDBBackupService(enc *crypto.Encryptor, stor *storage.StorageManager, cfg *config.AppConfig, dbConn *sql.DB) *DBBackupService {
 	return &DBBackupService{
 		encryptor: enc,
 		storage:   stor,
 		dbPath:    cfg.Database.Path,
+		dbConn:    dbConn,
 		config:    cfg,
 		logger:    slog.Default(),
 	}
@@ -61,12 +68,22 @@ func (s *DBBackupService) BackupDatabase(ctx context.Context) error {
 		return fmt.Errorf("database file not found: %s: %w", s.dbPath, err)
 	}
 
+	// Step 0: Checkpoint the SQLite WAL so all committed transactions are
+	// written to the main database file before we copy it. Without this,
+	// recent writes in the -wal file would be missing from the backup.
+	if s.dbConn != nil {
+		if _, err := s.dbConn.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+			s.logger.Warn("failed to checkpoint WAL, backup may be incomplete", "error", err)
+		}
+	}
+
 	timestamp := time.Now().UTC().Format("20060102-150405")
 	baseName := fmt.Sprintf("nas-backup-%s.db", timestamp)
 	remoteEncKey := fmt.Sprintf("%s/%s.enc", dbBackupPrefix, baseName)
 	remoteIVKey := fmt.Sprintf("%s/%s.iv", dbBackupPrefix, baseName)
 
-	// Step 1: Copy database to a temp file to avoid concurrent writes during encryption.
+	// Step 1: Copy database to a temp file using streaming to avoid loading
+	// the entire file into memory.
 	tmpDir := os.TempDir()
 	localCopy := filepath.Join(tmpDir, fmt.Sprintf("%s.copy", baseName))
 	if err := copyFile(s.dbPath, localCopy); err != nil {
@@ -89,18 +106,28 @@ func (s *DBBackupService) BackupDatabase(ctx context.Context) error {
 		return fmt.Errorf("upload encrypted database: %w", err)
 	}
 
-	// Step 4: Upload IV file.
+	// Step 4: Upload IV file. This is CRITICAL — without the IV, the
+	// encrypted database cannot be decrypted. If this fails, we must
+	// delete the orphaned .enc file from OSS to avoid leaving an
+	// unrecoverable backup that looks valid.
 	ivFile := filepath.Join(tmpDir, baseName+".iv")
 	if err := os.WriteFile(ivFile, []byte(iv), 0600); err != nil {
 		os.Remove(ivFile)
+		// Best-effort cleanup of the orphaned .enc file in OSS.
+		_ = s.storage.Delete(ctx, remoteEncKey)
 		return fmt.Errorf("write IV file: %w", err)
 	}
 	defer os.Remove(ivFile)
 
 	s.logger.Info("uploading database backup IV", "key", remoteIVKey)
 	if err := s.storage.Upload(ctx, ivFile, remoteIVKey); err != nil {
-		// Non-fatal: the .enc file is already uploaded. Log and continue.
-		s.logger.Error("failed to upload IV file (database backup may be unrecoverable)", "error", err)
+		// IV upload failed — the .enc file in OSS is useless without it.
+		// Delete the orphaned .enc to avoid a false sense of security.
+		s.logger.Error("failed to upload IV file, deleting orphaned encrypted database", "error", err)
+		if delErr := s.storage.Delete(ctx, remoteEncKey); delErr != nil {
+			s.logger.Error("failed to cleanup orphaned encrypted database", "cleanup_error", delErr)
+		}
+		return fmt.Errorf("upload IV file (encrypted database cleaned up): %w", err)
 	}
 
 	// Step 5: Prune old versions.
@@ -198,6 +225,14 @@ func (s *DBBackupService) Bootstrap(ctx context.Context, version string, targetD
 	encKey := fmt.Sprintf("%s.enc", version)
 	ivKey := fmt.Sprintf("%s.iv", version)
 
+	// Ensure the target directory exists.
+	targetDir := filepath.Dir(targetDBPath)
+	if targetDir != "" && targetDir != "." {
+		if err := os.MkdirAll(targetDir, 0755); err != nil {
+			return fmt.Errorf("create target directory %s: %w", targetDir, err)
+		}
+	}
+
 	// Download encrypted database.
 	tmpDir := os.TempDir()
 	localEnc := filepath.Join(tmpDir, filepath.Base(encKey))
@@ -209,7 +244,6 @@ func (s *DBBackupService) Bootstrap(ctx context.Context, version string, targetD
 	// Download IV file.
 	localIV := filepath.Join(tmpDir, filepath.Base(ivKey))
 	if err := s.storage.Download(ctx, ivKey, localIV); err != nil {
-		os.Remove(localEnc)
 		return fmt.Errorf("download IV file: %w", err)
 	}
 	defer os.Remove(localIV)
@@ -218,7 +252,7 @@ func (s *DBBackupService) Bootstrap(ctx context.Context, version string, targetD
 	if err != nil {
 		return fmt.Errorf("read IV file: %w", err)
 	}
-	iv := string(ivData)
+	iv := strings.TrimSpace(string(ivData))
 
 	// Decrypt to target path.
 	if err := s.encryptor.DecryptFile(localEnc, targetDBPath, iv); err != nil {
@@ -229,11 +263,21 @@ func (s *DBBackupService) Bootstrap(ctx context.Context, version string, targetD
 	return nil
 }
 
-// copyFile copies a file from src to dst.
+// copyFile copies a file from src to dst using streaming to avoid loading
+// the entire file into memory.
 func copyFile(src, dst string) error {
-	data, err := os.ReadFile(src)
+	srcFile, err := os.Open(src)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(dst, data, 0600)
+	defer srcFile.Close()
+
+	dstFile, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	_, err = io.Copy(dstFile, srcFile)
+	return err
 }
