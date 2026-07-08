@@ -24,15 +24,16 @@ import (
 
 // Engine orchestrates the full backup pipeline.
 type Engine struct {
-	db         *db.Database
-	scanner    *scanner.Scanner
-	dedup      *dedup.Deduplicator
-	compressor *compress.Compressor
-	encryptor  *crypto.Encryptor
-	storage    *storage.StorageManager
-	config     *config.AppConfig
-	logger     *slog.Logger
-	progress   *ProgressBroker
+	db           *db.Database
+	scanner      *scanner.Scanner
+	dedup        *dedup.Deduplicator
+	compressor   *compress.Compressor
+	encryptor    *crypto.Encryptor
+	storage      *storage.StorageManager
+	config       *config.AppConfig
+	logger       *slog.Logger
+	progress     *ProgressBroker
+	dbBackupSvc  *DBBackupService // optional: syncs encrypted DB to OSS after each backup
 
 	mu              sync.Mutex
 	runningBackupID int64
@@ -55,6 +56,13 @@ func NewEngine(database *db.Database, sc *scanner.Scanner, dd *dedup.Deduplicato
 		progress:    pb,
 		cancelFuncs: make(map[int64]context.CancelFunc),
 	}
+}
+
+// SetDBBackupService injects a DBBackupService. If set, the engine will
+// automatically upload an encrypted copy of the database to OSS after
+// each successful backup.
+func (e *Engine) SetDBBackupService(svc *DBBackupService) {
+	e.dbBackupSvc = svc
 }
 
 // ProgressBroker returns the progress broker for SSE subscriptions.
@@ -875,6 +883,19 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 		"skipped_inc", skippedInc,
 		"compress_saved", compressSaved,
 		"deleted", len(deletedPaths))
+
+	// After a successful backup, sync the encrypted database to OSS for
+	// disaster recovery. This runs asynchronously so it does not block the
+	// backup response. Failures are logged but do not fail the backup.
+	if e.dbBackupSvc != nil {
+		go func() {
+			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			if err := e.dbBackupSvc.BackupDatabase(bgCtx); err != nil {
+				e.logger.Error("automatic database backup to OSS failed", "error", err)
+			}
+		}()
+	}
 
 	return nil
 }

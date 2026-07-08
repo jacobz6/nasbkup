@@ -108,6 +108,14 @@ func main() {
 
 	// Initialize backup engine and restorer
 	engine := backup.NewEngine(database, sc, dd, comp, enc, stor, cfg, pb)
+
+	// Initialize database backup service for disaster recovery.
+	// After each successful backup, an encrypted copy of the database is
+	// automatically uploaded to OSS so that a new NAS can be bootstrapped
+	// from cloud backups using only master.key + rclone.conf.
+	dbBackupSvc := backup.NewDBBackupService(enc, stor, cfg)
+	engine.SetDBBackupService(dbBackupSvc)
+
 	restorer := backup.NewRestorer(database, enc, comp, stor, cfg)
 
 	// Initialize restore progress broker and job manager

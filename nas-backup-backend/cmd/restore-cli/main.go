@@ -19,6 +19,8 @@
 //	verify-dir <dir> [--limit N]    Verify all (or N sampled) files under a directory
 //	restore <path> -o <outdir>      Restore a single file to outdir
 //	restore-dir <dir> -o <outdir>   Restore all files under a directory to outdir
+//	bootstrap [-o <db-path>]       Download latest encrypted DB from OSS, decrypt, and save locally
+//	db-backup                       Manually trigger encrypted DB upload to OSS
 //
 // Common flags:
 //
@@ -74,6 +76,13 @@ func main() {
 	}
 	defer logger.Close()
 
+	// The "bootstrap" command recovers the database itself from OSS, so it
+	// must be handled before trying to open the local database file.
+	if command == "bootstrap" {
+		runBootstrap(cfg, *outDir)
+		return
+	}
+
 	// Open database.
 	database, err := db.Open(cfg.Database.Path)
 	if err != nil {
@@ -118,6 +127,10 @@ func main() {
 		runRestore(restorer, targetBackupID, *expedited, *outDir, rest)
 	case "restore-dir":
 		runRestoreDir(restorer, targetBackupID, *expedited, *outDir, *limit, rest)
+	case "bootstrap":
+		// Already handled above (before DB open). This case is unreachable.
+	case "db-backup":
+		runDBBackup(stor, enc, cfg)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n", command)
 		printUsage()
@@ -139,6 +152,8 @@ Commands:
   verify-dir <dir> [--limit N]  Verify all (or N sampled) files under a directory
   restore <path> -o <outdir>    Restore a single file to outdir
   restore-dir <dir> -o <outdir> Restore all files under a directory to outdir
+  bootstrap [-o <db-path>]       Download latest encrypted DB from OSS and save locally
+  db-backup                       Manually trigger encrypted DB upload to OSS
 
 Flags:
   --config       Path to config.yaml (default: config.yaml)
@@ -467,4 +482,67 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n-3] + "..."
+}
+
+// ─── bootstrap & db-backup ────────────────────────────────────────────────
+
+// runBootstrap downloads the latest encrypted database from OSS, decrypts it,
+// and saves it to the configured database path (or -o path).
+// This is the first step of disaster recovery on a fresh NAS.
+func runBootstrap(cfg *config.AppConfig, targetPath string) {
+	enc, err := crypto.NewEncryptor(cfg.Backup.Encryption.KeyFilePath)
+	if err != nil {
+		fail("init encryptor: %v", err)
+	}
+	stor, err := storage.NewStorageManager(cfg)
+	if err != nil {
+		fail("init storage: %v", err)
+	}
+	if err := stor.EnsureRcloneConfig(); err != nil {
+		fail("ensure rclone config: %v", err)
+	}
+
+	if targetPath == "" {
+		targetPath = cfg.Database.Path
+	}
+
+	svc := backup.NewDBBackupService(enc, stor, cfg)
+	ctx := context.Background()
+
+	// List available versions.
+	versions, err := svc.ListVersions(ctx)
+	if err != nil {
+		fail("list database backup versions: %v", err)
+	}
+	if len(versions) == 0 {
+		fail("no database backups found in OSS")
+	}
+
+	fmt.Printf("Available database backup versions:\n")
+	for i, v := range versions {
+		fmt.Printf("  [%d] %s\n", i+1, filepath.Base(v))
+	}
+
+	latest := versions[0]
+	fmt.Printf("\nBootstrapping latest version: %s\n", filepath.Base(latest))
+
+	if err := svc.Bootstrap(ctx, latest, targetPath); err != nil {
+		fail("bootstrap database: %v", err)
+	}
+
+	fmt.Printf("Database restored to: %s\n", targetPath)
+	fmt.Println("You can now start the nas-backup service normally.")
+}
+
+// runDBBackup manually triggers an encrypted database backup upload to OSS.
+func runDBBackup(stor *storage.StorageManager, enc *crypto.Encryptor, cfg *config.AppConfig) {
+	svc := backup.NewDBBackupService(enc, stor, cfg)
+	ctx := context.Background()
+
+	fmt.Println("Starting database backup to OSS...")
+	if err := svc.BackupDatabase(ctx); err != nil {
+		fail("database backup: %v", err)
+	}
+
+	fmt.Println("Database backup completed successfully.")
 }

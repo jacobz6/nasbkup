@@ -30,19 +30,27 @@
 - **默认位置**：`./data/rclone.conf`
 - **说明**：系统可从 `config.yaml` 中的 OSS 配置自动生成此文件，但建议保留已生成好的副本以避免版本差异。
 
-### 3. `nas-backup.db` -- SQLite 数据库
+### 3. `nas-backup.db` -- SQLite 数据库（可选，已自动同步到 OSS）
 
 - **用途**：记录所有文件的元数据（路径、大小、修改时间、SHA-256 哈希值）、哈希索引（去重映射）、备份会话历史、备份-文件关联关系（storage_key、加密 IV、压缩类型等），以及恢复作业记录。
 - **丢失后果**：系统无法定位云端对象的存储路径、加密参数和版本信息，实质上无法执行有意义的恢复操作。
 - **默认位置**：`./data/nas-backup.db`
+- **自动备份**：**每次成功备份后，系统会自动将加密后的数据库上传到 OSS 的 `meta/db/` 目录**（保留最近 3 个版本）。因此，即使本地数据库丢失，也可以通过 `restore-cli bootstrap` 命令从 OSS 恢复。**这意味着在灾难恢复时，你只需要 `master.key` 和 `rclone.conf` 两个文件。**
 
 ### 推荐的安全备份方式
 
-以上三件套必须与 NAS 物理隔离存放，建议采用**至少两种**以下方式进行异地备份：
+由于数据库已自动同步到 OSS，**只需要安全保存以下两件套**即可完成完整灾难恢复：
+
+| 文件 | 说明 | 丢失后果 |
+|------|------|----------|
+| **`master.key`** | AES-256 主密钥 | 所有云端加密数据永远无法恢复 |
+| **`rclone.conf`** | OSS 凭证 + crypt 密码 | 无法连接 OSS 或解密 rclone crypt 层 |
+
+建议采用**至少两种**以下方式进行异地备份：
 
 | 方式 | 说明 | 建议频率 |
 |------|------|----------|
-| **加密 U 盘** | 将三件套拷贝到加密 U 盘，存放在异地（如办公室保险柜） | 每次配置变更后 |
+| **加密 U 盘** | 将两件套拷贝到加密 U 盘，存放在异地（如办公室保险柜） | 每次配置变更后 |
 | **另一台设备/服务器** | 通过 scp/rsync 同步到另一台可信设备 | 每日自动同步 |
 | **云存储** | 加密打包后上传到另一个云存储服务（非同一 OSS bucket） | 每周自动备份 |
 | **打印纸质副本** | 将密钥和关键凭证打印后封存（仅限密钥等短内容） | 配置初始化时 |
@@ -178,10 +186,10 @@
 
 ### 前置条件
 
-1. 必备三件套（`master.key`、`rclone.conf`、`nas-backup.db`）已从异地安全备份中取回。
+1. 必备二件套（`master.key`、`rclone.conf`）已从异地安全备份中取回。
 2. 阿里云 OSS 中的备份数据完好（可在 OSS 控制台确认 bucket 中有数据）。
 3. 准备好新环境（一台 Linux 服务器，建议配置参见 `DEPLOYMENT.md`）。
-4. 记得原始 NAS 的备份目录结构（可从 `nas-backup.db` 中的 `config` 表或 `backup.directories` 配置回忆）。
+4. 原始 NAS 至少完成过一次成功的备份（数据库已自动同步到 OSS）。
 
 ### 操作步骤
 
@@ -240,26 +248,51 @@ npm ci
 npm run build
 ```
 
-#### 3. 放置必备文件
+#### 3. 放置必备文件并恢复数据库
 
-将异地备份的三件套放置到正确位置：
+将异地备份的二件套放置到正确位置，然后从 OSS 恢复数据库：
 
 ```bash
 # 创建数据目录
 mkdir -p /opt/nas-backup/nas-backup-backend/data/logs
 
-# 从备份介质复制三件套
+# 从备份介质复制二件套
 cp /path/to/backup/master.key   /opt/nas-backup/nas-backup-backend/data/master.key
 cp /path/to/backup/rclone.conf   /opt/nas-backup/nas-backup-backend/data/rclone.conf
-cp /path/to/backup/nas-backup.db /opt/nas-backup/nas-backup-backend/data/nas-backup.db
 
 # 设置正确的文件权限
 chmod 600 /opt/nas-backup/nas-backup-backend/data/master.key
 chmod 600 /opt/nas-backup/nas-backup-backend/data/rclone.conf
-chmod 644 /opt/nas-backup/nas-backup-backend/data/nas-backup.db
 ```
 
 > **注意**：`master.key` 和 `rclone.conf` 包含敏感凭证，必须设置 600 权限。
+
+从 OSS 恢复数据库（自动下载最新版本并解密）：
+
+```bash
+cd /opt/nas-backup/nas-backup-backend
+
+# 使用 restore-cli 从 OSS 拉取加密数据库并解密到本地
+./restore-cli -config config.yaml bootstrap
+
+# 输出示例：
+# Available database backup versions:
+#   [1] nas-backup-20260709-103000.db
+#   [2] nas-backup-20260708-103000.db
+#   [3] nas-backup-20260707-103000.db
+#
+# Bootstrapping latest version: nas-backup-20260709-103000.db
+# Database restored to: ./data/nas-backup.db
+# You can now start the nas-backup service normally.
+```
+
+如果需要恢复特定历史版本，可以先列出所有版本：
+
+```bash
+# 列出 OSS 中的数据库备份版本（需先手动 bootstrap 任意版本）
+# 或者使用 --o 指定输出路径，不覆盖默认路径
+./restore-cli -config config.yaml bootstrap -o ./data/nas-backup.db
+```
 
 #### 4. 配置 config.yaml
 
@@ -401,10 +434,10 @@ sudo systemctl start nas-backup
 | 维度 | 场景 B（灾难恢复） | 场景 C（全盘迁移） |
 |------|---------------------|---------------------|
 | 触发原因 | NAS 损坏/丢失/被攻击 | 计划性设备更换 |
-| 必备文件 | 从异地备份取回 | 从旧 NAS 直接拷贝 |
+| 必备文件 | 从异地备份取回 `master.key` + `rclone.conf` | 从旧 NAS 直接拷贝 |
 | OSS 数据 | 确认完好即可 | 同一 bucket，数据完好 |
 | 原始数据 | 可能部分丢失 | 旧 NAS 仍可访问 |
-| 数据库 | 使用备份的 db 文件 | 使用旧 NAS 的 db 文件或备份 |
+| 数据库 | 通过 `restore-cli bootstrap` 从 OSS 恢复 | 使用旧 NAS 的 db 文件或 OSS 恢复 |
 | 恢复范围 | 仅恢复备份中有的数据 | 可对比新旧数据完整性 |
 
 ### 操作步骤
@@ -570,6 +603,30 @@ ID     TYPE         STATUS      FILES       SIZE         COMPLETED_AT
 
 输出汇总：总文件数、已恢复数、失败数、数据量和耗时。失败文件会列出具体路径。
 
+#### `bootstrap [-o <数据库路径>]` -- 从 OSS 恢复数据库
+
+用于灾难恢复场景，从 OSS 下载最新的加密数据库并解密到本地：
+
+```bash
+# 恢复到配置文件指定的默认路径
+./restore-cli -config config.yaml bootstrap
+
+# 恢复到自定义路径
+./restore-cli -config config.yaml bootstrap -o /tmp/nas-backup.db
+```
+
+此命令不需要本地数据库已存在（它是恢复数据库本身），只需 `master.key` 和 `rclone.conf`。
+
+#### `db-backup` -- 手动触发数据库上传到 OSS
+
+正常情况下数据库在每次备份成功后自动上传。此命令用于手动触发：
+
+```bash
+./restore-cli -config config.yaml db-backup
+```
+
+上传的数据库保留最近 3 个版本，旧版本自动清理。
+
 ---
 
 ## ColdArchive 解冻说明
@@ -672,16 +729,19 @@ curl -X POST http://127.0.0.1:8080/api/restore/jobs/{id}/cancel
 
 **后果**：无法定位云端对象、无法知道哪些文件已备份、无法执行恢复。
 
-**尝试修复**：
-```bash
-# 检查数据库完整性
-sqlite3 ./data/nas-backup.db "PRAGMA integrity_check;"
+**解决**：系统已自动将加密数据库备份到 OSS，可直接从云端恢复：
 
-# 如有损坏，尝试从备份恢复
-cp /path/to/backup/nas-backup.db ./data/nas-backup.db
+```bash
+# 方法1：使用 restore-cli 从 OSS 恢复最新数据库
+./restore-cli -config config.yaml bootstrap
+
+# 方法2：手动检查本地数据库是否可修复
+sqlite3 ./data/nas-backup.db "PRAGMA integrity_check;"
 ```
 
-**预防**：定期备份数据库文件（建议每日自动备份，参见附录脚本）。
+> **注意**：数据库备份在每次成功备份后自动执行，保留最近 3 个版本。如果最近的备份本身也是损坏的，可以尝试恢复更早的版本（需要手动指定 OSS key）。
+
+**预防**：系统已自动处理，无需手动备份。
 
 ### Q8：rclone.conf 中的密码忘记了怎么办？
 
