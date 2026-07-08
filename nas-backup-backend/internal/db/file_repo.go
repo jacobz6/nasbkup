@@ -357,6 +357,80 @@ func (r *FileRepository) ListActiveByBackup(backupID int64, dirPath string) ([]*
 	return records, nil
 }
 
+// SearchActiveFilesParams holds parameters for searching active files.
+type SearchActiveFilesParams struct {
+	DirPath  string     // if non-empty, only files under this directory (path LIKE 'dir/%')
+	BackupID *int64     // if non-nil, only files in this backup (JOIN backup_files)
+	Search   string     // if non-empty, path LIKE '%search%'
+	Limit    int        // pagination limit; 0 = no limit
+	Offset   int        // pagination offset
+}
+
+// SearchActiveFiles queries active files with optional directory prefix,
+// backup filter, keyword search, and pagination. Results are ordered by path.
+func (r *FileRepository) SearchActiveFiles(params SearchActiveFilesParams) ([]*models.FileRecord, int64, error) {
+	var (
+		selectClause string
+		countClause  string
+		whereClause  = " WHERE 1=1"
+		args         []interface{}
+	)
+
+	if params.BackupID != nil {
+		selectClause = `SELECT f.id, f.path, f.size, f.mod_time, f.hash, f.status, f.backup_id, f.inode, f.created_at, f.updated_at FROM files f INNER JOIN backup_files bf ON bf.file_id = f.id`
+		countClause = `SELECT COUNT(*) FROM files f INNER JOIN backup_files bf ON bf.file_id = f.id`
+		whereClause += " AND bf.backup_id = ? AND f.status = 'active'"
+		args = append(args, *params.BackupID)
+	} else {
+		selectClause = `SELECT id, path, size, mod_time, hash, status, backup_id, inode, created_at, updated_at FROM files`
+		countClause = `SELECT COUNT(*) FROM files`
+		whereClause += " AND status = 'active'"
+	}
+
+	if params.DirPath != "" {
+		whereClause += " AND path LIKE ?"
+		args = append(args, params.DirPath+"/%")
+	}
+
+	if params.Search != "" {
+		whereClause += " AND path LIKE ?"
+		args = append(args, "%"+params.Search+"%")
+	}
+
+	// Count total matching rows for pagination.
+	var total int64
+	countArgs := make([]interface{}, len(args))
+	copy(countArgs, args)
+	if err := r.db.QueryRow(countClause+whereClause, countArgs...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count active files: %w", err)
+	}
+
+	query := selectClause + whereClause + " ORDER BY path"
+	if params.Limit > 0 {
+		query += " LIMIT ? OFFSET ?"
+		args = append(args, params.Limit, params.Offset)
+	}
+
+	rows, err := r.db.Query(query, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("search active files: %w", err)
+	}
+	defer rows.Close()
+
+	records := make([]*models.FileRecord, 0)
+	for rows.Next() {
+		rec, err := scanFileRecord(rows)
+		if err != nil {
+			return nil, 0, fmt.Errorf("scan searched file row: %w", err)
+		}
+		records = append(records, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("iterate searched files: %w", err)
+	}
+	return records, total, nil
+}
+
 // ListAllPaths returns all file paths in the database, used for comparing
 // against scan results to detect deleted files.
 func (r *FileRepository) ListAllPaths() ([]string, error) {

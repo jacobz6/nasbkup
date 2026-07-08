@@ -213,6 +213,16 @@ func (r *ConfigRepository) GetEnabledDirectories() ([]*models.BackupDirectory, e
 	return dirs, nil
 }
 
+// CountDirectories returns the total number of backup directory entries.
+func (r *ConfigRepository) CountDirectories() (int64, error) {
+	var count int64
+	err := r.db.QueryRow(`SELECT COUNT(*) FROM backup_directories`).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count backup directories: %w", err)
+	}
+	return count, nil
+}
+
 // ---------------------------------------------------------------------------
 // exclusion_rules table operations
 // ---------------------------------------------------------------------------
@@ -253,6 +263,16 @@ func (r *ConfigRepository) ListExclusionRules() ([]*models.ExclusionRule, error)
 		return nil, fmt.Errorf("iterate exclusion rules: %w", err)
 	}
 	return rules, nil
+}
+
+// CountExclusionRules returns the total number of exclusion rule entries.
+func (r *ConfigRepository) CountExclusionRules() (int64, error) {
+	var count int64
+	err := r.db.QueryRow(`SELECT COUNT(*) FROM exclusion_rules`).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count exclusion rules: %w", err)
+	}
+	return count, nil
 }
 
 // AddExclusionRule inserts a new exclusion rule and returns its ID.

@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import {
-  RotateCcw, Play, Square, Search, FolderOpen, Download,
+  RotateCcw, Play, Square, Search, FolderOpen, Download, Inbox,
   CheckCircle, XCircle, Activity, Terminal, AlertCircle, Info,
   HardDrive, Clock, Zap, FileText, RefreshCw, Archive,
 } from 'lucide-react';
@@ -186,6 +186,7 @@ export function Restore() {
   const [filesPageSize] = useState(20);
   const [filesLoading, setFilesLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
+  const [dirPath, setDirPath] = useState<string>(''); // current directory prefix for browsing
 
   // ── Selected files state ────────────────────────────────────────
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
@@ -244,6 +245,7 @@ export function Restore() {
       };
       if (searchQuery) params.search = searchQuery;
       if (selectedBackupId !== undefined) params.backup_id = selectedBackupId;
+      if (dirPath) params.dir_path = dirPath;
 
       const res = await restoreApi.listFiles(params);
       if (res.success) {
@@ -255,7 +257,7 @@ export function Restore() {
     } finally {
       setFilesLoading(false);
     }
-  }, [filesPage, filesPageSize, searchQuery, selectedBackupId]);
+  }, [filesPage, filesPageSize, searchQuery, selectedBackupId, dirPath]);
 
   // ── Fetch job history ────────────────────────────────────────────
   const fetchJobs = useCallback(async (p = jobsPage) => {
@@ -283,7 +285,7 @@ export function Restore() {
   // Re-fetch files when page or filters change
   useEffect(() => {
     fetchFiles();
-  }, [filesPage, searchQuery, selectedBackupId]);
+  }, [filesPage, searchQuery, selectedBackupId, dirPath]);
 
   // Re-fetch jobs when page changes
   useEffect(() => {
@@ -446,7 +448,56 @@ export function Restore() {
         />
       ),
     },
-    ...fileColumns,
+    {
+      key: 'path',
+      header: '文件路径',
+      render: (r) => {
+        const dir = r.path.substring(0, r.path.lastIndexOf('/'));
+        return (
+          <div className="flex items-center gap-2 group">
+            <FileText size={14} className="text-slate-500 shrink-0" />
+            <span className="font-mono text-sm text-slate-200 truncate" title={r.path}>
+              {r.path}
+            </span>
+            {dir && (
+              <button
+                onClick={() => { setDirPath(dir); setSearchQuery(''); setFilesPage(1); setSelectedIds(new Set()); }}
+                className="opacity-0 group-hover:opacity-100 text-slate-500 hover:text-brand-400 transition-opacity shrink-0"
+                title={`浏览目录: ${dir}`}
+              >
+                <FolderOpen size={12} />
+              </button>
+            )}
+          </div>
+        );
+      },
+    },
+    {
+      key: 'size',
+      header: '大小',
+      className: 'w-24',
+      render: (r) => (
+        <span className="font-mono text-sm text-slate-400">{formatFileSize(r.size)}</span>
+      ),
+    },
+    {
+      key: 'mod_time',
+      header: '修改时间',
+      className: 'w-40',
+      render: (r) => (
+        <span className="text-sm text-slate-400">{formatDateTime(r.mod_time)}</span>
+      ),
+    },
+    {
+      key: 'hash',
+      header: 'Hash',
+      className: 'w-28',
+      render: (r) => (
+        <span className="font-mono text-xs text-slate-500 truncate block" title={r.hash}>
+          {r.hash.length > 12 ? `${r.hash.slice(0, 8)}...` : r.hash}
+        </span>
+      ),
+    },
   ];
 
   // ── Render ────────────────────────────────────────────────────────
@@ -665,6 +716,7 @@ export function Restore() {
               <button
                 onClick={() => {
                   setSearchQuery('');
+                  setDirPath('');
                   setSelectedBackupId(undefined);
                   setFilesPage(1);
                   setSelectedIds(new Set());
@@ -690,15 +742,65 @@ export function Restore() {
 
           {/* File list table */}
           <div className="card p-0 overflow-hidden">
+            {/* Breadcrumb / path navigation */}
+            {(dirPath || searchQuery) && (
+              <div className="flex items-center gap-2 px-4 py-2.5 border-b border-slate-700/50 bg-slate-800/30">
+                <button
+                  onClick={() => { setDirPath(''); setSearchQuery(''); setFilesPage(1); }}
+                  className="text-xs text-brand-400 hover:text-brand-300 transition-colors flex items-center gap-1"
+                >
+                  <FolderOpen size={12} />
+                  根目录
+                </button>
+                {dirPath && dirPath.split('/').filter(Boolean).reduce((acc: JSX.Element[], seg, i, arr) => {
+                  const path = '/' + arr.slice(0, i + 1).join('/');
+                  acc.push(<span key={i} className="text-slate-600 text-xs">/</span>);
+                  acc.push(
+                    <button
+                      key={`p-${i}`}
+                      onClick={() => { setDirPath(path); setFilesPage(1); }}
+                      className={`text-xs transition-colors ${i === arr.length - 1 ? 'text-slate-300 font-medium' : 'text-brand-400 hover:text-brand-300'}`}
+                    >
+                      {seg}
+                    </button>
+                  );
+                  return acc;
+                }, [] as JSX.Element[])}
+                {searchQuery && (
+                  <span className="ml-auto text-xs text-slate-500">
+                    搜索: "<span className="text-slate-300">{searchQuery}</span>"
+                    <button onClick={() => setSearchQuery('')} className="ml-1 text-slate-500 hover:text-red-400">×</button>
+                  </span>
+                )}
+              </div>
+            )}
             {filesLoading ? (
               <div className="p-5">
                 <LoadingSkeleton rows={8} />
               </div>
             ) : files.length === 0 ? (
-              <EmptyState
-                message="暂无可恢复文件"
-                description="当前没有找到可恢复的文件。请确保已有成功的备份记录。"
-              />
+              <div className="flex flex-col items-center justify-center py-16 text-slate-500">
+                <Inbox size={48} strokeWidth={1} className="mb-4 text-slate-600" />
+                <p className="text-lg font-medium text-slate-400">
+                  {searchQuery ? '未找到匹配的文件' : dirPath ? '该目录下暂无可恢复文件' : '暂无可恢复文件'}
+                </p>
+                <p className="text-sm mt-2 text-slate-600 max-w-md text-center px-4">
+                  {searchQuery
+                    ? '尝试使用更短的关键词搜索，或检查路径是否正确。'
+                    : dirPath
+                    ? '该目录下没有已备份的文件记录。'
+                    : '请先在「备份内容」中配置备份目录，并执行一次成功的备份。文件备份完成后会在此处显示。'
+                  }
+                </p>
+                {(dirPath || searchQuery) && (
+                  <button
+                    onClick={() => { setDirPath(''); setSearchQuery(''); setFilesPage(1); }}
+                    className="mt-4 btn-secondary text-xs"
+                  >
+                    返回根目录
+                  </button>
+                )}
+              </div>
             ) : (
               <>
                 <DataTable columns={columnsWithSelect} data={files} rowKey={(r) => r.id} />

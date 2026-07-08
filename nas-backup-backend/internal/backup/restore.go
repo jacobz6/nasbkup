@@ -227,14 +227,17 @@ func (r *Restorer) PingStorage(ctx context.Context) error {
 // directory path. If backupID is provided, only files contained in that backup
 // session are returned (joined via backup_files); otherwise all active files
 // are considered. If dirPath is empty, all matching files are returned.
-func (r *Restorer) ListRestorableFiles(dirPath string, backupID *int64) ([]*models.FileRecord, error) {
-	if backupID != nil {
-		return r.db.FileRepo.ListActiveByBackup(*backupID, dirPath)
-	}
-	if dirPath != "" {
-		return r.db.FileRepo.ListActiveByDirectory(dirPath)
-	}
-	return r.db.FileRepo.ListByStatus(models.FileStatusActive, 0, 0)
+// If search is non-empty, only files whose path contains the search string
+// are returned. Pagination is applied via limit/offset; total is the count
+// of all matching rows before pagination.
+func (r *Restorer) ListRestorableFiles(dirPath string, backupID *int64, search string, limit, offset int) ([]*models.FileRecord, int64, error) {
+	return r.db.FileRepo.SearchActiveFiles(db.SearchActiveFilesParams{
+		DirPath:  dirPath,
+		BackupID: backupID,
+		Search:   search,
+		Limit:    limit,
+		Offset:   offset,
+	})
 }
 
 // GetFileInfo returns the file record and backup file record for a specific path.

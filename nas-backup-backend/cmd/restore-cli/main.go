@@ -177,7 +177,7 @@ func runList(restorer *backup.Restorer, backupID *int64, args []string) {
 	if len(args) > 0 {
 		dirPath = args[0]
 	}
-	files, err := restorer.ListRestorableFiles(dirPath, backupID)
+	files, _, err := restorer.ListRestorableFiles(dirPath, backupID, "", 0, 0)
 	if err != nil {
 		fail("list restorable files: %v", err)
 	}
@@ -286,7 +286,7 @@ func runVerifyDir(restorer *backup.Restorer, backupID *int64, expedited bool, li
 		fail("verify-dir requires a directory path argument")
 	}
 	dir := args[0]
-	files, err := restorer.ListRestorableFiles(dir, backupID)
+	files, _, err := restorer.ListRestorableFiles(dir, backupID, "", 0, 0)
 	if err != nil {
 		fail("list files: %v", err)
 	}
@@ -377,7 +377,7 @@ func runRestoreDir(restorer *backup.Restorer, backupID *int64, expedited bool, o
 		fail("restore-dir requires -o <output directory>")
 	}
 	dir := args[0]
-	files, err := restorer.ListRestorableFiles(dir, backupID)
+	files, _, err := restorer.ListRestorableFiles(dir, backupID, "", 0, 0)
 	if err != nil {
 		fail("list files: %v", err)
 	}

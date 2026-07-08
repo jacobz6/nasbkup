@@ -94,6 +94,9 @@ func (r *Router) handleRestoreListFiles(w http.ResponseWriter, req *http.Request
 	backupIDStr := req.URL.Query().Get("backup_id")
 	page, size := parsePagination(req)
 
+	// offset is 0-based; calculate from page (1-based).
+	offset := (page - 1) * size
+
 	var backupID *int64
 	if backupIDStr != "" {
 		id, err := strconv.ParseInt(backupIDStr, 10, 64)
@@ -104,21 +107,10 @@ func (r *Router) handleRestoreListFiles(w http.ResponseWriter, req *http.Request
 		backupID = &id
 	}
 
-	files, err := r.restorer.ListRestorableFiles(dirPath, backupID)
+	files, total, err := r.restorer.ListRestorableFiles(dirPath, backupID, search, size, offset)
 	if err != nil {
 		r.jsonError(w, fmt.Sprintf("list restorable files: %v", err), http.StatusInternalServerError)
 		return
-	}
-
-	// Filter by search if provided.
-	if search != "" {
-		filtered := make([]*models.FileRecord, 0)
-		for _, f := range files {
-			if containsPath(f.Path, search) {
-				filtered = append(filtered, f)
-			}
-		}
-		files = filtered
 	}
 
 	// Build enriched response with backup metadata.
@@ -131,18 +123,8 @@ func (r *Router) handleRestoreListFiles(w http.ResponseWriter, req *http.Request
 		Status  string `json:"status"`
 	}
 
-	total := int64(len(files))
-	start := (page - 1) * size
-	end := start + size
-	if start > int(total) {
-		start = int(total)
-	}
-	if end > int(total) {
-		end = int(total)
-	}
-
-	result := make([]enrichedFile, 0, end-start)
-	for _, f := range files[start:end] {
+	result := make([]enrichedFile, 0, len(files))
+	for _, f := range files {
 		result = append(result, enrichedFile{
 			ID:      f.ID,
 			Path:    f.Path,
@@ -154,12 +136,6 @@ func (r *Router) handleRestoreListFiles(w http.ResponseWriter, req *http.Request
 	}
 
 	r.jsonPaginatedResponse(w, result, total, page, size)
-}
-
-// containsPath checks if the path contains the search string (case-insensitive).
-func containsPath(path, search string) bool {
-	return len(search) == 0 ||
-		containsAny([]string{path}, search)
 }
 
 // handleRestoreProgressStream serves SSE for restore job progress.

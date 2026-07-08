@@ -62,6 +62,13 @@ func main() {
 	defer database.Close()
 	logger.Info("Database opened at: %s", cfg.Database.Path)
 
+	// Seed backup directories and exclusion rules from config.yaml if the
+	// database tables are empty. This allows first-time setup via config.yaml
+	// without requiring the web UI to be used first.
+	if err := seedConfigFromYAML(database, cfg); err != nil {
+		logger.Error("Failed to seed config from YAML: %v", err)
+	}
+
 	// Clean up stale "running"/"pending" backup records left over from a
 	// previous crash, so the new instance can start backups immediately.
 	if cleaned, err := database.BackupRepo.CleanupStaleRunning(); err != nil {
@@ -163,4 +170,44 @@ func main() {
 	}
 
 	logger.Info("Server exited gracefully")
+}
+
+// seedConfigFromYAML seeds backup directories and exclusion rules from
+// config.yaml into the database when the corresponding tables are empty.
+// This only runs on first startup (or after DB reset) so that web UI
+// changes are not overwritten on subsequent starts.
+func seedConfigFromYAML(database *db.Database, cfg *config.AppConfig) error {
+	// Seed directories.
+	dirCount, err := database.ConfigRepo.CountDirectories()
+	if err != nil {
+		return fmt.Errorf("count directories: %w", err)
+	}
+	if dirCount == 0 && len(cfg.Backup.Directories) > 0 {
+		for _, d := range cfg.Backup.Directories {
+			if _, err := database.ConfigRepo.AddDirectory(d.Path, d.Recursive, d.Enabled, d.Description); err != nil {
+				return fmt.Errorf("seed directory %q: %w", d.Path, err)
+			}
+		}
+		logger.Info("Seeded %d backup director(ies) from config.yaml", len(cfg.Backup.Directories))
+	}
+
+	// Seed exclusion rules.
+	excCount, err := database.ConfigRepo.CountExclusionRules()
+	if err != nil {
+		return fmt.Errorf("count exclusion rules: %w", err)
+	}
+	if excCount == 0 && len(cfg.Backup.Exclusions) > 0 {
+		for _, e := range cfg.Backup.Exclusions {
+			ruleType := e.RuleType
+			if ruleType == "" {
+				ruleType = "pattern"
+			}
+			if _, err := database.ConfigRepo.AddExclusionRule(e.Pattern, ruleType, e.Enabled); err != nil {
+				return fmt.Errorf("seed exclusion %q: %w", e.Pattern, err)
+			}
+		}
+		logger.Info("Seeded %d exclusion rule(s) from config.yaml", len(cfg.Backup.Exclusions))
+	}
+
+	return nil
 }
