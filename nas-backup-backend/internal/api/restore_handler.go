@@ -47,7 +47,8 @@ func (r *Router) handleRestoreCreate(w http.ResponseWriter, req *http.Request) {
 		r.jsonError(w, "paths or pattern is required", http.StatusBadRequest)
 		return
 	}
-	if restoreReq.OutputDir == "" {
+	// output_dir is required unless restore_to_original is true.
+	if !restoreReq.RestoreToOriginal && restoreReq.OutputDir == "" {
 		r.jsonError(w, "output_dir is required", http.StatusBadRequest)
 		return
 	}

@@ -55,22 +55,25 @@ func (m *RestoreJobManager) CreateJob(req *models.RestoreRequest) (*models.Resto
 	}
 
 	// --- validate output directory ---
-	allowedDirs := m.allowedRestoreDirs()
-	if err := ValidateOutputDir(req.OutputDir, allowedDirs); err != nil {
-		return nil, err
-	}
-
-	// --- ensure output dir exists and is a directory ---
-	if fi, err := os.Stat(req.OutputDir); err != nil {
-		if os.IsNotExist(err) {
-			if err := os.MkdirAll(req.OutputDir, 0755); err != nil {
-				return nil, fmt.Errorf("create output directory %q: %w", req.OutputDir, err)
-			}
-		} else {
-			return nil, fmt.Errorf("stat output directory %q: %w", req.OutputDir, err)
+	// Skip output dir validation when restoring to original paths.
+	if !req.RestoreToOriginal {
+		allowedDirs := m.allowedRestoreDirs()
+		if err := ValidateOutputDir(req.OutputDir, allowedDirs); err != nil {
+			return nil, err
 		}
-	} else if !fi.IsDir() {
-		return nil, fmt.Errorf("output path %q exists but is not a directory", req.OutputDir)
+
+		// --- ensure output dir exists and is a directory ---
+		if fi, err := os.Stat(req.OutputDir); err != nil {
+			if os.IsNotExist(err) {
+				if err := os.MkdirAll(req.OutputDir, 0755); err != nil {
+					return nil, fmt.Errorf("create output directory %q: %w", req.OutputDir, err)
+				}
+			} else {
+				return nil, fmt.Errorf("stat output directory %q: %w", req.OutputDir, err)
+			}
+		} else if !fi.IsDir() {
+			return nil, fmt.Errorf("output path %q exists but is not a directory", req.OutputDir)
+		}
 	}
 
 	// --- resolve files to get total count/size ---
@@ -92,12 +95,19 @@ func (m *RestoreJobManager) CreateJob(req *models.RestoreRequest) (*models.Resto
 		conflictStrategy = req.ConflictStrategy
 	}
 
+	// For "restore to original", store a sentinel in OutputDir for the
+	// job record so the restore worker knows to use original paths.
+	outputDir := req.OutputDir
+	if req.RestoreToOriginal {
+		outputDir = "__original__"
+	}
+
 	rec := &models.RestoreJobRecord{
 		Status:           models.RestoreJobStatusPending,
 		Paths:            req.Paths,
 		Pattern:          req.Pattern,
 		BackupID:         req.BackupID,
-		OutputDir:        req.OutputDir,
+		OutputDir:        outputDir,
 		Expedited:        req.Expedited,
 		ConflictStrategy: conflictStrategy,
 		TotalFiles:       len(files),
@@ -129,12 +139,13 @@ func (m *RestoreJobManager) StartJob(jobID int64) error {
 
 	// Parse paths from stored JSON.
 	req := &models.RestoreRequest{
-		Paths:            job.Paths,
-		Pattern:          job.Pattern,
-		BackupID:         job.BackupID,
-		OutputDir:        job.OutputDir,
-		Expedited:        job.Expedited,
-		ConflictStrategy: job.ConflictStrategy,
+		Paths:             job.Paths,
+		Pattern:           job.Pattern,
+		BackupID:          job.BackupID,
+		OutputDir:         job.OutputDir,
+		RestoreToOriginal: job.OutputDir == "__original__",
+		Expedited:         job.Expedited,
+		ConflictStrategy:  job.ConflictStrategy,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Hour)

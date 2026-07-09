@@ -459,7 +459,9 @@ func (e *Engine) reconcileBackupStatus(ctx context.Context, report *ReconcileRep
 		}
 	}
 
-	// Completed backups with no backup_files → candidate for failed.
+	// Completed FULL backups with no backup_files → candidate for failed.
+	// (Incremental backups with 0 files are normal — no changes since last backup —
+	// and are excluded by ListCompletedBackupsWithoutFiles.)
 	completedNoFiles, err := e.db.BackupRepo.ListCompletedBackupsWithoutFiles()
 	if err != nil {
 		err = fmt.Errorf("list completed backups without files: %w", err)
@@ -471,7 +473,7 @@ func (e *Engine) reconcileBackupStatus(ctx context.Context, report *ReconcileRep
 			BackupID: b.ID,
 			From:     models.BackupStatusCompleted,
 			To:       models.BackupStatusFailed,
-			Reason:   "backup marked completed but has no backup_files rows",
+			Reason:   "full backup marked completed but has no backup_files rows",
 		})
 	}
 	return nil

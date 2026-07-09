@@ -484,9 +484,10 @@ func (r *BackupRepository) ListFailedBackupsWithFiles() ([]*models.BackupRecord,
 	return records, nil
 }
 
-// ListCompletedBackupsWithoutFiles returns completed backups that have no
-// backup_files rows. These are candidates for status correction: a backup
-// marked completed but with no actual files backed up is likely an error.
+// ListCompletedBackupsWithoutFiles returns completed FULL backups that have no
+// backup_files rows. An incremental backup with 0 files is normal (no changes
+// since last backup), so incremental backups are excluded from this check.
+// Only full backups with 0 files are suspicious and worth flagging.
 func (r *BackupRepository) ListCompletedBackupsWithoutFiles() ([]*models.BackupRecord, error) {
 	rows, err := r.db.Query(`
 		SELECT id, type, status, base_backup_id,
@@ -495,6 +496,7 @@ func (r *BackupRepository) ListCompletedBackupsWithoutFiles() ([]*models.BackupR
 		       started_at, completed_at, error_message, created_at
 		FROM backups
 		WHERE status = 'completed'
+		  AND type = 'full'
 		  AND NOT EXISTS (SELECT 1 FROM backup_files WHERE backup_id = backups.id)
 		ORDER BY id
 	`)

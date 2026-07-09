@@ -461,6 +461,7 @@ export interface RestoreRequest {
   pattern?: string;
   backup_id?: number;
   output_dir: string;
+  restore_to_original?: boolean;
   expedited?: boolean;
   conflict_strategy?: 'overwrite' | 'skip' | 'rename';
 }

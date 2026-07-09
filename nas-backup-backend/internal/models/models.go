@@ -287,12 +287,13 @@ type BackupTriggerRequest struct {
 
 // RestoreRequest specifies what to restore and where.
 type RestoreRequest struct {
-	Paths            []string `json:"paths"`                      // file/directory paths to restore
+	Paths            []string `json:"paths"`                       // file/directory paths to restore
 	Pattern          string   `json:"pattern,omitempty"`           // glob pattern for batch restore
-	BackupID         *int64   `json:"backup_id,omitempty"`       // specific backup to restore from
-	OutputDir        string   `json:"output_dir"`                 // where to place restored files
-	Expedited        bool     `json:"expedited"`                  // use expedited OSS thaw
-	ConflictStrategy string   `json:"conflict_strategy,omitempty"` // "overwrite" | "skip" | "rename"
+	BackupID         *int64   `json:"backup_id,omitempty"`         // specific backup to restore from
+	OutputDir        string   `json:"output_dir"`                  // where to place restored files (ignored if RestoreToOriginal is true)
+	RestoreToOriginal bool    `json:"restore_to_original"`         // if true, restore each file to its original path
+	Expedited        bool     `json:"expedited"`                   // use expedited OSS thaw
+	ConflictStrategy string   `json:"conflict_strategy,omitempty"`  // "overwrite" | "skip" | "rename"
 }
 
 // RestoreResult summarizes a restore operation.

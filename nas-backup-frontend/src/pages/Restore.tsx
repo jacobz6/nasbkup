@@ -361,6 +361,7 @@ export function Restore() {
       paths: selectedPaths,
       backup_id: selectedBackupId,
       output_dir: outputMode === 'original' ? '' : outputDir,
+      restore_to_original: outputMode === 'original',
       conflict_strategy: conflictStrategy,
       expedited,
     };
@@ -392,6 +393,7 @@ export function Restore() {
       pattern: '*',
       backup_id: selectedBackupId,
       output_dir: outputMode === 'original' ? '' : outputDir,
+      restore_to_original: outputMode === 'original',
       conflict_strategy: conflictStrategy,
       expedited,
     };

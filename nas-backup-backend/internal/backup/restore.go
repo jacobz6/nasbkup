@@ -92,9 +92,15 @@ func (r *Restorer) RestoreWithOptions(ctx context.Context, req *models.RestoreRe
 		return nil, fmt.Errorf("no files found matching the request")
 	}
 
-	// Ensure output directory exists.
-	if err := os.MkdirAll(req.OutputDir, 0755); err != nil {
-		return nil, fmt.Errorf("create output directory %q: %w", req.OutputDir, err)
+	// Determine if this is a restore-to-original-paths operation.
+	restoreToOriginal := req.RestoreToOriginal || req.OutputDir == "__original__"
+
+	// Ensure output directory exists (skip for original-path restore, which
+	// creates per-file directories on the fly).
+	if !restoreToOriginal {
+		if err := os.MkdirAll(req.OutputDir, 0755); err != nil {
+			return nil, fmt.Errorf("create output directory %q: %w", req.OutputDir, err)
+		}
 	}
 
 	// Create temp directory for intermediate files.
@@ -106,20 +112,20 @@ func (r *Restorer) RestoreWithOptions(ctx context.Context, req *models.RestoreRe
 
 	// 2. Compute the common base directory to strip from output paths
 	// so that directory structure is preserved under outputDir.
-	//
-	// For a single file we strip the grandparent directory so the immediate
-	// parent dir name is preserved: restoring /data/docs/report.pdf lands at
-	// outputDir/docs/report.pdf. Previously filepath.Base() was used which
-	// flattened the path to outputDir/report.pdf, losing all directory
-	// structure — inconsistent with multi-file restore which preserves the
-	// relative structure under the common prefix.
+	// For restore-to-original, stripPrefix is "/" so that the full path
+	// (minus leading slash) is used relative to root.
 	stripPrefix := ""
-	switch len(files) {
-	case 1:
-		stripPrefix = filepath.Dir(filepath.Dir(files[0].Path))
-	default:
-		if len(files) > 1 {
-			stripPrefix = longestCommonDirPrefix(files)
+	if restoreToOriginal {
+		// Use root "/" as the base; the file's full path will be used as-is.
+		stripPrefix = ""
+	} else {
+		switch len(files) {
+		case 1:
+			stripPrefix = filepath.Dir(filepath.Dir(files[0].Path))
+		default:
+			if len(files) > 1 {
+				stripPrefix = longestCommonDirPrefix(files)
+			}
 		}
 	}
 
@@ -436,14 +442,26 @@ func (r *Restorer) restoreFile(
 	}
 
 	// Step 6: Move to output directory, preserving relative directory structure.
-	relPath := fileRec.Path
-	if stripPrefix != "" {
-		relPath = strings.TrimPrefix(fileRec.Path, stripPrefix)
-		relPath = strings.TrimPrefix(relPath, string(filepath.Separator))
+	var outputPath string
+	if outputDir == "__original__" {
+		// Restore to the file's original absolute path.
+		outputPath = fileRec.Path
 	} else {
-		relPath = filepath.Base(fileRec.Path)
+		relPath := fileRec.Path
+		if stripPrefix != "" {
+			relPath = strings.TrimPrefix(fileRec.Path, stripPrefix)
+			relPath = strings.TrimPrefix(relPath, string(filepath.Separator))
+		} else {
+			relPath = filepath.Base(fileRec.Path)
+		}
+		outputPath = filepath.Join(outputDir, relPath)
 	}
-	outputPath := filepath.Join(outputDir, relPath)
+
+	// Ensure the parent directory exists (needed for both original-path and
+	// custom-dir restore, since the target dir may not exist yet).
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
+		return fmt.Errorf("create output parent directory for %q: %w", outputPath, err)
+	}
 
 	// Step 6a: Handle existing file conflict according to conflictStrategy.
 	if conflictStrategy != "" {
