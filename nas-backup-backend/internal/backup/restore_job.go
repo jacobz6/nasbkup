@@ -268,9 +268,20 @@ func (m *RestoreJobManager) executeJob(ctx context.Context, cancel context.Cance
 		return
 	}
 
-	// Flush final progress and mark completed.
+	// Flush final progress.
 	_ = m.db.RestoreJobRepo.UpdateProgress(jobID, finalRestoredFiles, finalRestoredSize, finalFailed)
 	_ = m.db.RestoreJobRepo.UpdateCompleted(jobID, finalRestoredFiles, finalRestoredSize, elapsedMs, finalFailed)
+
+	// If all files failed (0 restored, some failed), mark the job as failed
+	// rather than completed — the user needs to know the restore didn't work.
+	if finalRestoredFiles == 0 && len(finalFailed) > 0 {
+		failSummary := fmt.Sprintf("所有 %d 个文件恢复均失败; 首个失败: %s", len(finalFailed), finalFailed[0])
+		_ = m.db.RestoreJobRepo.UpdateStatus(jobID, models.RestoreJobStatusFailed, failSummary)
+		m.progress.PublishPhase(jobID, models.RestorePhaseFailed, failSummary)
+		return
+	}
+
+	// Mark completed (partial success or full success).
 	_ = m.db.RestoreJobRepo.UpdateStatus(jobID, models.RestoreJobStatusCompleted, "")
 	m.progress.PublishProgress(jobID, finalRestoredFiles, totalFiles, 100, finalRestoredSize, totalSize)
 	m.progress.PublishPhase(jobID, models.RestorePhaseCompleted,

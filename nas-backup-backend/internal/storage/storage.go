@@ -70,8 +70,11 @@ var validS3StorageClasses = map[string]bool{
 // Operations requiring rclone will fail gracefully when invoked.
 //
 // OSS credentials (AccessKeyID, AccessKeySecret) are read from environment
-// variables OSS_ACCESS_KEY_ID and OSS_ACCESS_KEY_SECRET. They are NEVER read
-// from config.yaml to avoid storing secrets in config files.
+// variables OSS_ACCESS_KEY_ID and OSS_ACCESS_KEY_SECRET first. If the
+// environment variables are not set, they are read from the existing
+// rclone.conf file's [oss] section as a fallback. This ensures backward
+// compatibility with deployments that generated rclone.conf before the
+// security change that removed AK/SK from config.yaml.
 func NewStorageManager(cfg *config.AppConfig) (*StorageManager, error) {
 	storageClass := cfg.OSS.StorageClass
 	if storageClass != "" && !validS3StorageClasses[storageClass] {
@@ -81,9 +84,24 @@ func NewStorageManager(cfg *config.AppConfig) (*StorageManager, error) {
 		storageClass = ""
 	}
 
-	// Read OSS credentials from environment variables only — never from config files.
+	// Read OSS credentials from environment variables first.
 	akID := os.Getenv("OSS_ACCESS_KEY_ID")
 	akSecret := os.Getenv("OSS_ACCESS_KEY_SECRET")
+
+	// Fallback: if env vars are not set, try to read AK/SK from the existing
+	// rclone.conf [oss] section. This maintains backward compatibility with
+	// deployments where rclone.conf was generated with AK/SK from config.yaml.
+	if akID == "" || akSecret == "" {
+		if fallbackAK, fallbackSK, ok := readCredentialsFromRcloneConf(cfg.Rclone.ConfigPath); ok {
+			if akID == "" {
+				akID = fallbackAK
+			}
+			if akSecret == "" {
+				akSecret = fallbackSK
+			}
+			fmt.Println("INFO: OSS credentials read from rclone.conf fallback (env vars not set).")
+		}
+	}
 
 	sm := &StorageManager{
 		rcloneBinCfg: cfg.Rclone.BinaryPath,
@@ -349,6 +367,32 @@ func fieldValue(section, key string) string {
 	return strings.TrimSpace(m[1])
 }
 
+// readCredentialsFromRcloneConf reads the OSS access_key_id and
+// secret_access_key from the [oss] section of an existing rclone.conf
+// file. This is used as a fallback when environment variables are not set.
+// Returns (ak, sk, true) if both credentials were found, or ("", "", false)
+// otherwise.
+func readCredentialsFromRcloneConf(rcloneConfPath string) (string, string, bool) {
+	content, err := os.ReadFile(rcloneConfPath)
+	if err != nil {
+		return "", "", false
+	}
+	text := string(content)
+
+	start, end, ok := locateSection(text, "oss")
+	if !ok {
+		return "", "", false
+	}
+	section := text[start:end]
+
+	ak := fieldValue(section, "access_key_id")
+	sk := fieldValue(section, "secret_access_key")
+	if ak == "" || sk == "" {
+		return "", "", false
+	}
+	return ak, sk, true
+}
+
 // obscurePassword generates an obscured representation of a password for rclone.
 // It uses the configured rclone binary to run the obscure command.
 // If the rclone binary is not available or the command fails, an error is returned
@@ -586,6 +630,13 @@ func (sm *StorageManager) Exists(ctx context.Context, remoteKey string) (bool, e
 //
 // The restore window is set to 7 days.
 func (sm *StorageManager) RestoreObject(remoteKey string, expedited bool) error {
+	// If OSS SDK credentials are not available, we cannot trigger archive
+	// restore via the OSS SDK. Return an error explaining the requirement.
+	if sm.ossAKID == "" || sm.ossAKSecret == "" {
+		return fmt.Errorf("cannot restore archive object: OSS SDK credentials not available " +
+			"(set OSS_ACCESS_KEY_ID and OSS_ACCESS_KEY_SECRET env vars for ColdArchive/Archive support)")
+	}
+
 	client, err := oss.New(sm.ossEndpoint, sm.ossAKID, sm.ossAKSecret)
 	if err != nil {
 		return fmt.Errorf("create OSS client: %w", err)
@@ -622,6 +673,17 @@ func (sm *StorageManager) RestoreObject(remoteKey string, expedited bool) error 
 // CheckRestored checks whether an archived object has been restored and is
 // ready for download. It returns true if the object is in a restorable state.
 func (sm *StorageManager) CheckRestored(remoteKey string) (bool, error) {
+	// If OSS SDK credentials are not available (env vars not set and
+	// rclone.conf fallback also failed), we cannot use the OSS SDK to check
+	// archive restore status. Assume the object is ready for download —
+	// the rclone-based Download() call will fail with a specific error if
+	// the object truly needs thawing.
+	if sm.ossAKID == "" || sm.ossAKSecret == "" {
+		slog.Warn("OSS SDK credentials not available, skipping archive restore check; " +
+			"set OSS_ACCESS_KEY_ID and OSS_ACCESS_KEY_SECRET env vars for ColdArchive/Archive support")
+		return true, nil
+	}
+
 	client, err := oss.New(sm.ossEndpoint, sm.ossAKID, sm.ossAKSecret)
 	if err != nil {
 		return false, fmt.Errorf("create OSS client: %w", err)
