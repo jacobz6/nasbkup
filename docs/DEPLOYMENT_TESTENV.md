@@ -192,7 +192,7 @@ WantedBy=multi-user.target
 ```
 
 > **说明**：使用 `go run` 而非编译后的二进制，方便修改代码后快速重启生效。
-> 如果需要更高性能，可改为编译后运行，参考 `DEPLOYMENT.md`。
+> 如果需要更高性能，可改为编译后运行，参考 [DEPLOYMENT_PRODUCTION.md](DEPLOYMENT_PRODUCTION.md)。
 
 ### 3.5 启动服务
 

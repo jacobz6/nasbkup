@@ -81,15 +81,21 @@
 
 ```
 nasbkup_system/
+├── README.md                    # 项目主页（GitHub）
+├── docker-compose.yml           # Docker Compose 编排
+├── Dockerfile                   # Docker 三阶段构建
 ├── nas-backup-backend/          # Go 后端服务
-│   ├── cmd/nas-backup/          # 程序入口
+│   ├── cmd/nas-backup/          # HTTP 服务入口
 │   │   └── main.go
 │   ├── cmd/restore-cli/         # 下云恢复 CLI 工具
 │   ├── internal/                # 内部包（不可被外部导入）
 │   │   ├── api/                 # HTTP API 层（路由 + 处理器）
 │   │   ├── backup/              # 备份引擎 + 恢复器 + 进度推送 + 对账
 │   │   │   ├── engine.go        # 备份引擎核心
-│   │   │   ├── progress.go      # SSE 进度推送 Broker
+│   │   │   ├── progress.go      # SSE 进度推送 Broker（备份）
+│   │   │   ├── restore_progress.go # SSE 恢复进度 Broker
+│   │   │   ├── restore_job.go   # 恢复任务管理器
+│   │   │   ├── db_backup.go     # 数据库加密备份到 OSS
 │   │   │   ├── reconcile.go     # 数据一致性对账修复
 │   │   │   └── restore.go       # 文件恢复器
 │   │   ├── compress/            # zstd 压缩/解压
@@ -102,8 +108,13 @@ nasbkup_system/
 │   │   ├── models/              # 领域模型定义
 │   │   ├── scanner/             # 文件扫描与变更检测
 │   │   ├── scheduler/           # 定时任务调度
-│   │   └── storage/             # OSS 存储管理（rclone）
+│   │   └── storage/             # OSS 存储管理（rclone + OSS SDK）
 │   ├── scripts/                 # 辅助脚本
+│   │   ├── setup-rclone.sh      # rclone 交互式配置
+│   │   ├── patch-rclone-crypt-password.sh # 修复 rclone crypt 密码
+│   │   ├── backup.sh            # CLI 手动触发备份
+│   │   └── backup_restore_test.py # 备份恢复闭环测试
+│   ├── run_tests.sh             # 一键测试脚本
 │   ├── config.yaml.example      # 配置文件示例
 │   ├── go.mod / go.sum
 │   └── README.md
@@ -119,7 +130,8 @@ nasbkup_system/
 │   │   │   ├── Content.tsx      # 内容选择
 │   │   │   ├── Strategy.tsx     # 策略设置
 │   │   │   ├── Logs.tsx         # 日志查看
-│   │   │   └── Reconcile.tsx    # 系统对账
+│   │   │   ├── Reconcile.tsx    # 系统对账
+│   │   │   └── Restore.tsx      # 数据恢复页面
 │   │   ├── store/               # Zustand 状态
 │   │   ├── utils/               # 工具函数（api.ts 含 SSE 客户端）
 │   │   ├── lib/                 # 通用库
@@ -129,11 +141,21 @@ nasbkup_system/
 │   ├── package.json
 │   ├── vite.config.ts
 │   └── tailwind.config.js
-├── docker/                      # Docker 部署配置（含 Nginx SSE 配置）
-│   ├── nginx.conf
-│   └── config.docker.yaml
-├── DEPLOYMENT.md                # 生产部署指南
-├── DEPLOYMENT_testenv.md        # 测试环境部署指南
+├── docker/                      # Docker 部署配置
+│   ├── entrypoint.sh            # 容器启动脚本
+│   ├── nginx.conf               # Nginx 配置（含 SSE 长连接）
+│   └── config.docker.yaml       # 容器默认配置
+├── docs/                        # 文档中心
+│   ├── INDEX.md                 # 文档索引
+│   ├── WIKI.md                  # 代码百科（本文件）
+│   ├── DEPLOYMENT_DOCKER.md     # Docker 部署指南
+│   ├── DEPLOYMENT_PRODUCTION.md # 生产环境部署指南
+│   ├── DEPLOYMENT_TESTENV.md    # 测试环境部署指南
+│   ├── RESTORE_GUIDE.md         # 恢复操作指南
+│   ├── SCRIPTS.md               # 脚本说明
+│   ├── ALIGNMENT.md             # 需求对齐文档
+│   ├── DESIGN.md                # 架构设计文档
+│   └── TASKS.md                 # 任务拆分文档
 └── nas_file_generator.py        # 测试数据生成器
 ```
 
@@ -212,7 +234,8 @@ AppConfig
 │   ├── Host              # 监听地址 (默认 "0.0.0.0")
 │   ├── Port              # 监听端口 (默认 8080)
 │   ├── ReadTimeout       # 读超时秒数 (默认 30)
-│   └── WriteTimeout      # 写超时秒数 (默认 60, SSE端点动态禁用)
+│   ├── WriteTimeout      # 写超时秒数 (默认 60, SSE端点动态禁用)
+│   └── RestoreBaseDirs   # 恢复操作允许的基础目录列表（路径白名单，防止路径遍历）
 ├── DatabaseConfig        # 数据库配置
 │   └── Path              # SQLite 文件路径 (默认 "./data/nas-backup.db")
 ├── BackupConfig          # 备份配置
@@ -347,8 +370,14 @@ AppConfig
 | `OSSInfo` | StorageClass, Endpoint, Bucket, RemoteName, Region | OSS 配置信息（仪表板显示） |
 | `DashboardStats` | TotalFiles, TotalSize, OSSStorageUsed, OSSQuotaBytes, BackupCount, UniqueHashCount, NeedsReconcile, OSSInfo, LastBackupTime, LastBackupStatus, NextBackupTime, ActiveBackupRunning | 仪表板统计 |
 | `BackupTriggerRequest` | Type | 触发备份请求（支持 full/incremental/auto） |
-| `RestoreRequest` | Paths, Pattern, BackupID, OutputDir, Expedited | 恢复请求 |
+| `RestoreRequest` | Paths, Pattern, BackupID, OutputDir, Expedited, ConflictStrategy, RestoreToOriginal | 恢复请求（ConflictStrategy: overwrite/skip/rename，RestoreToOriginal: 恢复到原始路径） |
 | `RestoreResult` | TotalFiles, RestoredFiles, FailedFiles, TotalSize, ElapsedMs | 恢复结果 |
+| `RestoreJobStatus` | `pending` / `running` / `completed` / `failed` / `cancelled` | 恢复任务状态 |
+| `RestoreJobRecord` | ID, Status, Paths, Pattern, BackupID, OutputDir, Expedited, ConflictStrategy, TotalFiles, RestoredFiles, FailedFiles, TotalSize, RestoredSize, ElapsedMs, ErrorMessage, CreatedAt, StartedAt, CompletedAt | 恢复任务记录（异步执行） |
+| `RestoreCreateResponse` | JobID, Status, TotalFiles, TotalSize | 创建恢复任务响应 |
+| `RestorableFile` | ID, Path, Size, ModTime, Hash, Status, BackupCount, LatestBackupID, LatestBackupAt, StorageKey, CompressType, OriginalSize, StoredSize | 可恢复文件信息 |
+| `RestorePhase` | `preparing` / `thawing` / `downloading` / `decrypting` / `decompressing` / `verifying` / `moving` / `completed` / `failed` / `cancelled` | 恢复阶段 |
+| `RestoreProgressEvent` | Type, JobID, Phase, PhaseName, Current, Total, Percent, Message, Detail, Level, FilePath, FileSize, RestoredSize, TotalSize, Timestamp | SSE 恢复进度事件 |
 | `FSEntry` | Name, Path, IsDir, Size, ModTime, InBackup, PartialBackup, HasUpdate, WillBackup | 文件系统条目（PartialBackup 表示目录部分纳入备份） |
 | `FSBrowseResult` | Path, ParentPath, Entries | 文件浏览结果 |
 | `APIResponse` | Success, Data, Error | 标准 API 响应 |
@@ -607,7 +636,13 @@ type Router struct {
 
 | 处理器 | 请求 | 说明 |
 |--------|------|------|
-| `handleRestore` | `POST /api/restore` | 恢复文件，body: RestoreRequest（使用独立 4h 超时 context，客户端断连不中断） |
+| `handleRestoreCreate` | `POST /api/restore` | 创建异步恢复任务，body: RestoreRequest（含 paths/pattern/backup_id/output_dir/expedited/conflict_strategy/restore_to_original），返回 `{job_id, status, total_files, total_size}`（202 Accepted） |
+| `handleRestoreListFiles` | `GET /api/restore/files?dir_path=&backup_id=&search=&page=&size=` | 列出可恢复文件（分页+搜索+目录前缀过滤+备份版本选择） |
+| `handleRestoreProgressStream` | `GET /api/restore/progress/stream` | **SSE 恢复进度流**：推送 phase/progress/file/log 事件，连接时回放历史事件 |
+| `handleRestoreListJobs` | `GET /api/restore/jobs?page=&size=&status=` | 恢复任务历史列表（分页+状态过滤） |
+| `handleRestoreGetJob` | `GET /api/restore/jobs/{id}` | 单个恢复任务详情 |
+| `handleRestoreCancelJob` | `POST /api/restore/jobs/{id}/cancel` | 取消运行中的恢复任务 |
+| `handleListBackups` | `GET /api/backups?page=&size=` | 备份版本列表（分页，用于恢复时选择备份版本） |
 | `handleGarbageCollection` | `POST /api/gc` | 异步触发垃圾回收 |
 | `handleReconcile` | `POST /api/reconcile?dry_run=true/false` | **数据一致性对账**：同步检查 OSS ↔ hash_index ↔ backup_files ↔ 备份状态。dry_run=true 仅报告不修复，备份运行中返回 409 Conflict |
 | `handleStorageHealth` | `GET /api/storage/health` | **OSS 连通性健康检查**：ping OSS 验证配置/凭证/网络，返回延迟 ms，不可用时返回 503 |
@@ -1096,6 +1131,7 @@ BrowserRouter
 └── AppLayout (侧边栏 + 主内容区 + Toast)
     ├── /           → Dashboard (全览)
     ├── /content    → Content (内容选择)
+    ├── /restore    → Restore (文件恢复)
     ├── /strategy   → Strategy (策略设置)
     ├── /logs       → Logs (日志)
     └── /reconcile  → Reconcile (数据一致性对账)
@@ -1270,6 +1306,45 @@ API_BASE = `/api`（开发环境代理到后端）
 - 修复按钮：执行对账并自动修复可修复项，需二次确认
 - 执行中按钮置灰，显示加载状态
 - 对账完成后各问题卡片展开显示详情，已修复项标记为绿色
+
+#### Restore 页面 (`src/pages/Restore.tsx`)
+
+**功能**: 文件恢复操作（Web UI 恢复入口）
+
+**布局**:
+1. **头部说明卡片**: 提示归档存储需解冻，加急解冻可加速（ColdArchive 标准解冻最长 30 分钟）
+2. **恢复进度面板**（恢复运行时显示）:
+   - 状态横幅：运行中/已完成/失败/已取消
+   - 进度条：当前阶段（preparing→thawing→downloading→decrypting→decompressing→verifying→moving）、百分比、当前文件
+   - 已恢复文件数/总文件数、已恢复大小/总大小
+   - 实时日志面板（SSE 推送，最多 100 条）
+   - 取消按钮、完成摘要
+3. **三列布局**:
+   - 左 2/3：筛选栏（搜索框、备份版本下拉选择、重置、全选）+ 面包屑路径导航 + 文件列表表格（带 checkbox 多选列）
+   - 右 1/3：已选文件摘要 + 恢复配置面板
+4. **恢复历史表格**: ID、状态徽章、文件数(restored/total)、大小(restored/total)、加急标识、耗时、创建时间
+
+**恢复配置**:
+- **恢复目标**: 恢复到原路径（`restore_to_original: true`）或指定目录（`output_dir`）
+- **冲突策略**: skip（跳过已存在文件，默认）/ overwrite（覆盖）/ rename（追加时间戳重命名）
+- **加急解冻**: 开启后使用 OSS Expedited 解冻模式（适用于 ColdArchive/Archive 存储类型）
+
+**数据流**:
+- `useRestoreProgress` Hook 管理 SSE 恢复进度订阅
+- `fetchBackups` 加载备份版本列表（最多 50 条）
+- `fetchFiles` 支持搜索/目录前缀/备份版本过滤，分页加载可恢复文件
+- `fetchJobs` 分页加载恢复历史
+- 文件选择跨页保持（使用 `Set<number>` 存储选中文件 ID）
+- 路径面包屑可点击导航
+- 恢复完成后自动刷新历史列表
+
+**交互**:
+- 支持全盘恢复（一键恢复所有可恢复文件）
+- 支持多选文件后批量恢复
+- 恢复任务创建后异步执行，不阻塞 UI
+- 恢复进度通过 SSE 实时推送（phase/progress/file/log 事件）
+- 可取消运行中的恢复任务
+- 备份和恢复互斥（同一时间只能运行一个备份或恢复任务）
 
 ### 4.6 组件详解
 
@@ -1461,6 +1536,8 @@ SSE 实时进度订阅 Hook：
 
 索引: `idx_hash_index_hash`
 
+> **Migration 002**: 新增 `orphaned_at TEXT` 列，ref_count 降为 0 时设置时间戳，GC 宽限期基准。新增部分索引 `idx_hash_index_orphaned`（WHERE orphaned_at IS NOT NULL）
+
 #### backup_logs — 备份日志
 
 | 列 | 类型 | 约束 | 说明 |
@@ -1500,6 +1577,40 @@ SSE 实时进度订阅 Hook：
 | pattern | TEXT | NOT NULL UNIQUE | 匹配模式 |
 | rule_type | TEXT | NOT NULL DEFAULT 'pattern' CHECK(extension/directory/pattern/size_exceed) | 规则类型 |
 | enabled | INTEGER | NOT NULL DEFAULT 1 | 是否启用 |
+
+#### restore_jobs — 恢复任务（Migration 003）
+
+| 列 | 类型 | 约束 | 说明 |
+|----|------|------|------|
+| id | INTEGER | PK AUTOINCREMENT | 主键 |
+| status | TEXT | NOT NULL CHECK(pending/running/completed/failed/cancelled) | 任务状态 |
+| paths | TEXT | NOT NULL | 恢复路径列表（JSON 数组） |
+| pattern | TEXT | | 文件名匹配模式 |
+| backup_id | INTEGER | | 指定备份版本 ID |
+| output_dir | TEXT | NOT NULL | 恢复输出目录 |
+| expedited | BOOLEAN | NOT NULL DEFAULT 0 | 是否使用加急解冻 |
+| conflict_strategy | TEXT | NOT NULL DEFAULT 'skip' | 冲突策略(overwrite/skip/rename) |
+| total_files | INTEGER | NOT NULL DEFAULT 0 | 总文件数 |
+| restored_files | INTEGER | NOT NULL DEFAULT 0 | 已恢复文件数 |
+| failed_files | TEXT | | 失败文件列表（JSON 数组） |
+| total_size | INTEGER | NOT NULL DEFAULT 0 | 总大小 |
+| restored_size | INTEGER | NOT NULL DEFAULT 0 | 已恢复大小 |
+| elapsed_ms | INTEGER | | 耗时（毫秒） |
+| error_message | TEXT | | 错误信息 |
+| created_at | TEXT | NOT NULL DEFAULT datetime | 创建时间 |
+| started_at | TEXT | | 开始时间 |
+| completed_at | TEXT | | 完成时间 |
+
+索引: `idx_restore_jobs_status`, `idx_restore_jobs_created_at`
+
+#### schema_migrations — 迁移版本追踪
+
+| 列 | 类型 | 约束 | 说明 |
+|----|------|------|------|
+| version | INTEGER | PK | 迁移版本号 |
+| applied_at | TEXT | NOT NULL DEFAULT datetime | 应用时间 |
+
+> 当前迁移版本: 001 (初始表结构) → 002 (hash_index.orphaned_at) → 003 (restore_jobs 表)
 
 ---
 
@@ -1567,14 +1678,32 @@ SSE 实时进度订阅 Hook：
 | GET | `/api/logs?backup_id=&level=&search=&start_time=&end_time=&page=&page_size=` | Query: 过滤参数 | `PaginatedResponse<LogRecord>` | 日志列表 |
 | GET | `/api/logs/{id}` | - | `APIResponse<LogRecord>` | 日志详情 |
 
-### Restore & GC & Maintenance
+### Restore
 
 | 方法 | 路径 | 请求 | 响应 | 说明 |
 |------|------|------|------|------|
-| POST | `/api/restore` | Body: RestoreRequest | `APIResponse<RestoreResult>` | 恢复文件（4h 独立超时） |
+| POST | `/api/restore` | Body: RestoreRequest | `APIResponse<RestoreCreateResponse>` (202) | 创建异步恢复任务 |
+| GET | `/api/restore/files?dir_path=&backup_id=&search=&page=&size=` | Query: 过滤参数 | `PaginatedResponse<RestorableFile>` | 可恢复文件列表 |
+| GET | `/api/restore/progress/stream` | SSE 连接 | `text/event-stream` | **SSE 恢复进度流**（phase/progress/file/log） |
+| GET | `/api/restore/jobs?page=&size=&status=` | Query: 分页+状态 | `PaginatedResponse<RestoreJobRecord>` | 恢复任务历史 |
+| GET | `/api/restore/jobs/{id}` | - | `APIResponse<RestoreJobRecord>` | 恢复任务详情 |
+| POST | `/api/restore/jobs/{id}/cancel` | - | `APIResponse<{status}>` | 取消恢复任务 |
+
+### Backups
+
+| 方法 | 路径 | 请求 | 响应 | 说明 |
+|------|------|------|------|------|
+| GET | `/api/backups?page=&size=` | Query: page, size | `PaginatedResponse<BackupRecord>` | 备份版本列表 |
+
+### GC & Maintenance
+
+| 方法 | 路径 | 请求 | 响应 | 说明 |
+|------|------|------|------|------|
 | POST | `/api/gc` | - | `APIResponse<{status}>` | 触发垃圾回收（异步） |
 | POST | `/api/reconcile?dry_run=` | Query: dry_run (默认 true) | `APIResponse<ReconcileReport>` | **数据一致性对账**（备份运行中返回 409） |
 | GET | `/api/storage/health` | - | `APIResponse<{latency_ms, ok}>` (200/503) | OSS 连通性健康检查 |
+
+> **API 端点总数**: 36 条（含 2 个 SSE 流端点）
 
 ---
 
@@ -1825,7 +1954,7 @@ npm run preview  # 预览构建结果
    - `add_header Cache-Control 'no-cache';`
    - `add_header X-Accel-Buffering no;`（告诉 Nginx 不要缓冲）
 
-详见 [DEPLOYMENT.md](file:///Users/jacobzhang/工作区/code/nasbkup_system/DEPLOYMENT.md)
+详见 [DEPLOYMENT_PRODUCTION.md](DEPLOYMENT_PRODUCTION.md)（生产环境裸机部署）或 [DEPLOYMENT_DOCKER.md](DEPLOYMENT_DOCKER.md)（Docker 部署）
 
 ---
 

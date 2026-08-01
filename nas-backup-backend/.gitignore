@@ -55,4 +55,5 @@ config.yaml
 
 # Allow example files
 !config.yaml.example
-!data/rclone.conf.example
+# Note: rclone.conf.example cannot be tracked inside /data/ (excluded dir)
+# See docs/DEPLOYMENT_*.md for rclone configuration instructions

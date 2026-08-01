@@ -84,13 +84,22 @@ func NewStorageManager(cfg *config.AppConfig) (*StorageManager, error) {
 		storageClass = ""
 	}
 
-	// Read OSS credentials from environment variables first.
+	// Read OSS credentials with priority:
+	//   1. Environment variables OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET
+	//   2. config.yaml oss.access_key_id / oss.access_key_secret
+	//   3. Existing rclone.conf [oss] section (backward compatibility fallback)
 	akID := os.Getenv("OSS_ACCESS_KEY_ID")
 	akSecret := os.Getenv("OSS_ACCESS_KEY_SECRET")
 
-	// Fallback: if env vars are not set, try to read AK/SK from the existing
-	// rclone.conf [oss] section. This maintains backward compatibility with
-	// deployments where rclone.conf was generated with AK/SK from config.yaml.
+	// Fallback 2: config.yaml
+	if akID == "" {
+		akID = cfg.OSS.AccessKeyID
+	}
+	if akSecret == "" {
+		akSecret = cfg.OSS.AccessKeySecret
+	}
+
+	// Fallback 3: existing rclone.conf [oss] section
 	if akID == "" || akSecret == "" {
 		if fallbackAK, fallbackSK, ok := readCredentialsFromRcloneConf(cfg.Rclone.ConfigPath); ok {
 			if akID == "" {
@@ -99,7 +108,7 @@ func NewStorageManager(cfg *config.AppConfig) (*StorageManager, error) {
 			if akSecret == "" {
 				akSecret = fallbackSK
 			}
-			fmt.Println("INFO: OSS credentials read from rclone.conf fallback (env vars not set).")
+			fmt.Println("INFO: OSS credentials read from rclone.conf fallback (env vars and config.yaml not set).")
 		}
 	}
 
@@ -623,18 +632,46 @@ func (sm *StorageManager) Exists(ctx context.Context, remoteKey string) (bool, e
 	return len(entries) > 0, nil
 }
 
+// ossObjectKey converts a rclone-layer storage key to the actual OSS object key.
+// When using the crypt remote wrapper (remoteName != "oss"), rclone appends a
+// ".bin" suffix to all objects even when filename_encryption=off. This suffix
+// is stripped by rclone when listing/reading via the crypt remote, but the
+// raw OSS SDK must use the actual suffixed key.
+func (sm *StorageManager) ossObjectKey(remoteKey string) string {
+	// If using the crypt wrapper (remoteName != raw "oss"), append .bin suffix
+	// to match what rclone actually writes to OSS.
+	if sm.remoteName != "oss" && !strings.HasSuffix(remoteKey, ".bin") {
+		return remoteKey + ".bin"
+	}
+	return remoteKey
+}
+
 // RestoreObject initiates a restore (thaw) request for an archived object.
-// For ColdArchive objects, the expedited flag controls the restore speed:
-//   - Standard: restore completes in 1-10 hours.
-//   - Expedited: restore completes in 1-10 minutes (requires whitelist).
+//
+// Important note for Aliyun OSS Archive storage (as opposed to Cold Archive):
+// the Archive tier does NOT support the JobParameters/Tier parameter —
+// attempting to pass <Tier>Expedited</Tier> or <Tier>Standard</Tier> results
+// in a MalformedXML / "GlacierJobParameters is not supported" error. Only
+// the <Days> element is accepted. Expedited restore is available only for
+// Cold Archive / Deep Archive tiers, not for standard Archive.
 //
 // The restore window is set to 7 days.
 func (sm *StorageManager) RestoreObject(remoteKey string, expedited bool) error {
-	// If OSS SDK credentials are not available, we cannot trigger archive
-	// restore via the OSS SDK. Return an error explaining the requirement.
-	if sm.ossAKID == "" || sm.ossAKSecret == "" {
-		return fmt.Errorf("cannot restore archive object: OSS SDK credentials not available " +
-			"(set OSS_ACCESS_KEY_ID and OSS_ACCESS_KEY_SECRET env vars for ColdArchive/Archive support)")
+	// If OSS SDK is not fully configured, we cannot trigger archive restore
+	// via the OSS SDK. For non-archived storage (e.g., local filesystem, S3),
+	// no thaw is needed and objects are immediately downloadable.
+	if sm.ossAKID == "" || sm.ossAKSecret == "" || sm.ossEndpoint == "" || sm.ossBucket == "" {
+		slog.Warn("OSS SDK not fully configured, skipping archive restore (thaw) request; " +
+			"objects in non-archived storage classes are immediately downloadable")
+		return nil
+	}
+
+	// If expedited was requested, log that Aliyun Archive tier does not
+	// support it and fall back to standard restore (1-10 hours) instead of
+	// failing the whole job.
+	if expedited {
+		slog.Warn("expedited restore requested but Aliyun OSS Archive tier does not support " +
+			"GlacierJobParameters/Tier (expedited is only for Cold Archive); using standard restore (1-10 hours)")
 	}
 
 	client, err := oss.New(sm.ossEndpoint, sm.ossAKID, sm.ossAKSecret)
@@ -647,42 +684,59 @@ func (sm *StorageManager) RestoreObject(remoteKey string, expedited bool) error 
 		return fmt.Errorf("get OSS bucket %q: %w", sm.ossBucket, err)
 	}
 
-	restoreConfig := oss.RestoreConfiguration{
-		Days: 7,
-	}
-	if expedited {
-		restoreConfig.Tier = "Expedited"
-	} else {
-		restoreConfig.Tier = "Standard"
-	}
-
-	err = bucket.RestoreObjectDetail(remoteKey, restoreConfig)
+	// For Aliyun Archive storage, the restore request must contain ONLY
+	// <Days>; no <JobParameters><Tier> element is allowed. Use the simple
+	// RestoreObject API (not RestoreObjectDetail) which sends exactly that.
+	ossKey := sm.ossObjectKey(remoteKey)
+	err = bucket.RestoreObject(ossKey)
 	if err != nil {
 		// OSS returns a specific error when the object is already restored
 		// or a restore is already in progress. This is not a fatal error.
 		errMsg := err.Error()
-		if strings.Contains(errMsg, "RestoreAlreadyInProgress") {
+		if strings.Contains(errMsg, "RestoreAlreadyInProgress") ||
+			strings.Contains(errMsg, "OK") {
 			return nil
 		}
-		return fmt.Errorf("restore object %q: %w", remoteKey, err)
+		// If the object is not in archived state (e.g. STANDARD/IA), the
+		// restore call may return InvalidObjectState/OperationNotSupported —
+		// treat that as success (object downloadable).
+		if strings.Contains(errMsg, "OperationNotSupported") ||
+			strings.Contains(errMsg, "InvalidObjectState") {
+			slog.Info("object not in archived state, no thaw needed",
+				"key", remoteKey, "oss_key", ossKey)
+			return nil
+		}
+		return fmt.Errorf("restore object %q (oss key: %q): %w", remoteKey, ossKey, err)
 	}
 
 	return nil
 }
 
+// isArchiveStorageClass returns true if the given storage class string indicates
+// an archive/cold tier that requires thawing before download.
+func isArchiveStorageClass(sc string) bool {
+	scLower := strings.ToLower(sc)
+	return strings.Contains(scLower, "archive") ||
+		strings.Contains(scLower, "glacier") ||
+		strings.Contains(scLower, "cold") ||
+		strings.Contains(scLower, "deep")
+}
+
 // CheckRestored checks whether an archived object has been restored and is
 // ready for download. It returns true if the object is in a restorable state.
 func (sm *StorageManager) CheckRestored(remoteKey string) (bool, error) {
-	// If OSS SDK credentials are not available (env vars not set and
-	// rclone.conf fallback also failed), we cannot use the OSS SDK to check
-	// archive restore status. Assume the object is ready for download —
-	// the rclone-based Download() call will fail with a specific error if
-	// the object truly needs thawing.
-	if sm.ossAKID == "" || sm.ossAKSecret == "" {
-		slog.Warn("OSS SDK credentials not available, skipping archive restore check; " +
-			"set OSS_ACCESS_KEY_ID and OSS_ACCESS_KEY_SECRET env vars for ColdArchive/Archive support")
+	// If OSS SDK credentials/endpoint/bucket are not available, we cannot use
+	// the OSS SDK to check archive restore status. Assume the object is ready
+	// for download — the rclone-based Download() call will fail with a specific
+	// error if the object truly needs thawing.
+	if sm.ossAKID == "" || sm.ossAKSecret == "" || sm.ossEndpoint == "" || sm.ossBucket == "" {
+		slog.Warn("OSS SDK not fully configured (missing credentials/endpoint/bucket), skipping archive restore check; " +
+			"set OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET env vars and configure oss.endpoint/oss.bucket for ColdArchive/Archive support")
 		return true, nil
 	}
+
+	// Use actual OSS object key (with .bin suffix if using crypt wrapper)
+	ossKey := sm.ossObjectKey(remoteKey)
 
 	client, err := oss.New(sm.ossEndpoint, sm.ossAKID, sm.ossAKSecret)
 	if err != nil {
@@ -695,34 +749,82 @@ func (sm *StorageManager) CheckRestored(remoteKey string) (bool, error) {
 	}
 
 	// GetObjectDetailedMeta returns full metadata including the X-Oss-Restore header.
-	meta, err := bucket.GetObjectDetailedMeta(remoteKey)
+	meta, err := bucket.GetObjectDetailedMeta(ossKey)
+	usedFallback := false
 	if err != nil {
 		errMsg := err.Error()
 		// Distinguish "object not found" (404 NoSuchKey) from other HEAD errors.
 		// A 404 means the object was never uploaded or has been deleted (e.g.
 		// by GC based on an inconsistent hash_index). This is a data-integrity
-		// problem, NOT a thaw issue — returning the generic "head object" error
-		// here caused restore to fail with the misleading message "check
-		// restore status failed" instead of pointing at the real problem.
+		// problem, NOT a thaw issue.
 		if strings.Contains(errMsg, "404") || strings.Contains(errMsg, "NoSuchKey") {
-			return false, fmt.Errorf("object %q does not exist in OSS (404 NoSuchKey) — it may have been deleted by GC or never uploaded; verify hash_index/backup_files consistency (files.hash vs storage_key)", remoteKey)
+			// If we added .bin suffix and got 404, try without suffix as fallback
+			if ossKey != remoteKey {
+				meta, err = bucket.GetObjectDetailedMeta(remoteKey)
+				if err == nil {
+					// Found without suffix — use this path instead
+					slog.Warn("object found without .bin suffix, using raw key", "key", remoteKey)
+					ossKey = remoteKey
+					usedFallback = true
+				} else {
+					errMsg2 := err.Error()
+					if strings.Contains(errMsg2, "404") || strings.Contains(errMsg2, "NoSuchKey") {
+						return false, fmt.Errorf("object %q does not exist in OSS (404 NoSuchKey) — checked both %q and %q; it may have been deleted by GC or never uploaded; verify hash_index/backup_files consistency (files.hash vs storage_key)", remoteKey, sm.ossObjectKey(remoteKey), remoteKey)
+					}
+					return false, fmt.Errorf("head object %q (oss key: %q): %w", remoteKey, sm.ossObjectKey(remoteKey), err)
+				}
+			} else {
+				return false, fmt.Errorf("object %q does not exist in OSS (404 NoSuchKey) — it may have been deleted by GC or never uploaded; verify hash_index/backup_files consistency (files.hash vs storage_key)", remoteKey)
+			}
+		} else if strings.Contains(errMsg, "OperationNotSupported") || strings.Contains(errMsg, "InvalidObjectState") {
+			// This error indicates we tried to HEAD an object that is in a
+			// storage class that doesn't support direct HEAD operations.
+			// Fall through to assume it needs thawing.
+			slog.Warn("HEAD request returned InvalidObjectState/OperationNotSupported, assuming object needs thaw", "key", remoteKey)
+			return false, nil
+		} else {
+			return false, fmt.Errorf("head object %q (oss key: %q): %w", remoteKey, ossKey, err)
 		}
-		return false, fmt.Errorf("head object %q: %w", remoteKey, err)
 	}
+
+	_ = usedFallback
+
+	// Check storage class first. If the object is in an archive/cold tier, it
+	// requires restoration before download, regardless of the presence/absence
+	// of the X-Oss-Restore header.
+	storageClass := meta.Get("X-Oss-Storage-Class")
+	isArchive := isArchiveStorageClass(storageClass)
 
 	// Check the X-Oss-Restore header.
 	restoreHeader := meta.Get("X-Oss-Restore")
-	if restoreHeader == "" {
-		// No restore header means the object is not archived or not in a
-		// storage class that requires restoration.
+
+	if !isArchive {
+		// Object is in Standard/IA/other non-archive class - downloadable immediately
+		slog.Debug("object in non-archive storage class, ready for download",
+			"key", remoteKey, "storage_class", storageClass)
 		return true, nil
+	}
+
+	// Object is in an archive storage class.
+	if restoreHeader == "" {
+		// No restore header means the object has never had a restore request
+		// submitted for it — it needs thawing.
+		slog.Info("object is in archive storage and has no restore request, needs thaw",
+			"key", remoteKey, "storage_class", storageClass)
+		return false, nil
 	}
 
 	// The header value is like "ongoing-request=true" or "ongoing-request=false, expiry-date=..."
 	if strings.Contains(restoreHeader, "ongoing-request=false") {
+		// Restore completed and within the expiry window
+		slog.Debug("archive object restored and ready for download",
+			"key", remoteKey, "restore_header", restoreHeader)
 		return true, nil
 	}
 
+	// ongoing-request=true → restore is still in progress
+	slog.Info("archive object restore is in progress",
+		"key", remoteKey, "restore_header", restoreHeader)
 	return false, nil
 }
 

@@ -124,14 +124,15 @@ type ReconcileConfig struct {
 }
 
 // OSSConfig defines Alibaba Cloud OSS parameters.
-// AccessKeyID and AccessKeySecret are intentionally NOT mapped to YAML —
-// they are read from environment variables (OSS_ACCESS_KEY_ID,
-// OSS_ACCESS_KEY_SECRET) in the storage layer to avoid secrets in config files.
+// AccessKeyID and AccessKeySecret can be set via:
+//   1. Environment variables OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET (highest priority)
+//   2. config.yaml fields access_key_id / access_key_secret
+//   3. Existing rclone.conf [oss] section (fallback for backward compatibility)
 type OSSConfig struct {
 	Endpoint        string `yaml:"endpoint"`
 	Bucket          string `yaml:"bucket"`
-	AccessKeyID     string `yaml:"-"` // read from env var OSS_ACCESS_KEY_ID
-	AccessKeySecret string `yaml:"-"` // read from env var OSS_ACCESS_KEY_SECRET
+	AccessKeyID     string `yaml:"access_key_id"`
+	AccessKeySecret string `yaml:"access_key_secret"`
 	StorageClass    string `yaml:"storage_class"`
 	Region          string `yaml:"region"`
 }

@@ -43,3 +43,72 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# === Security: Sensitive files (NEVER commit) ===
+
+# Encryption keys
+*.key
+master.key
+
+# Configuration files with real credentials (OSS keys, rclone passwords, etc.)
+config.yaml
+**/config.yaml
+*.conf
+!**/*.conf.example
+!**/config.yaml.example
+!docker/nginx.conf
+
+# rclone config (contains OSS credentials + crypt passwords)
+rclone.conf
+**/rclone.conf
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Data directory (runtime data, keys, logs)
+**/data/
+!**/data/.gitkeep
+
+# === Build artifacts & binaries ===
+
+# Binary directories (rclone, compiled binaries, etc.)
+bin/
+**/bin/
+
+# Go build output
+/nas-backup
+/build/
+/dist/
+
+# Go workspace
+go.work
+go.work.sum
+
+# Test binaries
+*.test
+
+# Coverage files
+*.out
+*.coverprofile
+coverage.txt
+
+# === Test environment ===
+
+# Test environment data (reports, logs, test files)
+test-env/
+
+# Acceptance reports (generated, not source code)
+acceptance-report.html
+e2e-report.json
+cloud-archive-*.html
+cloud-archive-*.json
+backend.log
+
+# === Python cache ===
+__pycache__/
+*.pyc
+*.pyo
