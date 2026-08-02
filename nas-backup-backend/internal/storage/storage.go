@@ -39,17 +39,16 @@ const defaultRetryBaseDelay = 2 * time.Second
 
 // StorageManager manages all interactions with the cloud backup store.
 type StorageManager struct {
-	rcloneBin           string // Resolved path to the rclone binary.
-	rcloneBinCfg        string // User-configured binary path (may be empty or "rclone").
-	rcloneConf          string
-	remoteName          string
-	storageClass        string
-	ossEndpoint         string
-	ossBucket           string
-	ossAKID             string
-	ossAKSecret         string
-	rcloneVersion       string // Detected rclone version string (e.g. "v1.75.0")
-	supportsNoClobber   bool   // Whether rclone supports the --no-clobber flag (>= v1.65)
+	rcloneBin     string // Resolved path to the rclone binary.
+	rcloneBinCfg  string // User-configured binary path (may be empty or "rclone").
+	rcloneConf    string
+	remoteName    string
+	storageClass  string
+	ossEndpoint   string
+	ossBucket     string
+	ossAKID       string
+	ossAKSecret   string
+	rcloneVersion string // Detected rclone version string (e.g. "v1.75.0")
 }
 
 // validS3StorageClasses lists the storage class values accepted by rclone's
@@ -143,10 +142,9 @@ func NewStorageManager(cfg *config.AppConfig) (*StorageManager, error) {
 }
 
 // checkRcloneVersion verifies that the rclone binary is runnable by executing
-// `rclone version`. It parses the version string, stores it for diagnostics,
-// and detects whether the binary supports the --no-clobber flag (>= v1.65).
-// This detection allows the upload code to conditionally use --no-clobber as
-// a second-line-of-defense against overwriting existing objects.
+// `rclone version`. It parses the version string and stores it for diagnostics
+// and future feature detection (e.g. conditional use of flags that only exist
+// in newer rclone versions).
 func (sm *StorageManager) checkRcloneVersion() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -161,33 +159,9 @@ func (sm *StorageManager) checkRcloneVersion() error {
 		return fmt.Errorf("unexpected rclone version output: %q", lines[0])
 	}
 
-	// Store the version string (first line: "rclone v1.75.0")
 	sm.rcloneVersion = lines[0]
-
-	// Parse version number to determine feature support.
-	// --no-clobber was introduced in rclone v1.65 (released Dec 2024).
-	sm.supportsNoClobber = sm.detectNoClobberSupport()
-
-	slog.Info("rclone version detected",
-		"version", sm.rcloneVersion,
-		"supports_no_clobber", sm.supportsNoClobber)
-
+	slog.Info("rclone version detected", "version", sm.rcloneVersion)
 	return nil
-}
-
-// detectNoClobberSupport checks whether the rclone binary supports the
-// --no-clobber flag by running `rclone help copyto` and searching for the
-// flag. This is more reliable than parsing version numbers because it
-// handles edge cases like custom builds or backports.
-func (sm *StorageManager) detectNoClobberSupport() bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, sm.rcloneBin, "help", "copyto")
-	output, err := cmd.Output()
-	if err != nil {
-		return false
-	}
-	return strings.Contains(string(output), "--no-clobber")
 }
 
 // EnsureRcloneConfig checks if the rclone configuration file exists; if not, it
@@ -483,12 +457,11 @@ func (sm *StorageManager) Upload(ctx context.Context, localPath, remoteKey strin
 	// overwriting. In a multi-environment shared-bucket setup, another instance
 	// may have already uploaded the same content (by hash). Overwriting would
 	// corrupt the other instance's backup because AES-GCM uses a random IV per
-	// encryption. This application-level check is the primary no-clobber guard;
-	// when the rclone binary supports --no-clobber (>= v1.65), we also pass it
-	// as a second line of defense at the command level.
+	// encryption. This application-level Exists() check is the sole no-clobber
+	// defense (rclone has no --no-clobber flag despite rumors).
 	exists, preErr := sm.Exists(ctx, remoteKey)
 	if preErr == nil && exists {
-		slog.Info("upload skipped: object already exists in OSS (no-clobber)",
+		slog.Info("upload skipped: object already exists in OSS",
 			"remote_key", remoteKey)
 		return nil
 	}
@@ -500,9 +473,6 @@ func (sm *StorageManager) Upload(ctx context.Context, localPath, remoteKey strin
 			args = append(args, fmt.Sprintf("--s3-storage-class=%s", sm.storageClass))
 		}
 		args = append(args, "--config", sm.rcloneConf)
-		if sm.supportsNoClobber {
-			args = append(args, "--no-clobber")
-		}
 		args = append(args, "-v")
 
 		cmd := exec.CommandContext(ctx, sm.rcloneBin, args...)
@@ -514,19 +484,6 @@ func (sm *StorageManager) Upload(ctx context.Context, localPath, remoteKey strin
 				return ctx.Err()
 			}
 			errMsg := strings.TrimSpace(stderr.String())
-			// When --no-clobber is active, rclone returns a "not overwriting"
-			// error when the destination already exists. Treat this as success
-			// since the application-level Exists check above should have
-			// already caught this case. This is a safety net for race
-			// conditions where the object appeared between the Exists check
-			// and the rclone call.
-			if sm.supportsNoClobber && (strings.Contains(errMsg, "not overwriting") ||
-				strings.Contains(errMsg, "already exists") ||
-				strings.Contains(errMsg, "File exists")) {
-				slog.Info("upload skipped: --no-clobber detected existing object",
-					"remote_key", remoteKey)
-				return nil
-			}
 			return fmt.Errorf("rclone copyto %q → %q (size=%d): %w (stderr: %s)",
 				localPath, remoteSpec, fileSize, err, errMsg)
 		}

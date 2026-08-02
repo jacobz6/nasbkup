@@ -402,7 +402,7 @@ func (e *Engine) IsBootstrapRequired() (bool, string) {
 // backups. Running a backup in this state would either:
 //
 //   - Re-upload every file with a freshly-generated random IV. While
-//     --no-clobber prevents object overwrite (when rclone >= v1.65), but
+//     the application-level Exists() pre-check prevents object overwrite,
 //     uploading identical content under identical storage keys still wastes
 //     bandwidth and time.
 //   - Worse, if the user then clicks "修复" (reconcile apply), the reconciler
