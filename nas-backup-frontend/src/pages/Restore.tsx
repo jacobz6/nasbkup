@@ -2,13 +2,13 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import {
   RotateCcw, Play, Square, Search, FolderOpen, Download, Inbox,
   CheckCircle, XCircle, Activity, Terminal, AlertCircle, Info,
-  HardDrive, Clock, Zap, FileText, RefreshCw, Archive,
+  HardDrive, Clock, Zap, FileText, RefreshCw,
 } from 'lucide-react';
 import {
   restoreApi,
+  reconcileApi,
   type RestorableFile,
   type RestoreJobRecord,
-  type BackupRecord,
 } from '@/utils/api';
 import { useRestoreProgress } from '@/hooks/useRestoreProgress';
 import { DataTable, type Column } from '@/components/ui/DataTable';
@@ -192,17 +192,17 @@ export function Restore() {
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [selectedSize, setSelectedSize] = useState(0);
 
-  // ── Backup version selector ───────────────────────────────────────
-  const [backups, setBackups] = useState<BackupRecord[]>([]);
-  const [selectedBackupId, setSelectedBackupId] = useState<number | undefined>(undefined);
-
   // ── Restore config ───────────────────────────────────────────────
   // NOTE: Output path selection was removed by design — restore always
   // targets the file's original path as recorded in the backup DB.
   // Users do NOT get to choose / customise the restore destination.
+  // NOTE: Backup version selection was removed — the system always restores
+  // from the latest backup. This is a disaster recovery system, not a
+  // version management tool.
   const [conflictStrategy, setConflictStrategy] = useState<'skip' | 'overwrite' | 'rename'>('skip');
   const [expedited, setExpedited] = useState(false);
   const [restoring, setRestoring] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
 
   // ── Job history ──────────────────────────────────────────────────
   const [jobs, setJobs] = useState<RestoreJobRecord[]>([]);
@@ -224,18 +224,6 @@ export function Restore() {
   const logsContainerRef = useRef<HTMLDivElement>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
 
-  // ── Fetch backups ────────────────────────────────────────────────
-  const fetchBackups = useCallback(async () => {
-    try {
-      const res = await restoreApi.listBackups(1, 50);
-      if (res.success && res.data) {
-        setBackups(res.data);
-      }
-    } catch (e) {
-      console.error('Failed to fetch backups:', e);
-    }
-  }, []);
-
   // ── Fetch restorable files ───────────────────────────────────────
   const fetchFiles = useCallback(async (p = filesPage) => {
     setFilesLoading(true);
@@ -245,7 +233,6 @@ export function Restore() {
         size: filesPageSize,
       };
       if (searchQuery) params.search = searchQuery;
-      if (selectedBackupId !== undefined) params.backup_id = selectedBackupId;
       if (dirPath) params.dir_path = dirPath;
 
       const res = await restoreApi.listFiles(params);
@@ -258,7 +245,7 @@ export function Restore() {
     } finally {
       setFilesLoading(false);
     }
-  }, [filesPage, filesPageSize, searchQuery, selectedBackupId, dirPath]);
+  }, [filesPage, filesPageSize, searchQuery, dirPath]);
 
   // ── Fetch job history ────────────────────────────────────────────
   const fetchJobs = useCallback(async (p = jobsPage) => {
@@ -278,7 +265,6 @@ export function Restore() {
 
   // ── Initial load ──────────────────────────────────────────────────
   useEffect(() => {
-    fetchBackups();
     fetchFiles(1);
     fetchJobs(1);
   }, []);
@@ -286,7 +272,7 @@ export function Restore() {
   // Re-fetch files when page or filters change
   useEffect(() => {
     fetchFiles();
-  }, [filesPage, searchQuery, selectedBackupId, dirPath]);
+  }, [filesPage, searchQuery, dirPath]);
 
   // Re-fetch jobs when page changes
   useEffect(() => {
@@ -359,10 +345,9 @@ export function Restore() {
     }
 
     // Always restore to the original path as recorded in the backup DB.
-    // No user selection of target path is allowed.
+    // No user selection of target path or backup version is allowed.
     const data = {
       paths: selectedPaths,
-      backup_id: selectedBackupId,
       output_dir: '',
       restore_to_original: true,
       conflict_strategy: conflictStrategy,
@@ -392,11 +377,10 @@ export function Restore() {
   // ── Full restore (all files) ─────────────────────────────────────
   const handleFullRestore = async () => {
     // Always restore to the original path as recorded in the backup DB.
-    // No user selection of target path is allowed.
+    // No user selection of target path or backup version is allowed.
     const data = {
       paths: [],
       pattern: '*',
-      backup_id: selectedBackupId,
       output_dir: '',
       restore_to_original: true,
       conflict_strategy: conflictStrategy,
@@ -438,6 +422,30 @@ export function Restore() {
       addToast({ type: 'error', message: '网络错误' });
     }
     setConfirm((c) => ({ ...c, open: false }));
+  };
+
+  // ── Refresh OSS backup state ────────────────────────────────────
+  const handleRefreshOSS = async () => {
+    setRefreshing(true);
+    try {
+      const res = await reconcileApi.run(false);
+      if (res.success) {
+        const report = res.data;
+        const fixCount = report?.applied_fixes?.length ?? 0;
+        addToast({
+          type: 'success',
+          message: `OSS状态同步完成${fixCount > 0 ? `，修复了 ${fixCount} 项不一致` : ''}`,
+        });
+        await fetchFiles(1);
+        await fetchJobs(1);
+      } else {
+        addToast({ type: 'error', message: res.error || '同步OSS状态失败' });
+      }
+    } catch (e) {
+      addToast({ type: 'error', message: '网络错误，请确保后端服务已启动' });
+    } finally {
+      setRefreshing(false);
+    }
   };
 
   // ── File columns with checkbox ───────────────────────────────────
@@ -693,28 +701,6 @@ export function Restore() {
                 />
               </div>
 
-              {/* Backup version selector */}
-              <div className="flex items-center gap-2">
-                <Archive size={14} className="text-slate-500" />
-                <span className="text-sm text-slate-400">备份版本</span>
-                <select
-                  value={selectedBackupId ?? ''}
-                  onChange={(e) => {
-                    setSelectedBackupId(e.target.value ? Number(e.target.value) : undefined);
-                    setFilesPage(1);
-                    setSelectedIds(new Set());
-                  }}
-                  className="input-field w-40 text-sm"
-                >
-                  <option value="">全部版本</option>
-                  {backups.map((b) => (
-                    <option key={b.id} value={b.id}>
-                      #{b.id} - {formatDateTime(b.created_at)} ({b.type})
-                    </option>
-                  ))}
-                </select>
-              </div>
-
               <button onClick={handleSearch} className="btn-primary text-sm flex items-center gap-1.5">
                 <Search size={14} />
                 搜索
@@ -724,13 +710,22 @@ export function Restore() {
                 onClick={() => {
                   setSearchQuery('');
                   setDirPath('');
-                  setSelectedBackupId(undefined);
                   setFilesPage(1);
                   setSelectedIds(new Set());
                 }}
                 className="btn-secondary text-sm"
               >
                 重置
+              </button>
+
+              <button
+                onClick={handleRefreshOSS}
+                disabled={refreshing}
+                className="btn-secondary text-sm flex items-center gap-1.5"
+                title="同步OSS云端备份状态并刷新列表"
+              >
+                <RefreshCw size={14} className={refreshing ? 'animate-spin' : ''} />
+                {refreshing ? '同步中...' : '更新'}
               </button>
 
               <div className="ml-auto flex items-center gap-2">
