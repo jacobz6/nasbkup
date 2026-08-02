@@ -144,7 +144,7 @@ oss:
 # Rclone settings
 # ---------------------------------------------------------------------------
 rclone:
-  binary_path: "rclone"         # Path to rclone binary
+  binary_path: "./bin/rclone"   # Path to rclone binary (use project-bundled copy for version consistency)
   config_path: "./data/rclone.conf"
   remote_name: "oss-crypt"      # Name of the crypt remote in rclone.conf
 
