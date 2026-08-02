@@ -21,6 +21,10 @@ vendor/
 
 # Build output
 /nas-backup
+/restore-cli
+# also match in nested layouts (trailing slash excluded for files)
+nas-backup
+restore-cli
 /build/
 /dist/
 
