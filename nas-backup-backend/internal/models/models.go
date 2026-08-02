@@ -166,6 +166,8 @@ type DashboardStats struct {
 	BackupCount         int64        `json:"backup_count"`
 	UniqueHashCount     int64        `json:"unique_hash_count"`
 	NeedsReconcile      bool         `json:"needs_reconcile"`
+	BootstrapRequired   bool         `json:"bootstrap_required"`
+	BootstrapMessage    string       `json:"bootstrap_message,omitempty"`
 	OSSInfo             OSSInfo      `json:"oss_info"`
 	LastBackupTime      *time.Time   `json:"last_backup_time,omitempty"`
 	LastBackupStatus    BackupStatus `json:"last_backup_status"`
@@ -294,6 +296,16 @@ type RestoreRequest struct {
 	RestoreToOriginal bool    `json:"restore_to_original"`         // if true, restore each file to its original path
 	Expedited        bool     `json:"expedited"`                   // use expedited OSS thaw
 	ConflictStrategy string   `json:"conflict_strategy,omitempty"`  // "overwrite" | "skip" | "rename"
+
+	// FallbackBaseDir is set internally (NOT exposed to API callers) when the
+	// original backup path cannot be written on the current machine. This
+	// happens when a backup created on a Linux machine (e.g. /home/user/...)
+	// is being restored on macOS (where /home is an automount that cannot
+	// accept user-created subdirs). When set, restoreFile prepends this
+	// directory to the original path, producing e.g.
+	//   <FallbackBaseDir>/home/user/file.jpg
+	// instead of failing with "operation not supported" on mkdir /home/user.
+	FallbackBaseDir string `json:"-"`
 }
 
 // RestoreResult summarizes a restore operation.

@@ -197,8 +197,9 @@ export function Restore() {
   const [selectedBackupId, setSelectedBackupId] = useState<number | undefined>(undefined);
 
   // ── Restore config ───────────────────────────────────────────────
-  const [outputMode, setOutputMode] = useState<'original' | 'custom'>('original');
-  const [outputDir, setOutputDir] = useState('');
+  // NOTE: Output path selection was removed by design — restore always
+  // targets the file's original path as recorded in the backup DB.
+  // Users do NOT get to choose / customise the restore destination.
   const [conflictStrategy, setConflictStrategy] = useState<'skip' | 'overwrite' | 'rename'>('skip');
   const [expedited, setExpedited] = useState(false);
   const [restoring, setRestoring] = useState(false);
@@ -357,11 +358,13 @@ export function Restore() {
       return;
     }
 
+    // Always restore to the original path as recorded in the backup DB.
+    // No user selection of target path is allowed.
     const data = {
       paths: selectedPaths,
       backup_id: selectedBackupId,
-      output_dir: outputMode === 'original' ? '' : outputDir,
-      restore_to_original: outputMode === 'original',
+      output_dir: '',
+      restore_to_original: true,
       conflict_strategy: conflictStrategy,
       expedited,
     };
@@ -388,12 +391,14 @@ export function Restore() {
 
   // ── Full restore (all files) ─────────────────────────────────────
   const handleFullRestore = async () => {
+    // Always restore to the original path as recorded in the backup DB.
+    // No user selection of target path is allowed.
     const data = {
       paths: [],
       pattern: '*',
       backup_id: selectedBackupId,
-      output_dir: outputMode === 'original' ? '' : outputDir,
-      restore_to_original: outputMode === 'original',
+      output_dir: '',
+      restore_to_original: true,
       conflict_strategy: conflictStrategy,
       expedited,
     };
@@ -847,46 +852,14 @@ export function Restore() {
             </h3>
 
             <div className="space-y-4">
-              {/* Output directory mode */}
-              <div>
-                <label className="block text-sm text-slate-400 mb-2">恢复目标</label>
-                <div className="space-y-2">
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="radio"
-                      name="outputMode"
-                      checked={outputMode === 'original'}
-                      onChange={() => setOutputMode('original')}
-                      className="text-brand-400 focus:ring-brand-400"
-                    />
-                    <span className="text-sm text-slate-300">恢复到原路径</span>
-                  </label>
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="radio"
-                      name="outputMode"
-                      checked={outputMode === 'custom'}
-                      onChange={() => setOutputMode('custom')}
-                      className="text-brand-400 focus:ring-brand-400"
-                    />
-                    <span className="text-sm text-slate-300">恢复到指定目录</span>
-                  </label>
+              {/* Restore destination notice */}
+              <div className="flex items-start gap-2 bg-brand-500/10 border border-brand-500/20 rounded-lg p-3">
+                <Info size={14} className="shrink-0 mt-0.5 text-brand-400" />
+                <div className="text-xs text-slate-300 leading-relaxed">
+                  文件将恢复到其<strong className="text-white">备份时的原始路径</strong>（DB 中记录的
+                  <span className="font-mono text-brand-300"> files.path </span>），不可自定义目标目录。
                 </div>
               </div>
-
-              {/* Custom output directory input */}
-              {outputMode === 'custom' && (
-                <div>
-                  <label className="block text-sm text-slate-400 mb-1.5">目标目录</label>
-                  <input
-                    type="text"
-                    value={outputDir}
-                    onChange={(e) => setOutputDir(e.target.value)}
-                    placeholder="/path/to/restore"
-                    className="input-field text-sm"
-                  />
-                </div>
-              )}
 
               {/* Conflict strategy */}
               <div>
@@ -903,10 +876,10 @@ export function Restore() {
               </div>
 
               {/* Expedited thawing */}
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between border-t border-surface-3 pt-4">
                 <div>
                   <label className="text-sm text-slate-300">加急解冻</label>
-                  <p className="text-xs text-slate-500 mt-0.5">加速归档文件的解冻过程</p>
+                  <p className="text-xs text-slate-500 mt-0.5">加速归档文件的解冻过程（仅 ColdArchive 生效）</p>
                 </div>
                 <button
                   onClick={() => setExpedited(!expedited)}

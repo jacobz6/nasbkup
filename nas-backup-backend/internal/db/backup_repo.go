@@ -532,6 +532,17 @@ func (r *BackupRepository) CountBackupFiles(backupID int64) (int64, error) {
 	return count, nil
 }
 
+// CountAllBackupFiles returns the total number of rows in backup_files.
+// Used by reconcile's safety pre-check to detect an uninitialized instance.
+func (r *BackupRepository) CountAllBackupFiles() (int64, error) {
+	var count int64
+	err := r.db.QueryRow(`SELECT COUNT(*) FROM backup_files`).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count all backup files: %w", err)
+	}
+	return count, nil
+}
+
 // ListAllBackupFileStorageKeys returns the set of distinct storage_key values
 // referenced by backup_files. Used by the reconciler to detect orphan backup_files
 // rows whose storage_key is missing from hash_index.

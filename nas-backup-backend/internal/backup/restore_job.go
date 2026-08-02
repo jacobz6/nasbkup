@@ -54,6 +54,20 @@ func (m *RestoreJobManager) CreateJob(req *models.RestoreRequest) (*models.Resto
 		return nil, fmt.Errorf("a restore is already running")
 	}
 
+	// NORMALIZE INPUT (match RestoreWithOptions in restore.go):
+	// Canonicalize the two equivalent forms of "restore to DB original path"
+	// so that downstream checks (ValidateOutputDir, MkdirAll, path selection
+	// inside restoreFile) treat req.RestoreToOriginal=true, req.OutputDir="",
+	// and req.OutputDir="__original__" uniformly as "restore to files.Path from DB".
+	// This is required because the new frontend UI no longer exposes a custom
+	// output-dir picker and always sends output_dir="" + restore_to_original=true.
+	if req.RestoreToOriginal || req.OutputDir == "" {
+		req.OutputDir = "__original__"
+		req.RestoreToOriginal = true
+	} else if req.OutputDir == "__original__" {
+		req.RestoreToOriginal = true
+	}
+
 	// --- validate output directory ---
 	// Skip output dir validation when restoring to original paths.
 	if !req.RestoreToOriginal {
@@ -148,7 +162,7 @@ func (m *RestoreJobManager) StartJob(jobID int64) error {
 		ConflictStrategy:  job.ConflictStrategy,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Hour)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Hour)
 
 	m.mu.Lock()
 	m.activeJobID = jobID
@@ -247,12 +261,14 @@ func (m *RestoreJobManager) executeJob(ctx context.Context, cancel context.Cance
 	mu.Unlock()
 
 	// Collect final counters from result (if available), otherwise fall back to callback-tracked values.
+	// NOTE: Do NOT append result.FailedFiles to finalFailed — the callback already
+	// recorded every failed path, and result.FailedFiles would duplicate them
+	// (causing total_files=16 to show as failed_files=32 in the job record).
 	finalRestoredFiles := restoredCount
 	finalRestoredSize := restoredSize
 	if result != nil {
 		finalRestoredFiles = result.RestoredFiles
 		finalRestoredSize = result.TotalSize
-		finalFailed = append(finalFailed, result.FailedFiles...)
 	}
 
 	if err != nil {

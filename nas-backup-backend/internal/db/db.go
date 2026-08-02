@@ -28,6 +28,14 @@ type Database struct {
 	RestoreJobRepo  *RestoreJobRepository
 }
 
+// Conn exposes the underlying *sql.DB handle to callers that need it (for
+// example, DBBackupService runs low-level VACUUM / backup-copy statements and
+// needs direct access to the connection instead of going through the typed
+// repository layer). Callers MUST NOT close the returned handle.
+func (d *Database) Conn() *sql.DB {
+	return d.db
+}
+
 // Open creates or opens the SQLite database at the given path and runs
 // any pending migrations.
 func Open(dbPath string) (*Database, error) {

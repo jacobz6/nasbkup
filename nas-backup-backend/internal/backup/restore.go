@@ -23,9 +23,16 @@ import (
 )
 
 // maxThawWait is the maximum time to wait for an archived object to be restored.
-const maxThawWait = 30 * time.Minute
+// Aliyun OSS Archive tier typically completes within 1 minute; ColdArchive Standard
+// tier takes 2-5 hours; Deep Cold Archive can take 48h. A generous upper bound
+// avoids failing a large bulk restore just because one object is slow. Note that
+// the per-file thaw loop exits as soon as CheckRestored reports completion, so
+// most files will not wait anywhere near this long.
+const maxThawWait = 6 * time.Hour
 
 // thawPollInterval is how often to poll the restore status of an archived object.
+// 30s keeps HEAD request volume low while still providing reasonable latency
+// once the thaw completes.
 const thawPollInterval = 30 * time.Second
 
 // Restorer handles file restoration from backup storage.
@@ -83,6 +90,22 @@ func (r *Restorer) Restore(ctx context.Context, req *models.RestoreRequest) (*mo
 func (r *Restorer) RestoreWithOptions(ctx context.Context, req *models.RestoreRequest, opts *RestoreOptions) (*models.RestoreResult, error) {
 	start := time.Now()
 
+	// NORMALIZE INPUT: ensure the two forms of "restore to DB original path"
+	// always behave identically regardless of which field the caller sets.
+	// Semantically:
+	//   req.RestoreToOriginal == true        → restore each file to files.Path (from DB)
+	//   req.OutputDir      == "__original__" → same meaning (legacy sentinel)
+	//   req.OutputDir      == "" + RestoreToOriginal not set → treat as restore-to-original
+	//                        because the new UI never lets users pick a custom dir.
+	// Downstream code (MkdirAll, restoreFile target-path selection) still keys
+	// off OutputDir == "__original__", so canonicalize here once.
+	if req.RestoreToOriginal || req.OutputDir == "" {
+		req.OutputDir = "__original__"
+		req.RestoreToOriginal = true
+	} else if req.OutputDir == "__original__" {
+		req.RestoreToOriginal = true
+	}
+
 	// 1. Query file records matching the request.
 	files, err := r.resolveFiles(req)
 	if err != nil {
@@ -94,6 +117,27 @@ func (r *Restorer) RestoreWithOptions(ctx context.Context, req *models.RestoreRe
 
 	// Determine if this is a restore-to-original-paths operation.
 	restoreToOriginal := req.RestoreToOriginal || req.OutputDir == "__original__"
+
+	// CROSS-PLATFORM FALLBACK: When restoring to original paths, detect whether
+	// the target path on the current machine can actually be written. The most
+	// common case is a backup created on Linux (paths like /home/user/...)
+	// being restored on macOS, where /home is an automount that does not allow
+	// user-created subdirectories (mkdir fails with "operation not supported").
+	// When detected, redirect all files to a fixed sandboxed directory under
+	// the backend's data directory (data/restores/<original_path>), preserving
+	// the full directory structure so the user can still find their files.
+	// All cross-platform restores land in the same data/restores/ dir, so the
+	// user always knows where to look regardless of how many jobs they run.
+	if restoreToOriginal && req.FallbackBaseDir == "" && len(files) > 0 {
+		if fallbackDir, detected := detectCrossPlatformFallback(files[0].Path, r.config); detected {
+			req.FallbackBaseDir = fallbackDir
+			slog.Warn("cross-platform restore detected: backup path not writable on current OS, "+
+				"redirecting restore to fallback directory",
+				"sample_path", files[0].Path,
+				"fallback_dir", fallbackDir,
+				"file_count", len(files))
+		}
+	}
 
 	// Ensure output directory exists (skip for original-path restore, which
 	// creates per-file directories on the fly).
@@ -186,7 +230,7 @@ func (r *Restorer) RestoreWithOptions(ctx context.Context, req *models.RestoreRe
 					"path", fileRec.Path, "file_id", fileRec.ID)
 				restoreErr = fmt.Errorf("no backup file record for file_id %d", fileRec.ID)
 			} else {
-				restoreErr = r.restoreFile(ctx, fileRec, bfRec, req.OutputDir, stripPrefix, req.Expedited, tmpDir, conflictStrategy)
+				restoreErr = r.restoreFile(ctx, fileRec, bfRec, req.OutputDir, stripPrefix, req.Expedited, tmpDir, conflictStrategy, req.FallbackBaseDir)
 			}
 
 			if onProgress != nil {
@@ -330,6 +374,9 @@ func (r *Restorer) resolveBackupFile(fileID int64, backupID *int64) (*models.Bac
 
 // restoreFile handles the complete restore pipeline for a single file:
 // thaw (if needed) → download → decrypt → decompress → verify → conflict check → move.
+// fallbackBaseDir, when non-empty, is prepended to the original file path
+// (for restore-to-original mode only) when the original path cannot be written
+// on the current OS — see detectCrossPlatformFallback for details.
 func (r *Restorer) restoreFile(
 	ctx context.Context,
 	fileRec *models.FileRecord,
@@ -339,6 +386,7 @@ func (r *Restorer) restoreFile(
 	expedited bool,
 	tmpDir string,
 	conflictStrategy string,
+	fallbackBaseDir string,
 ) error {
 	downloadedPath := filepath.Join(tmpDir, fmt.Sprintf("%d_download.enc", fileRec.ID))
 	decryptedPath := filepath.Join(tmpDir, fmt.Sprintf("%d_decrypted", fileRec.ID))
@@ -444,8 +492,14 @@ func (r *Restorer) restoreFile(
 	// Step 6: Move to output directory, preserving relative directory structure.
 	var outputPath string
 	if outputDir == "__original__" {
-		// Restore to the file's original absolute path.
-		outputPath = fileRec.Path
+		// Restore to the file's original absolute path. When the cross-platform
+		// fallback is active, prepend the fallback base so the file lands under
+		// <fallback>/home/user/file.jpg instead of failing on /home/user.
+		if fallbackBaseDir != "" {
+			outputPath = filepath.Join(fallbackBaseDir, fileRec.Path)
+		} else {
+			outputPath = fileRec.Path
+		}
 	} else {
 		relPath := fileRec.Path
 		if stripPrefix != "" {
@@ -572,6 +626,54 @@ func moveFile(src, dst string) error {
 
 	os.Remove(src)
 	return nil
+}
+
+// detectCrossPlatformFallback tests whether the parent directory of the given
+// original backup path can be created on the current machine. When a backup is
+// restored on a different OS (e.g. Linux backups → macOS), certain mount points
+// (like /home on macOS automount) silently reject mkdir with "operation not
+// supported". When that happens this function returns a fixed fallback directory
+// under the backend's data directory so the restore can still succeed.
+//
+// All cross-platform restores land in the SAME directory:
+//   <backend_data_dir>/restores/<original_path>
+// This keeps the UI/UX simple — the user always looks in one place for their
+// restored files, regardless of how many restore jobs they've triggered.
+//
+// Parameters:
+//   - samplePath: one of the original backup paths (e.g. "/home/user/photos/IMG.jpg")
+//   - cfg:        app config (used to derive the data directory from the DB path)
+//
+// Returns:
+//   - fallbackDir: sandboxed directory where files should be restored instead
+//   - detected:    true when a writable-path issue was found and fallback was set
+func detectCrossPlatformFallback(samplePath string, cfg *config.AppConfig) (string, bool) {
+	// Try to create the parent directory of the original path. If it fails
+	// with a permission/operation error, we know we need the fallback.
+	parentDir := filepath.Dir(samplePath)
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
+		// Determine the backend data directory from the SQLite DB path.
+		dataDir := filepath.Join(".", "data")
+		if cfg != nil && cfg.Database.Path != "" {
+			dataDir = filepath.Dir(cfg.Database.Path)
+		}
+		// Resolve to absolute path so fallback works regardless of CWD.
+		if absDir, err := filepath.Abs(dataDir); err == nil {
+			dataDir = absDir
+		}
+		// Fixed fallback directory — all cross-platform restores land here.
+		fallbackDir := filepath.Join(dataDir, "restores")
+		if err := os.MkdirAll(fallbackDir, 0755); err != nil {
+			slog.Error("failed to create cross-platform fallback directory",
+				"fallback_dir", fallbackDir, "error", err)
+			return "", false
+		}
+		return fallbackDir, true
+	}
+	// Directory creation succeeded — no cross-platform issue. Clean up the
+	// empty directory we just created (best-effort; non-fatal on failure).
+	os.Remove(parentDir)
+	return "", false
 }
 
 func longestCommonDirPrefix(files []*models.FileRecord) string {

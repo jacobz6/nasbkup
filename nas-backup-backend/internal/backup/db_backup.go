@@ -26,7 +26,11 @@ const (
 	dbBackupPrefix = "meta/db"
 
 	// dbBackupKeepVersions is the number of historical database backup versions to retain.
-	dbBackupKeepVersions = 3
+	// Bumped from 3 → 10 to support multiple environments sharing one OSS bucket.
+	// With 3 a new environment's DB backup could silently prune older snapshots
+	// created by another instance, forcing the earlier instance through the
+	// (much slower) "rebuild hash_index from files + OSS" disaster recovery path.
+	dbBackupKeepVersions = 10
 )
 
 // DBBackupService handles encrypted database snapshots to cloud storage.
@@ -209,6 +213,11 @@ func (s *DBBackupService) ListVersions(ctx context.Context) ([]string, error) {
 // Bootstrap downloads the specified database backup version from OSS,
 // decrypts it, and replaces the local database file. This is used for
 // disaster recovery when setting up a new NAS.
+//
+// If the OSS bucket uses archive/cold storage class for database backups,
+// Bootstrap will automatically submit a thaw request and poll until the
+// object is downloadable (up to maxThawWait). This mirrors the thaw flow
+// used by the file restore path in restore.go.
 func (s *DBBackupService) Bootstrap(ctx context.Context, version string, targetDBPath string) error {
 	if version == "" {
 		// Find latest version.
@@ -233,7 +242,17 @@ func (s *DBBackupService) Bootstrap(ctx context.Context, version string, targetD
 		}
 	}
 
-	// Download encrypted database.
+	// Step A: Thaw archived objects if needed. Database backups are small
+	// (typically < 50MB) so thawing should complete well within the 6h
+	// timeout even on Archive tier (usually 1-10 hours).
+	if err := s.ensureRestored(ctx, encKey); err != nil {
+		return fmt.Errorf("thaw encrypted database: %w", err)
+	}
+	if err := s.ensureRestored(ctx, ivKey); err != nil {
+		return fmt.Errorf("thaw IV file: %w", err)
+	}
+
+	// Step B: Download encrypted database.
 	tmpDir := os.TempDir()
 	localEnc := filepath.Join(tmpDir, filepath.Base(encKey))
 	if err := s.storage.Download(ctx, encKey, localEnc); err != nil {
@@ -241,7 +260,7 @@ func (s *DBBackupService) Bootstrap(ctx context.Context, version string, targetD
 	}
 	defer os.Remove(localEnc)
 
-	// Download IV file.
+	// Step C: Download IV file.
 	localIV := filepath.Join(tmpDir, filepath.Base(ivKey))
 	if err := s.storage.Download(ctx, ivKey, localIV); err != nil {
 		return fmt.Errorf("download IV file: %w", err)
@@ -261,6 +280,78 @@ func (s *DBBackupService) Bootstrap(ctx context.Context, version string, targetD
 
 	s.logger.Info("database bootstrapped from OSS", "version", version, "target", targetDBPath)
 	return nil
+}
+
+// maxThawWait is the maximum time Bootstrap will wait for an archived
+// database snapshot to be thawed. Database backups are small (typically
+// <50MB) so they should thaw within 1-10 hours on Archive tier; 6 hours
+// is a safe upper bound that matches the file restore path.
+const bootstrapMaxThawWait = 6 * time.Hour
+
+// bootstrapThawPollInterval is how often Bootstrap polls the archive
+// restore status while waiting for thaw completion.
+const bootstrapThawPollInterval = 30 * time.Second
+
+// ensureRestored checks whether an OSS object is in an archived storage class
+// and, if so, submits a restore request and waits until it becomes
+// downloadable (or the context is cancelled / maxThawWait elapses).
+// Non-archived objects (Standard/IA) pass through immediately.
+func (s *DBBackupService) ensureRestored(ctx context.Context, remoteKey string) error {
+	// Fast path: check if already restored or non-archive.
+	restored, err := s.storage.CheckRestored(remoteKey)
+	if err == nil && restored {
+		return nil
+	}
+	if err != nil {
+		s.logger.Info("check restore status failed, will attempt thaw anyway",
+			"key", remoteKey, "error", err)
+	}
+
+	// Initiate thaw request. Use standard (non-expedited) because Archive
+	// tier does not support expedited restore.
+	if err := s.storage.RestoreObject(remoteKey, false); err != nil {
+		// "RestoreAlreadyInProgress" or non-archived state is fine.
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "RestoreAlreadyInProgress") ||
+			strings.Contains(errMsg, "OK") ||
+			strings.Contains(errMsg, "OperationNotSupported") ||
+			strings.Contains(errMsg, "InvalidObjectState") {
+			s.logger.Info("object thaw already in progress or not archived, proceeding",
+				"key", remoteKey)
+			return nil
+		}
+		return fmt.Errorf("initiate restore for %q: %w", remoteKey, err)
+	}
+
+	s.logger.Info("database bootstrap: thaw initiated, waiting for completion",
+		"key", remoteKey)
+
+	// Poll until thaw completes or timeout.
+	deadline := time.Now().Add(bootstrapMaxThawWait)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(bootstrapThawPollInterval):
+		}
+
+		restored, err = s.storage.CheckRestored(remoteKey)
+		if err != nil {
+			s.logger.Warn("check restore status during poll, retrying",
+				"key", remoteKey, "error", err)
+			continue
+		}
+		if restored {
+			s.logger.Info("database bootstrap: thaw completed", "key", remoteKey)
+			return nil
+		}
+		s.logger.Info("database bootstrap: still thawing, waiting...",
+			"key", remoteKey, "elapsed", time.Since(deadline.Add(-bootstrapMaxThawWait)).Round(time.Second))
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("object %q not restored after %v", remoteKey, bootstrapMaxThawWait)
+		}
+	}
 }
 
 // copyFile copies a file from src to dst using streaming to avoid loading

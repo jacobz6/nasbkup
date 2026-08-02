@@ -336,6 +336,16 @@ func (r *HashRepository) CountActiveHashes() (int64, error) {
 	return count, nil
 }
 
+// CountAll returns the total number of records in hash_index.
+func (r *HashRepository) CountAll() (int64, error) {
+	var count int64
+	err := r.db.QueryRow(`SELECT COUNT(*) FROM hash_index`).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count all hash records: %w", err)
+	}
+	return count, nil
+}
+
 // HasRefCountMismatches returns true if any hash_index.ref_count disagrees with
 // the actual number of active files referencing that hash. This is a lightweight
 // single-query check used by the dashboard's "needs reconcile" indicator.

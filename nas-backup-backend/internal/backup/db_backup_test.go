@@ -11,8 +11,12 @@ func TestDBBackupService_PruneVersions(t *testing.T) {
 	// Verify that the version sorting and prune logic works correctly.
 	// We test the logic by checking that versions beyond dbBackupKeepVersions
 	// are correctly identified for deletion.
+	//
+	// We use more versions than dbBackupKeepVersions to ensure pruning is
+	// actually required (dbBackupKeepVersions was bumped from 3 → 10, so we
+	// need at least 11 versions to trigger a prune).
 
-	// Simulate OSS listing result.
+	// Simulate OSS listing result (12 versions → keep 10, prune 2 oldest).
 	keys := []string{
 		"meta/db/nas-backup-20260701-100000.db.enc",
 		"meta/db/nas-backup-20260701-100000.db.iv",
@@ -24,6 +28,20 @@ func TestDBBackupService_PruneVersions(t *testing.T) {
 		"meta/db/nas-backup-20260704-100000.db.iv",
 		"meta/db/nas-backup-20260705-100000.db.enc",
 		"meta/db/nas-backup-20260705-100000.db.iv",
+		"meta/db/nas-backup-20260706-100000.db.enc",
+		"meta/db/nas-backup-20260706-100000.db.iv",
+		"meta/db/nas-backup-20260707-100000.db.enc",
+		"meta/db/nas-backup-20260707-100000.db.iv",
+		"meta/db/nas-backup-20260708-100000.db.enc",
+		"meta/db/nas-backup-20260708-100000.db.iv",
+		"meta/db/nas-backup-20260709-100000.db.enc",
+		"meta/db/nas-backup-20260709-100000.db.iv",
+		"meta/db/nas-backup-20260710-100000.db.enc",
+		"meta/db/nas-backup-20260710-100000.db.iv",
+		"meta/db/nas-backup-20260711-100000.db.enc",
+		"meta/db/nas-backup-20260711-100000.db.iv",
+		"meta/db/nas-backup-20260712-100000.db.enc",
+		"meta/db/nas-backup-20260712-100000.db.iv",
 	}
 
 	// Extract versions using the same logic as pruneOldVersions.
@@ -51,21 +69,19 @@ func TestDBBackupService_PruneVersions(t *testing.T) {
 		}
 	}
 
-	if len(versions) != 5 {
-		t.Fatalf("expected 5 unique versions, got %d", len(versions))
+	if len(versions) != 12 {
+		t.Fatalf("expected 12 unique versions, got %d", len(versions))
 	}
 
-	// We should have 5 versions: keep 3, delete 2 (oldest).
+	// We should have 12 versions: keep dbBackupKeepVersions (10), delete 2 (oldest).
 	sorted := make([]string, 0, len(versions))
 	for base := range versions {
 		sorted = append(sorted, base)
 	}
-	// Check that sorting descending works (simple string sort is enough since
-	// the timestamps are in YYYYMMDD format).
-	// Just verify we have the right count after filtering.
 
 	if len(sorted) <= dbBackupKeepVersions {
-		t.Fatal("expected to need pruning with 5 versions and keep=3")
+		t.Fatalf("expected to need pruning with %d versions and keep=%d",
+			len(sorted), dbBackupKeepVersions)
 	}
 
 	toDelete := 0
@@ -78,7 +94,8 @@ func TestDBBackupService_PruneVersions(t *testing.T) {
 	}
 	expectedDeletions := len(sorted) - dbBackupKeepVersions
 	if expectedDeletions != 2 {
-		t.Errorf("expected 2 versions to delete, got %d", expectedDeletions)
+		t.Errorf("expected 2 versions to delete, got %d (versions=%d keep=%d)",
+			expectedDeletions, len(sorted), dbBackupKeepVersions)
 	}
 }
 

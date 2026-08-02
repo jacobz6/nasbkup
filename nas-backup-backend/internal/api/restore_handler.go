@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -15,12 +16,12 @@ import (
 )
 
 // restoreTimeout is the maximum duration for a restore operation. Restore may
-// involve thawing ColdArchive/Archive objects, which can take up to 30 minutes
-// per object (and longer for many objects). The restore runs detached from the
-// HTTP request context so that a client disconnect does NOT cancel an in-flight
-// thaw — previously req.Context() was cancelled when the client gave up,
-// aborting the restore mid-flight.
-const restoreTimeout = 4 * time.Hour
+// involve thawing ColdArchive/DeepColdArchive objects which can take 2-48h per
+// object, and a bulk restore processes many files. The restore runs detached
+// from the HTTP request context so that a client disconnect does NOT cancel
+// an in-flight thaw — previously req.Context() was cancelled when the client
+// gave up, aborting the restore mid-flight.
+const restoreTimeout = 8 * time.Hour
 
 // reconcileTimeout is the maximum duration for a reconciliation pass. Listing
 // all OSS objects + batch existence checks over a large bucket can take
@@ -362,7 +363,7 @@ func (r *Router) handleReconcile(w http.ResponseWriter, req *http.Request) {
 		msg = fmt.Sprintf("reconcile completed: %d fixes applied", len(report.AppliedFixes))
 	}
 	_ = r.db.LogRepo.Insert(nil, level, msg,
-		fmt.Sprintf("oss_orphans=%d dangling_ref0=%d dangling_refn=%d orphan_bf=%d ref_mismatch=%d failed_with_files=%d completed_no_files=%d errors=%d",
+		fmt.Sprintf("oss_orphans=%d dangling_ref0=%d dangling_refn=%d orphan_bf=%d ref_mismatch=%d failed_with_files=%d completed_no_files=%d errors=%d bootstrap=%t restart=%t",
 			len(report.OSSOnlyOrphans),
 			len(report.DanglingHashIndexesRefZero),
 			len(report.DanglingHashIndexesRefNonZero),
@@ -371,9 +372,38 @@ func (r *Router) handleReconcile(w http.ResponseWriter, req *http.Request) {
 			len(report.FailedBackupsWithFiles),
 			len(report.CompletedBackupsNoFiles),
 			len(report.Errors),
+			report.BootstrapApplied,
+			report.NeedRestart,
 		))
 
 	r.jsonResponse(w, report, http.StatusOK)
+
+	// If the reconcile pass swapped in a freshly-bootstrapped DB, SQLite will
+	// not pick up the new file because the open *sql.DB handle keeps a fd to
+	// the old (now-replaced) file. Instead of trying to hot-reload (which is
+	// racy, would break in-flight prepared statements, and forces us to
+	// rebuild every repo/svc instance), do a clean process exit — systemd /
+	// docker / manual runners all restart us promptly, and the UI shows a
+	// "服务正在重启" banner per report.RestartDelaySeconds.
+	//
+	// The goroutine deliberately outlives this request handler: the
+	// ResponseWriter has already been flushed (jsonResponse wrote status+body
+	// above), so the HTTP client will see the full 200 response before the
+	// process terminates.
+	if report.NeedRestart {
+		delay := time.Duration(report.RestartDelaySeconds) * time.Second
+		if delay <= 0 {
+			delay = 5 * time.Second
+		}
+		slog.Info("reconcile bootstrap: scheduling process exit for DB reload",
+			"delay", delay, "reason", "bootstrap_applied")
+		go func(d time.Duration) {
+			time.Sleep(d)
+			slog.Info("reconcile bootstrap: exiting process to reload new DB",
+				"pid", os.Getpid())
+			os.Exit(0)
+		}(delay)
+	}
 }
 
 // containsAny reports whether any string in haystack contains substr.

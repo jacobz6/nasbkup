@@ -65,6 +65,26 @@ func (e *Engine) SetDBBackupService(svc *DBBackupService) {
 	e.dbBackupSvc = svc
 }
 
+// getDBBackupSvc returns the engine's DBBackupService, lazily constructing one
+// from the existing storage/encryptor/config/database dependencies if it was
+// never injected. This lets the reconciler's bootstrap-from-OSS path work even
+// when the engine was assembled by test helpers or lightweight callers that
+// skipped the explicit SetDBBackupService call.
+//
+// Returns nil if the underlying storage or encryptor is unavailable (e.g.
+// tests running without OSS configured) — callers should fall through to the
+// non-bootstrap reconcile path in that case.
+func (e *Engine) getDBBackupSvc() *DBBackupService {
+	if e.dbBackupSvc != nil {
+		return e.dbBackupSvc
+	}
+	if e.storage == nil || e.encryptor == nil || e.db == nil || e.db.Conn() == nil || e.config == nil {
+		return nil
+	}
+	e.dbBackupSvc = NewDBBackupService(e.encryptor, e.storage, e.config, e.db.Conn())
+	return e.dbBackupSvc
+}
+
 // ProgressBroker returns the progress broker for SSE subscriptions.
 func (e *Engine) ProgressBroker() *ProgressBroker {
 	return e.progress
@@ -91,6 +111,16 @@ func (e *Engine) RunFullBackup(ctx context.Context) error {
 	if running {
 		e.mu.Unlock()
 		return fmt.Errorf("a backup is already running")
+	}
+
+	// Bootstrap guard: refuse to backup on an uninitialized instance when OSS
+	// already contains backup data. Without this, a fresh empty database would
+	// either (a) overwrite existing OSS objects with different-IV ciphertexts
+	// (corrupting other instances' backups), or (b) trigger reconcile/GC to
+	// delete all existing OSS objects.
+	if err := e.checkBootstrapRequired(ctx); err != nil {
+		e.mu.Unlock()
+		return err
 	}
 
 	backupID, err := e.db.BackupRepo.Create(models.BackupTypeFull, nil)
@@ -136,6 +166,12 @@ func (e *Engine) RunIncrementalBackup(ctx context.Context) error {
 		return fmt.Errorf("no full backup found; run a full backup first")
 	}
 	baseBackupID := latestFull.ID
+
+	// Bootstrap guard (same as RunFullBackup).
+	if err := e.checkBootstrapRequired(ctx); err != nil {
+		e.mu.Unlock()
+		return err
+	}
 
 	backupID, err := e.db.BackupRepo.Create(models.BackupTypeIncremental, &baseBackupID)
 	if err != nil {
@@ -228,6 +264,15 @@ func (e *Engine) StartBackup(backupType models.BackupType) (int64, error) {
 		}
 	}
 
+	// Bootstrap guard (same as RunFullBackup). Must run synchronously before
+	// returning the backup ID to the caller — otherwise the API has already
+	// returned success but the async goroutine will reject it with a confusing
+	// "bootstrap required" error that nobody receives.
+	if err := e.checkBootstrapRequired(context.Background()); err != nil {
+		e.mu.Unlock()
+		return 0, err
+	}
+
 	backupID, err := e.db.BackupRepo.Create(actualType, baseBackupID)
 	if err != nil {
 		e.mu.Unlock()
@@ -298,6 +343,119 @@ func (e *Engine) NeedsReconcile() bool {
 	return false
 }
 
+// IsBootstrapRequired performs the same emptiness-vs-OSS check as
+// checkBootstrapRequired but returns a (bool, string) tuple without raising an
+// error. The dashboard API calls this to surface a prominent "需要先bootstrap"
+// warning in the UI when a fresh instance points at a bucket that already has
+// backups from another environment (or the same environment after a DB reset).
+// Errors during the OSS probe are silently treated as "bootstrap not required"
+// because we cannot tell whether the bucket is empty — the upstream backup
+// entry guard will re-run the check and surface errors properly if the user
+// tries to backup anyway.
+func (e *Engine) IsBootstrapRequired() (bool, string) {
+	// Step 1: local DB has any committed state → bootstrap not required
+	if hashCount, hErr := e.db.HashRepo.CountAll(); hErr == nil && hashCount > 0 {
+		return false, ""
+	}
+	if completed, cErr := e.db.BackupRepo.CountByStatus(models.BackupStatusCompleted); cErr == nil && completed > 0 {
+		return false, ""
+	}
+
+	// Step 2: OSS probe
+	if e.storage == nil {
+		return false, ""
+	}
+	shortCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	prefix := "data/"
+	if e.config.Reconcile.OSSListPrefix != "" {
+		prefix = e.config.Reconcile.OSSListPrefix
+	}
+	var (
+		hasData bool
+		cause   string
+	)
+	if dataKeys, dErr := e.storage.List(shortCtx, prefix); dErr == nil && len(dataKeys) > 0 {
+		hasData = true
+		cause = fmt.Sprintf("OSS 目录 %q 下已有 %d 个备份对象，本环境数据库为空。", prefix, len(dataKeys))
+	}
+	if dbKeys, dbErr := e.storage.List(shortCtx, dbBackupPrefix); dbErr == nil && len(dbKeys) > 0 {
+		hasData = true
+		if cause == "" {
+			cause = fmt.Sprintf("OSS 目录 %q 下已有 %d 个数据库快照，本环境数据库为空。", dbBackupPrefix, len(dbKeys))
+		}
+	}
+	if !hasData {
+		return false, ""
+	}
+	msg := cause + " 请在 nas-backup-backend 目录下执行: " +
+		"./restore-cli -config config.yaml bootstrap"
+	return true, msg
+}
+
+// checkBootstrapRequired detects a dangerous mismatch: the local database is
+// empty (no hash_index rows and no completed backups) but OSS already contains
+// backup data (objects under data/ or meta/db/). This happens when a user
+// installs the backend on a new machine (e.g. NAS) pointing at the same OSS
+// bucket where another machine (e.g. their Mac) has already produced
+// backups. Running a backup in this state would either:
+//
+//   - Re-upload every file with a freshly-generated random IV. While
+//     --no-clobber now prevents object overwrite, uploading identical content
+//     under identical storage keys still wastes bandwidth and time.
+//   - Worse, if the user then clicks "修复" (reconcile apply), the reconciler
+//     would see hash_index empty and classify ALL existing OSS objects as
+//     "orphans" and DELETE them, destroying all cross-instance backups.
+//
+// Instead we force the new environment to run restore-cli bootstrap first,
+// which populates the local database from OSS via the cloud DB snapshot.
+func (e *Engine) checkBootstrapRequired(ctx context.Context) error {
+	// Step 1: cheap in-process check — does the local DB have any content?
+	hashCount, hErr := e.db.HashRepo.CountAll()
+	completedBackups, cErr := e.db.BackupRepo.CountByStatus(models.BackupStatusCompleted)
+	if (hErr == nil && hashCount > 0) || (cErr == nil && completedBackups > 0) {
+		// DB already has some committed state; no bootstrap guard needed.
+		// This also means a truly fresh instance that successfully completed
+		// its very first backup will pass this guard on every subsequent run.
+		return nil
+	}
+
+	// Step 2: DB is empty. Does OSS actually have anything under data/?
+	// Use a short timeout so a misconfigured bucket doesn't hang startup.
+	shortCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	// Probe both the data prefix (backup blobs) and meta/db prefix (cloud DB
+	// snapshots); either having content means another environment has used
+	// this bucket.
+	var hasData bool
+	if e.storage != nil {
+		prefix := "data/"
+		if e.config.Reconcile.OSSListPrefix != "" {
+			prefix = e.config.Reconcile.OSSListPrefix
+		}
+		dataKeys, dErr := e.storage.List(shortCtx, prefix)
+		if dErr == nil && len(dataKeys) > 0 {
+			hasData = true
+		}
+		dbKeys, dbErr := e.storage.List(shortCtx, dbBackupPrefix)
+		if dbErr == nil && len(dbKeys) > 0 {
+			hasData = true
+		}
+	}
+
+	if !hasData {
+		// OSS is empty — first-time backup on a new bucket. Allow.
+		return nil
+	}
+
+	return fmt.Errorf(
+		"bootstrap required: local database is empty but OSS already contains backup data. " +
+			"To share an OSS bucket between environments, first restore the database from OSS using: " +
+			"./restore-cli -config config.yaml bootstrap")
+}
+
 // RunGarbageCollection cleans up orphan data in OSS and the database.
 // It refuses to run while a backup is in progress to avoid deleting objects
 // that are in the process of being uploaded but not yet recorded in
@@ -314,6 +472,20 @@ func (e *Engine) RunGarbageCollection(ctx context.Context) error {
 		return fmt.Errorf("check running backup: %w", err)
 	} else if running {
 		return fmt.Errorf("a backup is currently running (db); run GC after it finishes")
+	}
+
+	// Safety guard: refuse to delete objects when the local database appears
+	// empty but there are active (ref_count > 0) hashes. This detects the
+	// pathological scenario where hash_index was somehow wiped but leftover
+	// orphan records (ref_count=0) point at objects that GC would delete.
+	// In a shared-bucket setup the objects could still belong to another
+	// environment's backup. When hash_count is 0 we simply have no basis for
+	// deciding what is safe to delete — abort.
+	if hashCount, hErr := e.db.HashRepo.CountAll(); hErr == nil && hashCount == 0 {
+		return fmt.Errorf(
+			"garbage collection aborted: hash_index is empty. Without a hash index " +
+				"there is no way to distinguish orphan objects from in-use ones. " +
+				"Run ./restore-cli -config config.yaml bootstrap to restore the database first")
 	}
 
 	graceDays := e.config.Backup.Retention.OrphanGraceDays

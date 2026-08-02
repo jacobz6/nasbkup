@@ -447,6 +447,19 @@ func (sm *StorageManager) Upload(ctx context.Context, localPath, remoteKey strin
 
 	remoteSpec := fmt.Sprintf("%s:%s", sm.remoteName, remoteKey)
 
+	// Pre-check: if the object already exists in OSS, skip uploading to avoid
+	// overwriting. In a multi-environment shared-bucket setup, another instance
+	// may have already uploaded the same content (by hash). Overwriting would
+	// corrupt the other instance's backup because AES-GCM uses a random IV per
+	// encryption. This is an application-level no-clobber guard; --no-clobber
+	// on the rclone command line acts as a second line of defense.
+	exists, preErr := sm.Exists(ctx, remoteKey)
+	if preErr == nil && exists {
+		slog.Info("upload skipped: object already exists in OSS (no-clobber)",
+			"remote_key", remoteKey)
+		return nil
+	}
+
 	return sm.withRetry(ctx, defaultRetryCount, func() error {
 		var args []string
 		args = append(args, "copyto", localPath, remoteSpec)
@@ -454,6 +467,7 @@ func (sm *StorageManager) Upload(ctx context.Context, localPath, remoteKey strin
 			args = append(args, fmt.Sprintf("--s3-storage-class=%s", sm.storageClass))
 		}
 		args = append(args, "--config", sm.rcloneConf)
+		args = append(args, "--no-clobber")
 		args = append(args, "-v")
 
 		cmd := exec.CommandContext(ctx, sm.rcloneBin, args...)
@@ -464,9 +478,18 @@ func (sm *StorageManager) Upload(ctx context.Context, localPath, remoteKey strin
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			errMsg := strings.TrimSpace(stderr.String())
+			// rclone --no-clobber returns an error when the destination exists.
+			// Treat this as success since the object is already stored.
+			if strings.Contains(errMsg, "not overwriting") ||
+				strings.Contains(errMsg, "already exists") ||
+				strings.Contains(errMsg, "File exists") {
+				slog.Info("upload skipped: --no-clobber detected existing object",
+					"remote_key", remoteKey)
+				return nil
+			}
 			return fmt.Errorf("rclone copyto %q → %q (size=%d): %w (stderr: %s)",
-				localPath, remoteSpec, fileSize, err,
-				strings.TrimSpace(stderr.String()))
+				localPath, remoteSpec, fileSize, err, errMsg)
 		}
 		return nil
 	})
@@ -655,7 +678,7 @@ func (sm *StorageManager) ossObjectKey(remoteKey string) string {
 // the <Days> element is accepted. Expedited restore is available only for
 // Cold Archive / Deep Archive tiers, not for standard Archive.
 //
-// The restore window is set to 7 days.
+// The restore window is explicitly set to 7 days via RestoreObjectDetail.
 func (sm *StorageManager) RestoreObject(remoteKey string, expedited bool) error {
 	// If OSS SDK is not fully configured, we cannot trigger archive restore
 	// via the OSS SDK. For non-archived storage (e.g., local filesystem, S3),
@@ -684,17 +707,29 @@ func (sm *StorageManager) RestoreObject(remoteKey string, expedited bool) error 
 		return fmt.Errorf("get OSS bucket %q: %w", sm.ossBucket, err)
 	}
 
-	// For Aliyun Archive storage, the restore request must contain ONLY
-	// <Days>; no <JobParameters><Tier> element is allowed. Use the simple
-	// RestoreObject API (not RestoreObjectDetail) which sends exactly that.
 	ossKey := sm.ossObjectKey(remoteKey)
-	err = bucket.RestoreObject(ossKey)
+
+	// For Aliyun Archive storage, the restore request body MUST contain ONLY
+	// <Days>; NO <JobParameters><Tier> element is allowed (Archive tier does
+	// not support Tier — sending one triggers MalformedXML / "GlacierJobParameters
+	// is not supported"). For ColdArchive/DeepColdArchive, Tier is legal but
+	// Archive is the overwhelmingly common case in this project, so be
+	// conservative and only send <Days>.
+	//
+	// We intentionally do NOT call bucket.RestoreObjectDetail(oss.RestoreConfiguration{Days:7})
+	// because the SDK forcibly overwrites an empty Tier to "Standard" inside
+	// RestoreObjectDetail, producing an XML body with <JobParameters><Tier>Standard</Tier></JobParameters>
+	// that Archive buckets reject. Instead, post the minimal XML via RestoreObjectXML.
+	restoreXML := `<RestoreRequest><Days>7</Days></RestoreRequest>`
+	err = bucket.RestoreObjectXML(ossKey, restoreXML)
 	if err != nil {
 		// OSS returns a specific error when the object is already restored
 		// or a restore is already in progress. This is not a fatal error.
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "RestoreAlreadyInProgress") ||
 			strings.Contains(errMsg, "OK") {
+			slog.Info("restore already in progress or already restored",
+				"key", remoteKey, "oss_key", ossKey)
 			return nil
 		}
 		// If the object is not in archived state (e.g. STANDARD/IA), the
@@ -709,6 +744,8 @@ func (sm *StorageManager) RestoreObject(remoteKey string, expedited bool) error 
 		return fmt.Errorf("restore object %q (oss key: %q): %w", remoteKey, ossKey, err)
 	}
 
+	slog.Info("object thaw request submitted successfully",
+		"key", remoteKey, "oss_key", ossKey, "days", 7)
 	return nil
 }
 
@@ -724,6 +761,17 @@ func isArchiveStorageClass(sc string) bool {
 
 // CheckRestored checks whether an archived object has been restored and is
 // ready for download. It returns true if the object is in a restorable state.
+//
+// Per Aliyun OSS docs (https://help.aliyun.com/zh/oss/how-do-i-check-whether-the-oss-file-is-unfrozen),
+// the x-oss-restore header value uses QUOTED booleans:
+//
+//	Thawing in progress:   ongoing-request="true"
+//	Thawing completed:     ongoing-request="false", expiry-date="Thu, 04 Jan 2024 03:28:54 GMT"
+//	Never thawed / expired: (header absent)
+//
+// A previous buggy version matched against "ongoing-request=false" (no quotes),
+// which never matched the real response and caused the UI to stay stuck on
+// "正在解冻中" long after the actual thaw completed.
 func (sm *StorageManager) CheckRestored(remoteKey string) (bool, error) {
 	// If OSS SDK credentials/endpoint/bucket are not available, we cannot use
 	// the OSS SDK to check archive restore status. Assume the object is ready
@@ -796,7 +844,22 @@ func (sm *StorageManager) CheckRestored(remoteKey string) (bool, error) {
 	isArchive := isArchiveStorageClass(storageClass)
 
 	// Check the X-Oss-Restore header.
+	// NOTE: Per Aliyun docs, Go SDK http.Header canonicalises header names; the
+	// raw wire header is "x-oss-restore" and meta.Get() / meta["X-Oss-Restore"]
+	// should both work. However, we also try the exact lowercase key as a
+	// defence-in-depth fallback because older SDK versions had case-sensitivity
+	// bugs on some platforms.
 	restoreHeader := meta.Get("X-Oss-Restore")
+	if restoreHeader == "" {
+		if v, ok := meta["X-Oss-Restore"]; ok && len(v) > 0 {
+			restoreHeader = v[0]
+		}
+	}
+	if restoreHeader == "" {
+		if v, ok := meta["x-oss-restore"]; ok && len(v) > 0 {
+			restoreHeader = v[0]
+		}
+	}
 
 	if !isArchive {
 		// Object is in Standard/IA/other non-archive class - downloadable immediately
@@ -814,16 +877,32 @@ func (sm *StorageManager) CheckRestored(remoteKey string) (bool, error) {
 		return false, nil
 	}
 
-	// The header value is like "ongoing-request=true" or "ongoing-request=false, expiry-date=..."
-	if strings.Contains(restoreHeader, "ongoing-request=false") {
-		// Restore completed and within the expiry window
-		slog.Debug("archive object restored and ready for download",
-			"key", remoteKey, "restore_header", restoreHeader)
+	// Per Aliyun docs the header is:
+	//   ongoing-request="true"            → thaw in progress
+	//   ongoing-request="false", expiry-date="..." → thaw completed
+	// Both boolean values carry QUOTES. Accept both quoted and unquoted variants
+	// for forward/backward compatibility (some proxies strip quotes).
+	restoreHeaderLower := strings.ToLower(restoreHeader)
+
+	completed := strings.Contains(restoreHeaderLower, `ongoing-request="false"`) ||
+		strings.Contains(restoreHeaderLower, "ongoing-request=false")
+	inProgress := strings.Contains(restoreHeaderLower, `ongoing-request="true"`) ||
+		strings.Contains(restoreHeaderLower, "ongoing-request=true")
+
+	if completed {
+		slog.Info("archive object restored and ready for download",
+			"key", remoteKey, "storage_class", storageClass, "restore_header", restoreHeader)
 		return true, nil
 	}
+	if inProgress {
+		slog.Info("archive object restore is still in progress (thawing)",
+			"key", remoteKey, "storage_class", storageClass, "restore_header", restoreHeader)
+		return false, nil
+	}
 
-	// ongoing-request=true → restore is still in progress
-	slog.Info("archive object restore is in progress",
+	// Header present but unrecognised format — log and treat as not-yet-restored
+	// (fail-safe: worst case user has to wait for the next poll cycle).
+	slog.Warn("unrecognised x-oss-restore header format, treating as not-restored",
 		"key", remoteKey, "restore_header", restoreHeader)
 	return false, nil
 }
