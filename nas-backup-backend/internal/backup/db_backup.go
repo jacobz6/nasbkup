@@ -123,10 +123,10 @@ func (s *DBBackupService) PullOSSDB(ctx context.Context) (bool, error) {
 	defer os.Remove(localIV)
 	defer os.Remove(localDec)
 
-	if err := s.storage.Download(ctx, ossDBEncKey, localEnc); err != nil {
+	if err := s.storage.DownloadWithThaw(ctx, ossDBEncKey, localEnc, 30*time.Minute, 10*time.Second); err != nil {
 		return false, fmt.Errorf("download oss.db.enc: %w", err)
 	}
-	if err := s.storage.Download(ctx, ossDBIVKey, localIV); err != nil {
+	if err := s.storage.DownloadWithThaw(ctx, ossDBIVKey, localIV, 30*time.Minute, 10*time.Second); err != nil {
 		return false, fmt.Errorf("download oss.db.iv: %w", err)
 	}
 
@@ -261,10 +261,10 @@ func (s *DBBackupService) archivePreviousOSSDB(ctx context.Context) error {
 	defer os.Remove(prevEnc)
 	defer os.Remove(prevIV)
 
-	if err := s.storage.Download(ctx, ossDBEncKey, prevEnc); err != nil {
+	if err := s.storage.DownloadWithThaw(ctx, ossDBEncKey, prevEnc, 30*time.Minute, 10*time.Second); err != nil {
 		return fmt.Errorf("download previous oss.db.enc: %w", err)
 	}
-	if err := s.storage.Download(ctx, ossDBIVKey, prevIV); err != nil {
+	if err := s.storage.DownloadWithThaw(ctx, ossDBIVKey, prevIV, 30*time.Minute, 10*time.Second); err != nil {
 		return fmt.Errorf("download previous oss.db.iv: %w", err)
 	}
 	if err := s.storage.Upload(ctx, prevEnc, bkupEnc); err != nil {

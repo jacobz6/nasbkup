@@ -1044,11 +1044,9 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64) (retErr erro
 
 	// ── Phase 11: Push updated DB to OSS ───────────────────────────────
 	// Sync the encrypted database to OSS as the new authoritative oss.db.
-	// The previous oss.db is renamed to a .bkup. Failures are logged but do
-	// not fail the backup — the files are already uploaded, and the DB will
-	// be synced on the next successful backup.
+	// The previous oss.db is renamed to a .bkup (may need thaw if in GLACIER).
 	if svc := e.getDBBackupSvc(); svc != nil {
-		pushCtx, pushCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		pushCtx, pushCancel := context.WithTimeout(context.Background(), 30*time.Minute)
 		if err := svc.PushOSSDB(pushCtx); err != nil {
 			e.logger.Error("failed to push oss.db to OSS after backup", "error", err)
 			e.logEvent(backupID, models.LogLevelWarn, "数据库同步到OSS失败", err.Error())

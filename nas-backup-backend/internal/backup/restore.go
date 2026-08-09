@@ -459,8 +459,53 @@ func (r *Restorer) restoreFile(
 	}
 
 	// Step 2: Download encrypted file.
-	if err := r.storage.Download(ctx, bfRec.StorageKey, downloadedPath); err != nil {
-		return fmt.Errorf("download %q: %w", bfRec.StorageKey, err)
+	// First attempt: download directly (thaw was already handled above).
+	downloadErr := r.storage.Download(ctx, bfRec.StorageKey, downloadedPath)
+	if downloadErr != nil {
+		// If the download failed because the object is in GLACIER and we
+		// somehow missed the thaw (e.g. CheckRestored returned a false
+		// negative), retry once with a full thaw cycle. This is a safety
+		// net for edge cases like OSS metadata caching or race conditions
+		// where the storage class changed between CheckRestored and Download.
+		errMsg := downloadErr.Error()
+		if strings.Contains(errMsg, "GLACIER") || strings.Contains(errMsg, "restore first") {
+			slog.Warn("download failed with GLACIER error despite thaw check, retrying with full thaw",
+				"storage_key", bfRec.StorageKey, "error", downloadErr)
+
+			if thawErr := r.storage.RestoreObject(bfRec.StorageKey, expedited); thawErr != nil {
+				return fmt.Errorf("download %q (GLACIER, thaw failed): %w", bfRec.StorageKey, thawErr)
+			}
+
+			deadline := time.Now().Add(maxThawWait)
+			for time.Now().Before(deadline) {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(thawPollInterval):
+				}
+
+				restored, checkErr := r.storage.CheckRestored(bfRec.StorageKey)
+				if checkErr != nil {
+					slog.Warn("check restore status failed during retry",
+						"storage_key", bfRec.StorageKey, "error", checkErr)
+					continue
+				}
+				if restored {
+					break
+				}
+			}
+
+			if !restored {
+				return fmt.Errorf("object %q not restored after %v (retry)", bfRec.StorageKey, maxThawWait)
+			}
+
+			// Second attempt: download after thaw.
+			if err := r.storage.Download(ctx, bfRec.StorageKey, downloadedPath); err != nil {
+				return fmt.Errorf("download %q (after thaw retry): %w", bfRec.StorageKey, err)
+			}
+		} else {
+			return fmt.Errorf("download %q: %w", bfRec.StorageKey, downloadErr)
+		}
 	}
 
 	// Step 3: Decrypt.

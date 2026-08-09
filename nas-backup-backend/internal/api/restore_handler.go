@@ -426,10 +426,11 @@ func (r *Router) handleRefreshOSSDB(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Use a detached context: pulling + decrypting the DB can take a while
-	// over slow links, and the local DB swap must not be aborted by the
-	// HTTP server's WriteTimeout.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// Use a detached context with generous timeout: pulling + decrypting the DB
+	// can take a while over slow links, and if the object is in GLACIER it
+	// may need thawing (up to 30 min for ColdArchive). The local DB swap must
+	// not be aborted by the HTTP server's WriteTimeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
 	pulled, err := r.engine.RefreshFromOSS(ctx)

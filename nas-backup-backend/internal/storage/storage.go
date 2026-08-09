@@ -22,6 +22,12 @@ import (
 	"github.com/nas-backup/internal/config"
 )
 
+// ErrOSSSDKNotConfigured is returned when OSS SDK credentials are missing
+// and an archive restore (thaw) operation cannot be performed.
+var ErrOSSSDKNotConfigured = fmt.Errorf("OSS SDK not fully configured; " +
+	"set OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET env vars and configure " +
+	"oss.endpoint/oss.bucket in config.yaml to enable GLACIER/Archive thaw support")
+
 // truncateForLog returns the first n bytes of s, with a trailing "..." indicator
 // if truncation occurred. Used for safe logging of raw command output.
 func truncateForLog(s string, n int) string {
@@ -524,6 +530,72 @@ func (sm *StorageManager) Download(ctx context.Context, remoteKey, localPath str
 	})
 }
 
+// DownloadWithThaw downloads a file from OSS, first ensuring the object is
+// thawed (restored) if it resides in an archive storage class (GLACIER,
+// ColdArchive, DeepColdArchive). It checks thaw status via CheckRestored,
+// initiates thaw via RestoreObject if needed, polls until the object becomes
+// downloadable, then downloads via Download.
+//
+// The maxThawWait parameter controls the maximum time to wait for thaw
+// completion; pass 0 to use the default (6 hours). The pollInterval controls
+// how often to check thaw status; pass 0 to use the default (30 seconds).
+//
+// When the OSS SDK is not fully configured, CheckRestored and RestoreObject
+// will return ErrOSSSDKNotConfigured, and this method will wrap that error
+// with a clear message so the caller knows thaw cannot be performed.
+func (sm *StorageManager) DownloadWithThaw(ctx context.Context, remoteKey, localPath string, maxThawWait, pollInterval time.Duration) error {
+	if maxThawWait <= 0 {
+		maxThawWait = 6 * time.Hour
+	}
+	if pollInterval <= 0 {
+		pollInterval = 30 * time.Second
+	}
+
+	// Step 1: Check if object needs thawing.
+	restored, err := sm.CheckRestored(remoteKey)
+	if err != nil {
+		return fmt.Errorf("check restore status for %q: %w", remoteKey, err)
+	}
+
+	if !restored {
+		slog.Info("object may need thawing, initiating restore request",
+			"key", remoteKey)
+
+		// Step 2: Initiate thaw.
+		if err := sm.RestoreObject(remoteKey, false); err != nil {
+			return fmt.Errorf("initiate thaw for %q: %w", remoteKey, err)
+		}
+
+		// Step 3: Poll until thaw completes or timeout.
+		deadline := time.Now().Add(maxThawWait)
+		for time.Now().Before(deadline) {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(pollInterval):
+			}
+
+			restored, err := sm.CheckRestored(remoteKey)
+			if err != nil {
+				slog.Warn("check restore status failed, retrying",
+					"key", remoteKey, "error", err)
+				continue
+			}
+			if restored {
+				slog.Info("object thaw completed", "key", remoteKey)
+				break
+			}
+		}
+
+		if !restored {
+			return fmt.Errorf("object %q not restored after %v", remoteKey, maxThawWait)
+		}
+	}
+
+	// Step 4: Download the now-restored object.
+	return sm.Download(ctx, remoteKey, localPath)
+}
+
 // Delete removes a single file from OSS with retry logic for transient failures.
 // The context allows cancellation of in-flight delete operations.
 func (sm *StorageManager) Delete(ctx context.Context, remoteKey string) error {
@@ -677,12 +749,11 @@ func (sm *StorageManager) ossObjectKey(remoteKey string) string {
 // The restore window is explicitly set to 7 days via RestoreObjectDetail.
 func (sm *StorageManager) RestoreObject(remoteKey string, expedited bool) error {
 	// If OSS SDK is not fully configured, we cannot trigger archive restore
-	// via the OSS SDK. For non-archived storage (e.g., local filesystem, S3),
-	// no thaw is needed and objects are immediately downloadable.
+	// via the OSS SDK. Return ErrOSSSDKNotConfigured so the caller gets a
+	// clear actionable message instead of silently skipping and then hitting a
+	// confusing "Object in GLACIER" error from rclone later.
 	if sm.ossAKID == "" || sm.ossAKSecret == "" || sm.ossEndpoint == "" || sm.ossBucket == "" {
-		slog.Warn("OSS SDK not fully configured, skipping archive restore (thaw) request; " +
-			"objects in non-archived storage classes are immediately downloadable")
-		return nil
+		return ErrOSSSDKNotConfigured
 	}
 
 	// If expedited was requested, log that Aliyun Archive tier does not
@@ -770,13 +841,13 @@ func isArchiveStorageClass(sc string) bool {
 // "正在解冻中" long after the actual thaw completed.
 func (sm *StorageManager) CheckRestored(remoteKey string) (bool, error) {
 	// If OSS SDK credentials/endpoint/bucket are not available, we cannot use
-	// the OSS SDK to check archive restore status. Assume the object is ready
-	// for download — the rclone-based Download() call will fail with a specific
-	// error if the object truly needs thawing.
+	// the OSS SDK to check archive restore status. Return false so the caller
+	// attempts the thaw flow; RestoreObject will return ErrOSSSDKNotConfigured
+	// with a clear actionable message instead of silently skipping.
 	if sm.ossAKID == "" || sm.ossAKSecret == "" || sm.ossEndpoint == "" || sm.ossBucket == "" {
-		slog.Warn("OSS SDK not fully configured (missing credentials/endpoint/bucket), skipping archive restore check; " +
-			"set OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET env vars and configure oss.endpoint/oss.bucket for ColdArchive/Archive support")
-		return true, nil
+		slog.Warn("OSS SDK not fully configured (missing credentials/endpoint/bucket), " +
+			"cannot verify archive restore status; assuming thaw may be needed")
+		return false, nil
 	}
 
 	// Use actual OSS object key (with .bin suffix if using crypt wrapper)
