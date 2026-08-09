@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -39,6 +40,8 @@ type Engine struct {
 	mu              sync.Mutex
 	runningBackupID int64
 	cancelFuncs     map[int64]context.CancelFunc
+
+	ready           atomic.Bool // true after InitFromOSS completes successfully
 }
 
 // NewEngine creates a new backup Engine with all required dependencies.
@@ -90,6 +93,18 @@ func (e *Engine) ProgressBroker() *ProgressBroker {
 	return e.progress
 }
 
+// Ready returns true after InitFromOSS has completed successfully.
+func (e *Engine) Ready() bool {
+	return e.ready.Load()
+}
+
+// SetReady sets the engine's ready state. This is primarily useful for testing
+// where InitFromOSS is skipped (no real OSS), but the engine should still be
+// considered ready for API requests.
+func (e *Engine) SetReady(ready bool) {
+	e.ready.Store(ready)
+}
+
 // InitFromOSS initializes the local DB from OSS at service startup.
 // It probes OSS reachability with exponential backoff retry (up to 10 minutes),
 // then either pulls the authoritative oss.db or falls back to the local DB.
@@ -97,6 +112,10 @@ func (e *Engine) ProgressBroker() *ProgressBroker {
 // OSS reachability is a hard prerequisite: if OSS is unreachable after the
 // retry budget, the service cannot start and a fatal error is returned.
 func (e *Engine) InitFromOSS(ctx context.Context) error {
+	defer func() {
+		e.ready.Store(true)
+	}()
+
 	svc := e.getDBBackupSvc()
 	if svc == nil {
 		return fmt.Errorf("cannot init from OSS: storage or encryptor not configured")

@@ -68,6 +68,7 @@ func (r *Router) handleDashboardStats(w http.ResponseWriter, req *http.Request) 
 		LastBackupStatus:    lastBackupStatus,
 		NextBackupTime:      nextBackupTime,
 		ActiveBackupRunning: isRunning,
+		EngineReady:         r.engine.Ready(), // Whether InitFromOSS has completed
 	}
 
 	r.jsonResponse(w, stats, http.StatusOK)

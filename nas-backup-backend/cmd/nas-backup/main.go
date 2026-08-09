@@ -116,19 +116,19 @@ func main() {
 	dbBackupSvc := backup.NewDBBackupService(enc, stor, cfg, database.DB())
 	engine.SetDBBackupService(dbBackupSvc)
 
-	// Initialize the local DB from the authoritative oss.db in OSS. This makes
-	// the local DB a working copy of the single source of truth and lets
-	// multiple machines share the same backup index. OSS reachability is a
-	// hard prerequisite — if OSS stays unreachable for 10 minutes the service
-	// exits so the operator can fix the config/network.
-	initCtx, initCancel := context.WithTimeout(context.Background(), 15*time.Minute)
-	if err := engine.InitFromOSS(initCtx); err != nil {
-		initCancel()
-		logger.Error("Failed to initialize DB from OSS: %v", err)
-		log.Fatalf("Failed to initialize DB from OSS: %v", err)
-	}
-	initCancel()
-	logger.Info("Database initialized from OSS")
+	// Initialize the local DB from the authoritative oss.db in OSS asynchronously.
+	// OSS reachability is probed in the background (up to 10 minutes) so the
+	// HTTP server can start immediately and serve requests without waiting.
+	go func() {
+		initCtx, initCancel := context.WithTimeout(context.Background(), 15*time.Minute)
+		defer initCancel()
+
+		if err := engine.InitFromOSS(initCtx); err != nil {
+			logger.Error("Failed to initialize DB from OSS (service will start but backup/restore are unavailable): %v", err)
+			return
+		}
+		logger.Info("Database initialized from OSS")
+	}()
 
 	restorer := backup.NewRestorer(database, enc, comp, stor, cfg)
 

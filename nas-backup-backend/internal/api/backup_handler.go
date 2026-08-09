@@ -33,6 +33,12 @@ func (r *Router) handleBackupTrigger(w http.ResponseWriter, req *http.Request) {
 	}
 	_ = triggerReq.Type // accepted for backward compatibility, ignored
 
+	// Check engine readiness AFTER basic validation
+	if !r.engine.Ready() {
+		r.jsonError(w, "engine is still initializing from OSS, please retry", http.StatusServiceUnavailable)
+		return
+	}
+
 	backupID, err := r.engine.StartBackup()
 	if err != nil {
 		slog.Warn("backup trigger failed", "error", err)

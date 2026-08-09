@@ -59,6 +59,8 @@ func setupTestEnv(t *testing.T) *testEnv {
 
 	pb := backup.NewProgressBroker()
 	engine := backup.NewEngine(database, nil, nil, nil, nil, nil, cfg, pb)
+	// Set engine ready for API testing since we don't initialize from OSS in tests
+	engine.SetReady(true)
 
 	// Create a Restorer with nil storage/encryptor/compressor — only DB
 	// operations (file listing) work, which is enough for validation tests

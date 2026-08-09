@@ -186,6 +186,7 @@ type DashboardStats struct {
 	LastBackupStatus    BackupStatus `json:"last_backup_status"`
 	NextBackupTime      *time.Time   `json:"next_backup_time,omitempty"`
 	ActiveBackupRunning bool         `json:"active_backup_running"`
+	EngineReady         bool         `json:"engine_ready"` // true when InitFromOSS completed
 }
 
 // --- Content selection ---

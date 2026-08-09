@@ -53,6 +53,12 @@ func (r *Router) handleRestoreCreate(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Check engine readiness AFTER basic validation
+	if !r.engine.Ready() {
+		r.jsonError(w, "engine is still initializing from OSS, please retry", http.StatusServiceUnavailable)
+		return
+	}
+
 	// Delegate to RestoreJobManager for async job creation + start.
 	job, err := r.restoreJobMgr.CreateJob(&restoreReq)
 	if err != nil {
@@ -312,6 +318,11 @@ func (r *Router) handleGarbageCollection(w http.ResponseWriter, req *http.Reques
 // If a backup is currently running, reconcile returns 409 Conflict so the
 // caller can retry after the backup finishes.
 func (r *Router) handleReconcile(w http.ResponseWriter, req *http.Request) {
+	if !r.engine.Ready() {
+		r.jsonError(w, "engine is still initializing from OSS, please retry", http.StatusServiceUnavailable)
+		return
+	}
+
 	dryRun := r.config.Reconcile.DryRun
 	if v := req.URL.Query().Get("dry_run"); v != "" {
 		b, err := strconv.ParseBool(v)
