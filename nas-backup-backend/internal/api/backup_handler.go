@@ -1,8 +1,10 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -13,25 +15,25 @@ import (
 )
 
 // handleBackupTrigger starts a new backup job.
+// The legacy "type" field in the request body is accepted for backward
+// compatibility but ignored — every backup is now a standalone session.
 func (r *Router) handleBackupTrigger(w http.ResponseWriter, req *http.Request) {
 	var triggerReq models.BackupTriggerRequest
-	if err := json.NewDecoder(req.Body).Decode(&triggerReq); err != nil {
-		r.jsonError(w, "invalid request body", http.StatusBadRequest)
+
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		r.jsonError(w, "failed to read request body", http.StatusBadRequest)
 		return
 	}
-
-	// Default to auto if type is not specified
-	backupType := triggerReq.Type
-	if backupType == "" {
-		backupType = models.BackupTypeAuto
+	if len(bytes.TrimSpace(body)) > 0 {
+		if err := json.Unmarshal(body, &triggerReq); err != nil {
+			r.jsonError(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
 	}
+	_ = triggerReq.Type // accepted for backward compatibility, ignored
 
-	if backupType != models.BackupTypeFull && backupType != models.BackupTypeIncremental && backupType != models.BackupTypeAuto {
-		r.jsonError(w, "type must be 'full', 'incremental', or 'auto'", http.StatusBadRequest)
-		return
-	}
-
-	backupID, err := r.engine.StartBackup(backupType)
+	backupID, err := r.engine.StartBackup()
 	if err != nil {
 		slog.Warn("backup trigger failed", "error", err)
 		r.jsonError(w, err.Error(), http.StatusConflict)

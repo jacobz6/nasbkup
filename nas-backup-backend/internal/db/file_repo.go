@@ -1,148 +1,170 @@
 package db
 
 import (
-        "database/sql"
-        "fmt"
-        "time"
+	"database/sql"
+	"fmt"
+	"time"
 
-        "github.com/nas-backup/internal/models"
+	"github.com/nas-backup/internal/models"
 )
 
 // scanner is a common interface for *sql.Row and *sql.Rows Scan method.
 type scanner interface {
-        Scan(dest ...interface{}) error
+	Scan(dest ...interface{}) error
 }
 
 // FileRepository handles all CRUD operations for the files table.
 type FileRepository struct {
-        db *sql.DB
+	db *sql.DB
 }
 
 // NewFileRepository creates a new FileRepository with the given database connection.
 func NewFileRepository(db *sql.DB) *FileRepository {
-        return &FileRepository{db: db}
+	return &FileRepository{db: db}
 }
+
+// fileColumns is the full column list for the files table, used by all SELECT queries.
+const fileColumns = "id, path, size, mod_time, hash, status, backup_id, inode, created_at, updated_at, last_backup_status, last_backup_error, last_backup_at, last_backup_id"
 
 // scanFileRecord scans a single file row from a scanner into a FileRecord.
 // The inode column is read from the database but discarded since the model
 // does not expose it as a field.
 func scanFileRecord(s scanner) (*models.FileRecord, error) {
-        var (
-                rec       models.FileRecord
-                modTime   string
-                createdAt string
-                updatedAt string
-                backupID  sql.NullInt64
-                _inode    int64 // read but not exposed on model
-        )
-        if err := s.Scan(
-                &rec.ID, &rec.Path, &rec.Size, &modTime,
-                &rec.Hash, &rec.Status, &backupID, &_inode,
-                &createdAt, &updatedAt,
-        ); err != nil {
-                return nil, err
-        }
+	var (
+		rec              models.FileRecord
+		modTime          string
+		createdAt        string
+		updatedAt        string
+		backupID         sql.NullInt64
+		lastBackupID     sql.NullInt64
+		lastBackupAt     sql.NullString
+		lastBackupStatus sql.NullString
+		lastBackupError  sql.NullString
+		_inode           int64 // read but not exposed on model
+	)
+	if err := s.Scan(
+		&rec.ID, &rec.Path, &rec.Size, &modTime,
+		&rec.Hash, &rec.Status, &backupID, &_inode,
+		&createdAt, &updatedAt,
+		&lastBackupStatus, &lastBackupError, &lastBackupAt, &lastBackupID,
+	); err != nil {
+		return nil, err
+	}
 
-        t, err := time.Parse(time.RFC3339, modTime)
-        if err != nil {
-                return nil, fmt.Errorf("parse mod_time %q: %w", modTime, err)
-        }
-        rec.ModTime = t
+	t, err := time.Parse(time.RFC3339, modTime)
+	if err != nil {
+		return nil, fmt.Errorf("parse mod_time %q: %w", modTime, err)
+	}
+	rec.ModTime = t
 
-        t, err = time.Parse(time.RFC3339, createdAt)
-        if err != nil {
-                return nil, fmt.Errorf("parse created_at %q: %w", createdAt, err)
-        }
-        rec.CreatedAt = t
+	t, err = time.Parse(time.RFC3339, createdAt)
+	if err != nil {
+		return nil, fmt.Errorf("parse created_at %q: %w", createdAt, err)
+	}
+	rec.CreatedAt = t
 
-        t, err = time.Parse(time.RFC3339, updatedAt)
-        if err != nil {
-                return nil, fmt.Errorf("parse updated_at %q: %w", updatedAt, err)
-        }
-        rec.UpdatedAt = t
+	t, err = time.Parse(time.RFC3339, updatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("parse updated_at %q: %w", updatedAt, err)
+	}
+	rec.UpdatedAt = t
 
-        if backupID.Valid {
-                rec.BackupID = backupID.Int64
-        }
+	if backupID.Valid {
+		rec.BackupID = backupID.Int64
+	}
 
-        return &rec, nil
+	if lastBackupStatus.Valid {
+		rec.LastBackupStatus = models.FileBackupStatus(lastBackupStatus.String)
+	}
+	if lastBackupError.Valid {
+		rec.LastBackupError = lastBackupError.String
+	}
+	if lastBackupAt.Valid {
+		t, err := time.Parse(time.RFC3339, lastBackupAt.String)
+		if err != nil {
+			return nil, fmt.Errorf("parse last_backup_at %q: %w", lastBackupAt.String, err)
+		}
+		rec.LastBackupAt = &t
+	}
+	if lastBackupID.Valid {
+		rec.LastBackupID = lastBackupID.Int64
+	}
+
+	return &rec, nil
 }
 
 // Upsert inserts a new file record or updates an existing one if the path already exists.
 // When the path exists, it updates size, mod_time, hash, inode, status to active, and updated_at.
+// Does NOT modify last_backup_* fields — those are updated separately via MarkBackupSuccess/MarkBackupFailed.
 // Returns the file ID of the inserted or updated record.
 func (r *FileRepository) Upsert(path string, size int64, modTime time.Time, hash string, inode uint64) (int64, error) {
-        now := Now()
-        modTimeStr := modTime.UTC().Format(time.RFC3339)
+	now := Now()
+	modTimeStr := modTime.UTC().Format(time.RFC3339)
 
-        var id int64
-        err := r.db.QueryRow(`
-                INSERT INTO files (path, size, mod_time, hash, inode, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
-                ON CONFLICT(path) DO UPDATE SET
-                        size = excluded.size,
-                        mod_time = excluded.mod_time,
-                        hash = excluded.hash,
-                        inode = excluded.inode,
-                        status = 'active',
-                        updated_at = excluded.updated_at
-                RETURNING id
-        `, path, size, modTimeStr, hash, inode, now, now).Scan(&id)
-        if err != nil {
-                return 0, fmt.Errorf("upsert file %q: %w", path, err)
-        }
+	var id int64
+	err := r.db.QueryRow(`
+		INSERT INTO files (path, size, mod_time, hash, inode, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+		ON CONFLICT(path) DO UPDATE SET
+			size = excluded.size,
+			mod_time = excluded.mod_time,
+			hash = excluded.hash,
+			inode = excluded.inode,
+			status = 'active',
+			updated_at = excluded.updated_at
+		RETURNING id
+	`, path, size, modTimeStr, hash, inode, now, now).Scan(&id)
+	if err != nil {
+		return 0, fmt.Errorf("upsert file %q: %w", path, err)
+	}
 
-        return id, nil
+	return id, nil
 }
 
 // GetByPath retrieves a file record by its path.
 // Returns nil without error if no record is found.
 func (r *FileRepository) GetByPath(path string) (*models.FileRecord, error) {
-        row := r.db.QueryRow(`
-                SELECT id, path, size, mod_time, hash, status, backup_id, inode, created_at, updated_at
-                FROM files WHERE path = ?
-        `, path)
-        rec, err := scanFileRecord(row)
-        if err != nil {
-                if err == sql.ErrNoRows {
-                        return nil, nil
-                }
-                return nil, fmt.Errorf("get file by path %q: %w", path, err)
-        }
-        return rec, nil
+	row := r.db.QueryRow(`
+		SELECT `+fileColumns+` FROM files WHERE path = ?
+	`, path)
+	rec, err := scanFileRecord(row)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get file by path %q: %w", path, err)
+	}
+	return rec, nil
 }
 
 // GetByHash retrieves all active file records matching the given hash.
 func (r *FileRepository) GetByHash(hash string) ([]*models.FileRecord, error) {
-        rows, err := r.db.Query(`
-                SELECT id, path, size, mod_time, hash, status, backup_id, inode, created_at, updated_at
-                FROM files WHERE hash = ? AND status = 'active'
-        `, hash)
-        if err != nil {
-                return nil, fmt.Errorf("get files by hash %q: %w", hash, err)
-        }
-        defer rows.Close()
+	rows, err := r.db.Query(`
+		SELECT `+fileColumns+` FROM files WHERE hash = ? AND status = 'active'
+	`, hash)
+	if err != nil {
+		return nil, fmt.Errorf("get files by hash %q: %w", hash, err)
+	}
+	defer rows.Close()
 
-        records := make([]*models.FileRecord, 0)
-        for rows.Next() {
-                rec, err := scanFileRecord(rows)
-                if err != nil {
-                        return nil, fmt.Errorf("scan file row by hash: %w", err)
-                }
-                records = append(records, rec)
-        }
-        if err := rows.Err(); err != nil {
-                return nil, fmt.Errorf("iterate files by hash: %w", err)
-        }
-        return records, nil
+	records := make([]*models.FileRecord, 0)
+	for rows.Next() {
+		rec, err := scanFileRecord(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan file row by hash: %w", err)
+		}
+		records = append(records, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate files by hash: %w", err)
+	}
+	return records, nil
 }
 
 // ListByStatus retrieves file records filtered by status with pagination.
 // Use limit and offset to control pagination; pass 0 for limit to retrieve all records.
 func (r *FileRepository) ListByStatus(status models.FileStatus, limit, offset int) ([]*models.FileRecord, error) {
-	query := `SELECT id, path, size, mod_time, hash, status, backup_id, inode, created_at, updated_at
-		FROM files WHERE status = ?
-		ORDER BY path`
+	query := `SELECT ` + fileColumns + ` FROM files WHERE status = ? ORDER BY path`
 	var args []interface{}
 	args = append(args, status)
 	if limit > 0 {
@@ -172,109 +194,187 @@ func (r *FileRepository) ListByStatus(status models.FileStatus, limit, offset in
 
 // MarkDeleted sets the status of a file to "deleted" and updates the updated_at timestamp.
 func (r *FileRepository) MarkDeleted(path string) error {
-        now := Now()
-        result, err := r.db.Exec(`
-                UPDATE files SET status = 'deleted', updated_at = ? WHERE path = ?
-        `, now, path)
-        if err != nil {
-                return fmt.Errorf("mark file deleted %q: %w", path, err)
-        }
-        affected, err := result.RowsAffected()
-        if err != nil {
-                return fmt.Errorf("rows affected after mark deleted %q: %w", path, err)
-        }
-        if affected == 0 {
-                return fmt.Errorf("file not found for mark deleted: %q", path)
-        }
-        return nil
+	now := Now()
+	result, err := r.db.Exec(`
+		UPDATE files SET status = 'deleted', updated_at = ? WHERE path = ?
+	`, now, path)
+	if err != nil {
+		return fmt.Errorf("mark file deleted %q: %w", path, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected after mark deleted %q: %w", path, err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("file not found for mark deleted: %q", path)
+	}
+	return nil
 }
 
 // MarkDeletedBatch marks multiple files as deleted in a single transaction.
 // Returns an error if any path fails to be updated; the entire batch is rolled back.
 func (r *FileRepository) MarkDeletedBatch(paths []string) error {
-        if len(paths) == 0 {
-                return nil
-        }
+	if len(paths) == 0 {
+		return nil
+	}
 
-        tx, err := r.db.Begin()
-        if err != nil {
-                return fmt.Errorf("begin transaction for batch mark deleted: %w", err)
-        }
-        defer tx.Rollback()
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin transaction for batch mark deleted: %w", err)
+	}
+	defer tx.Rollback()
 
-        now := Now()
-        stmt, err := tx.Prepare(`
-                UPDATE files SET status = 'deleted', updated_at = ? WHERE path = ?
-        `)
-        if err != nil {
-                return fmt.Errorf("prepare batch mark deleted: %w", err)
-        }
-        defer stmt.Close()
+	now := Now()
+	stmt, err := tx.Prepare(`
+		UPDATE files SET status = 'deleted', updated_at = ? WHERE path = ?
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare batch mark deleted: %w", err)
+	}
+	defer stmt.Close()
 
-        for _, p := range paths {
-                if _, err := stmt.Exec(now, p); err != nil {
-                        return fmt.Errorf("mark deleted %q in batch: %w", p, err)
-                }
-        }
+	for _, p := range paths {
+		if _, err := stmt.Exec(now, p); err != nil {
+			return fmt.Errorf("mark deleted %q in batch: %w", p, err)
+		}
+	}
 
-        if err := tx.Commit(); err != nil {
-                return fmt.Errorf("commit batch mark deleted: %w", err)
-        }
-        return nil
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit batch mark deleted: %w", err)
+	}
+	return nil
 }
 
 // UpdateHash updates the hash value and updated_at timestamp for a file identified by ID.
 func (r *FileRepository) UpdateHash(id int64, hash string) error {
-        now := Now()
-        result, err := r.db.Exec(`
-                UPDATE files SET hash = ?, updated_at = ? WHERE id = ?
-        `, hash, now, id)
-        if err != nil {
-                return fmt.Errorf("update hash for file %d: %w", id, err)
-        }
-        affected, err := result.RowsAffected()
-        if err != nil {
-                return fmt.Errorf("rows affected after update hash for file %d: %w", id, err)
-        }
-        if affected == 0 {
-                return fmt.Errorf("file not found for update hash: %d", id)
-        }
-        return nil
+	now := Now()
+	result, err := r.db.Exec(`
+		UPDATE files SET hash = ?, updated_at = ? WHERE id = ?
+	`, hash, now, id)
+	if err != nil {
+		return fmt.Errorf("update hash for file %d: %w", id, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected after update hash for file %d: %w", id, err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("file not found for update hash: %d", id)
+	}
+	return nil
+}
+
+// MarkBackupSuccess records that a file was successfully backed up in the given backup session.
+func (r *FileRepository) MarkBackupSuccess(fileID, backupID int64) error {
+	now := Now()
+	_, err := r.db.Exec(`
+		UPDATE files SET
+			last_backup_status = 'success',
+			last_backup_error = '',
+			last_backup_at = ?,
+			last_backup_id = ?,
+			updated_at = ?
+		WHERE id = ?
+	`, now, backupID, now, fileID)
+	if err != nil {
+		return fmt.Errorf("mark backup success for file %d: %w", fileID, err)
+	}
+	return nil
+}
+
+// MarkBackupFailed records that a file failed to back up in the given backup session.
+func (r *FileRepository) MarkBackupFailed(fileID, backupID int64, errMsg string) error {
+	now := Now()
+	// Truncate very long error messages to avoid DB issues.
+	const maxErrLen = 1024
+	if len(errMsg) > maxErrLen {
+		errMsg = errMsg[:maxErrLen]
+	}
+	_, err := r.db.Exec(`
+		UPDATE files SET
+			last_backup_status = 'failed',
+			last_backup_error = ?,
+			last_backup_at = ?,
+			last_backup_id = ?,
+			updated_at = ?
+		WHERE id = ?
+	`, errMsg, now, backupID, now, fileID)
+	if err != nil {
+		return fmt.Errorf("mark backup failed for file %d: %w", fileID, err)
+	}
+	return nil
+}
+
+// MarkBackupSuccessBatch records successful backup for multiple files in a single transaction.
+func (r *FileRepository) MarkBackupSuccessBatch(fileIDs []int64, backupID int64) error {
+	if len(fileIDs) == 0 {
+		return nil
+	}
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin transaction for batch mark backup success: %w", err)
+	}
+	defer tx.Rollback()
+
+	now := Now()
+	stmt, err := tx.Prepare(`
+		UPDATE files SET
+			last_backup_status = 'success',
+			last_backup_error = '',
+			last_backup_at = ?,
+			last_backup_id = ?,
+			updated_at = ?
+		WHERE id = ?
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare batch mark backup success: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, fid := range fileIDs {
+		if _, err := stmt.Exec(now, backupID, now, fid); err != nil {
+			return fmt.Errorf("mark backup success for file %d in batch: %w", fid, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit batch mark backup success: %w", err)
+	}
+	return nil
 }
 
 // CountByStatus returns the number of file records with the given status.
 func (r *FileRepository) CountByStatus(status models.FileStatus) (int64, error) {
-        var count int64
-        err := r.db.QueryRow(`SELECT COUNT(*) FROM files WHERE status = ?`, status).Scan(&count)
-        if err != nil {
-                return 0, fmt.Errorf("count files by status %q: %w", status, err)
-        }
-        return count, nil
+	var count int64
+	err := r.db.QueryRow(`SELECT COUNT(*) FROM files WHERE status = ?`, status).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count files by status %q: %w", status, err)
+	}
+	return count, nil
 }
 
 // TotalSizeByStatus returns the sum of file sizes for all records with the given status.
 // Returns 0 if no records match.
 func (r *FileRepository) TotalSizeByStatus(status models.FileStatus) (int64, error) {
-        var total sql.NullInt64
-        err := r.db.QueryRow(`SELECT SUM(size) FROM files WHERE status = ?`, status).Scan(&total)
-        if err != nil {
-                return 0, fmt.Errorf("total size by status %q: %w", status, err)
-        }
-        if !total.Valid {
-                return 0, nil
-        }
-        return total.Int64, nil
+	var total sql.NullInt64
+	err := r.db.QueryRow(`SELECT SUM(size) FROM files WHERE status = ?`, status).Scan(&total)
+	if err != nil {
+		return 0, fmt.Errorf("total size by status %q: %w", status, err)
+	}
+	if !total.Valid {
+		return 0, nil
+	}
+	return total.Int64, nil
 }
 
 // CountBackedUp returns the number of distinct file IDs that have at least one
 // entry in backup_files (i.e. their content has been uploaded to OSS).
 func (r *FileRepository) CountBackedUp() (int64, error) {
-        var count int64
-        err := r.db.QueryRow(`SELECT COUNT(DISTINCT file_id) FROM backup_files`).Scan(&count)
-        if err != nil {
-                return 0, fmt.Errorf("count backed up files: %w", err)
-        }
-        return count, nil
+	var count int64
+	err := r.db.QueryRow(`SELECT COUNT(DISTINCT file_id) FROM backup_files`).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count backed up files: %w", err)
+	}
+	return count, nil
 }
 
 // ListActiveByDirectory retrieves all active file records whose path starts with
@@ -282,8 +382,7 @@ func (r *FileRepository) CountBackedUp() (int64, error) {
 func (r *FileRepository) ListActiveByDirectory(dirPath string) ([]*models.FileRecord, error) {
 	pattern := dirPath + "/%"
 	rows, err := r.db.Query(`
-		SELECT id, path, size, mod_time, hash, status, backup_id, inode, created_at, updated_at
-		FROM files WHERE path LIKE ? AND status = 'active'
+		SELECT `+fileColumns+` FROM files WHERE path LIKE ? AND status = 'active'
 		ORDER BY path
 	`, pattern)
 	if err != nil {
@@ -307,11 +406,7 @@ func (r *FileRepository) ListActiveByDirectory(dirPath string) ([]*models.FileRe
 
 // ListActiveByBackup retrieves active file records that are part of a specific
 // backup session. If dirPath is non-empty, results are additionally filtered to
-// files whose path starts with dirPath. This joins backup_files with files so
-// that only files actually contained in the given backup are returned — the
-// previous implementation ignored backupID entirely and could return files that
-// were never in the targeted backup, causing spurious "no backup file record
-// found" errors during restore.
+// files whose path starts with dirPath.
 func (r *FileRepository) ListActiveByBackup(backupID int64, dirPath string) ([]*models.FileRecord, error) {
 	var (
 		query string
@@ -319,7 +414,7 @@ func (r *FileRepository) ListActiveByBackup(backupID int64, dirPath string) ([]*
 	)
 	if dirPath != "" {
 		query = `
-			SELECT f.id, f.path, f.size, f.mod_time, f.hash, f.status, f.backup_id, f.inode, f.created_at, f.updated_at
+			SELECT f.` + fileColumns + `
 			FROM files f
 			INNER JOIN backup_files bf ON bf.file_id = f.id
 			WHERE bf.backup_id = ? AND f.status = 'active' AND f.path LIKE ?
@@ -328,7 +423,7 @@ func (r *FileRepository) ListActiveByBackup(backupID int64, dirPath string) ([]*
 		args = append(args, backupID, dirPath+"/%")
 	} else {
 		query = `
-			SELECT f.id, f.path, f.size, f.mod_time, f.hash, f.status, f.backup_id, f.inode, f.created_at, f.updated_at
+			SELECT f.` + fileColumns + `
 			FROM files f
 			INNER JOIN backup_files bf ON bf.file_id = f.id
 			WHERE bf.backup_id = ? AND f.status = 'active'
@@ -377,12 +472,12 @@ func (r *FileRepository) SearchActiveFiles(params SearchActiveFilesParams) ([]*m
 	)
 
 	if params.BackupID != nil {
-		selectClause = `SELECT f.id, f.path, f.size, f.mod_time, f.hash, f.status, f.backup_id, f.inode, f.created_at, f.updated_at FROM files f INNER JOIN backup_files bf ON bf.file_id = f.id`
+		selectClause = `SELECT f.` + fileColumns + ` FROM files f INNER JOIN backup_files bf ON bf.file_id = f.id`
 		countClause = `SELECT COUNT(*) FROM files f INNER JOIN backup_files bf ON bf.file_id = f.id`
 		whereClause += " AND bf.backup_id = ? AND f.status = 'active'"
 		args = append(args, *params.BackupID)
 	} else {
-		selectClause = `SELECT id, path, size, mod_time, hash, status, backup_id, inode, created_at, updated_at FROM files`
+		selectClause = `SELECT ` + fileColumns + ` FROM files`
 		countClause = `SELECT COUNT(*) FROM files`
 		whereClause += " AND status = 'active'"
 	}
@@ -434,72 +529,69 @@ func (r *FileRepository) SearchActiveFiles(params SearchActiveFilesParams) ([]*m
 // ListAllPaths returns all file paths in the database, used for comparing
 // against scan results to detect deleted files.
 func (r *FileRepository) ListAllPaths() ([]string, error) {
-        rows, err := r.db.Query(`SELECT path FROM files ORDER BY path`)
-        if err != nil {
-                return nil, fmt.Errorf("list all paths: %w", err)
-        }
-        defer rows.Close()
+	rows, err := r.db.Query(`SELECT path FROM files ORDER BY path`)
+	if err != nil {
+		return nil, fmt.Errorf("list all paths: %w", err)
+	}
+	defer rows.Close()
 
-        var paths []string
-        for rows.Next() {
-                var p string
-                if err := rows.Scan(&p); err != nil {
-                        return nil, fmt.Errorf("scan path row: %w", err)
-                }
-                paths = append(paths, p)
-        }
-        if err := rows.Err(); err != nil {
-                return nil, fmt.Errorf("iterate all paths: %w", err)
-        }
-        return paths, nil
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, fmt.Errorf("scan path row: %w", err)
+		}
+		paths = append(paths, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate all paths: %w", err)
+	}
+	return paths, nil
 }
 
 // GetByID retrieves a file record by its primary key ID.
 // Returns nil without error if no record is found.
 func (r *FileRepository) GetByID(id int64) (*models.FileRecord, error) {
-        row := r.db.QueryRow(`
-                SELECT id, path, size, mod_time, hash, status, backup_id, inode, created_at, updated_at
-                FROM files WHERE id = ?
-        `, id)
-        rec, err := scanFileRecord(row)
-        if err != nil {
-                if err == sql.ErrNoRows {
-                        return nil, nil
-                }
-                return nil, fmt.Errorf("get file by id %d: %w", id, err)
-        }
-        return rec, nil
+	row := r.db.QueryRow(`
+		SELECT `+fileColumns+` FROM files WHERE id = ?
+	`, id)
+	rec, err := scanFileRecord(row)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get file by id %d: %w", id, err)
+	}
+	return rec, nil
 }
 
 // CountActiveByHash returns a map of hash → count of active files referencing
-// that hash. Used by the reconciler to rebuild ref_count for hash_index: the
-// expected ref_count for a hash equals the number of active files with that hash.
-// Hashes with empty hash value are excluded.
+// that hash. Used by the reconciler to rebuild ref_count for hash_index.
 func (r *FileRepository) CountActiveByHash() (map[string]int, error) {
-        rows, err := r.db.Query(`
-                SELECT hash, COUNT(*) AS cnt
-                FROM files
-                WHERE status = 'active' AND hash <> ''
-                GROUP BY hash
-        `)
-        if err != nil {
-                return nil, fmt.Errorf("count active files by hash: %w", err)
-        }
-        defer rows.Close()
+	rows, err := r.db.Query(`
+		SELECT hash, COUNT(*) AS cnt
+		FROM files
+		WHERE status = 'active' AND hash <> ''
+		GROUP BY hash
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("count active files by hash: %w", err)
+	}
+	defer rows.Close()
 
-        result := make(map[string]int)
-        for rows.Next() {
-                var (
-                        hash string
-                        cnt  int
-                )
-                if err := rows.Scan(&hash, &cnt); err != nil {
-                        return nil, fmt.Errorf("scan count by hash row: %w", err)
-                }
-                result[hash] = cnt
-        }
-        if err := rows.Err(); err != nil {
-                return nil, fmt.Errorf("iterate count by hash: %w", err)
-        }
-        return result, nil
+	result := make(map[string]int)
+	for rows.Next() {
+		var (
+			hash string
+			cnt  int
+		)
+		if err := rows.Scan(&hash, &cnt); err != nil {
+			return nil, fmt.Errorf("scan count by hash row: %w", err)
+		}
+		result[hash] = cnt
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate count by hash: %w", err)
+	}
+	return result, nil
 }

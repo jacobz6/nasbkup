@@ -81,55 +81,6 @@ type ReconcileReport struct {
 	FailedBackupsWithFiles     []BackupStatusFix `json:"failed_backups_with_files"`
 	CompletedBackupsNoFiles    []BackupStatusFix `json:"completed_backups_no_files"`
 
-	// ── Bootstrap-from-OSS auto-recovery ──
-	// When the local database is completely empty (no hash_index rows and no
-	// backup_files rows) but OSS meta/db/ contains encrypted DB snapshots
-	// produced by another instance, reconcile can perform an in-place database
-	// bootstrap (restore the latest snapshot) instead of deleting every OSS-only
-	// orphan). This is the "one-button sync everything from OSS" workflow
-	// (including the metadata DB itself) behavior requested by the operator.
-	//
-	// BootstrapAvailable indicates the reconcile detected this scenario during
-	// dry-run or apply. If true, clicking "执行修复" will run the
-	// bootstrap instead of the normal fix pass.
-	BootstrapAvailable bool `json:"bootstrap_available"`
-	// BootstrapVersion is the snapshot version (e.g.
-	// "meta/db/nas-backup-20260802-143045.db") that will be / was used.
-	BootstrapVersion string `json:"bootstrap_version,omitempty"`
-	// BootstrapApplied is true when reconcile-apply successfully replaced the local
-	// DB from the OSS snapshot. When true NeedRestart will also be true
-	// because a process restart is required before SQLite reloads the new file.
-	BootstrapApplied bool `json:"bootstrap_applied"`
-	// BootstrapTargetPath is the on-disk path the restored DB was written to
-	// (typically config.Database.Path).
-	BootstrapTargetPath string `json:"bootstrap_target_path,omitempty"`
-	// BootstrapThawRequired is true when the OSS DB snapshot is in an archived
-	// storage class (GLACIER/Archive/ColdArchive) and must be thawed before
-	// it can be downloaded. This adds a wait of 1-10 hours for Archive tier
-	// (or minutes for ColdArchive) — too long for a single reconcile call.
-	BootstrapThawRequired bool `json:"bootstrap_thaw_required"`
-	// BootstrapThawSubmitted is true when reconcile-apply detected an archived
-	// snapshot and submitted a restore (thaw) request to OSS. The user should
-	// wait for thaw to complete and then run reconcile again to actually
-	// bootstrap the database. When BootstrapThawSubmitted == true,
-	// BootstrapApplied and NeedRestart will be false.
-	BootstrapThawSubmitted bool `json:"bootstrap_thaw_submitted"`
-	// BootstrapThawKey is the OSS key whose thaw was submitted, so the user
-	// knows which object is being thawed.
-	BootstrapThawKey string `json:"bootstrap_thaw_key,omitempty"`
-	// BootstrapThawETA is a human-readable estimate of how long thawing
-	// typically takes for the detected storage class ("1-10 小时" for Archive,
-	// "5 分钟" for ColdArchive).
-	BootstrapThawETA string `json:"bootstrap_thaw_eta,omitempty"`
-	// NeedRestart instructs the caller (HTTP handler / frontend) that the
-	// backend must be restarted before changes take full effect. Currently only set when
-	// BootstrapApplied == true (SQLite process-locks the DB file and cannot
-	// hot-reload the new content).
-	NeedRestart bool `json:"need_restart"`
-	// RestartDelaySeconds is a client hint: the UI should block the user for
-	// this many seconds before attempting to reconnect.
-	RestartDelaySeconds int `json:"restart_delay_seconds,omitempty"`
-
 	// Summary of applied / skipped fixes
 	AppliedFixes []string `json:"applied_fixes"`
 	SkippedFixes []string `json:"skipped_fixes"` // skipped due to dry-run
@@ -192,140 +143,6 @@ func (e *Engine) Reconcile(ctx context.Context, dryRun bool) (*ReconcileReport, 
 	}
 
 	e.logger.Info("starting reconciliation", "dry_run", dryRun)
-
-	// ── Step 0: fast-path — bootstrap-from-OSS scenario ────────────────
-	// If the local DB is completely empty and meta/db/ has snapshots from
-	// another environment, the user's intent is almost certainly "sync the
-	// metadata from OSS so I can see the backups", not "delete every OSS
-	// object that my empty DB doesn't know about". Detect this scenario up
-	// front and short-circuit all later steps so the report surface area
-	// stays focused on bootstrap actions.
-	{
-		hashCount, hErr := e.db.HashRepo.CountAll()
-		bfCount, bfErr := e.db.BackupRepo.CountAllBackupFiles()
-		localEmpty := hErr == nil && hashCount == 0 && bfErr == nil && bfCount == 0
-		if localEmpty {
-			dbBackupSvc := e.getDBBackupSvc()
-			if dbBackupSvc == nil {
-				// No storage/encryptor available → cannot run bootstrap path.
-				// Fall through to the normal reconcile flow, which will simply
-				// report "everything's inconsistent" — the user will figure out
-				// they need OSS configured before they can sync anything.
-			} else {
-				versions, vErr := dbBackupSvc.ListVersions(ctx)
-				if vErr == nil && len(versions) > 0 {
-					version := versions[0]
-					report.BootstrapAvailable = true
-					report.BootstrapVersion = version
-
-					// Check if the snapshot is in an archived storage class that
-					// requires thawing before download. Thawing takes 1-10 hours
-					// for Archive tier, so we split bootstrap into two phases:
-					// Phase 1: submit thaw request and return immediately.
-					// Phase 2: re-run reconcile after thaw completes to actually
-					// download and bootstrap.
-					encKey := fmt.Sprintf("%s.enc", version)
-					restored, checkErr := e.storage.CheckRestored(encKey)
-					if checkErr != nil {
-						e.logger.Info("bootstrap: could not check thaw status, will try direct bootstrap",
-							"key", encKey, "error", checkErr)
-					}
-
-					if checkErr == nil && !restored {
-						// Object needs thawing. Submit restore request and bail
-						// out — the user must re-run reconcile after thaw.
-						if dryRun {
-							report.BootstrapThawRequired = true
-							report.BootstrapThawKey = encKey
-							report.BootstrapThawETA = "1-10 小时"
-							report.AppliedFixes = append(report.AppliedFixes,
-								"检测到数据库快照位于归档存储（GLACIER），执行修复时将自动发起解冻请求。解冻完成后（约 1-10 小时），请再次点击「执行修复」完成数据库同步。")
-							report.SkippedFixes = append(report.SkippedFixes,
-								fmt.Sprintf("将发起解冻请求（对象 %s），解冻完成后再执行bootstrap", encKey))
-							e.logger.Info("reconcile: bootstrap thaw needed (dry-run)",
-								"key", encKey)
-							return report, nil
-						}
-						// apply: submit thaw request, return immediately
-						if thawErr := e.storage.RestoreObject(encKey, false); thawErr != nil {
-							errMsg := thawErr.Error()
-							if strings.Contains(errMsg, "RestoreAlreadyInProgress") ||
-								strings.Contains(errMsg, "OK") {
-								// Already thawing — good, proceed with Phase 1 return.
-							} else if strings.Contains(errMsg, "OperationNotSupported") ||
-								strings.Contains(errMsg, "InvalidObjectState") {
-								// Not archived — should be downloadable now.
-								restored = true
-								e.logger.Info("bootstrap: object not archived, proceeding",
-									"key", encKey)
-							} else {
-								report.Errors = append(report.Errors,
-									fmt.Sprintf("发起解冻请求失败：%v", thawErr))
-								e.logger.Error("reconcile: bootstrap thaw submit failed",
-									"key", encKey, "error", thawErr)
-								return report, fmt.Errorf("initiate restore: %w", thawErr)
-							}
-						}
-						if !restored {
-							// Thaw submitted successfully. Return with thaw info.
-							report.BootstrapThawRequired = true
-							report.BootstrapThawSubmitted = true
-							report.BootstrapThawKey = encKey
-							report.BootstrapThawETA = "1-10 小时"
-							report.AppliedFixes = append(report.AppliedFixes,
-								fmt.Sprintf("已为数据库快照 %s 发起解冻请求。解冻完成后（约 1-10 小时），请再次点击「执行修复」完成数据库同步。", encKey))
-							e.logger.Info("reconcile: bootstrap thaw submitted",
-								"key", encKey)
-							return report, nil
-						}
-						// restored == true: fall through to Bootstrap() below
-					}
-
-					// Either object is already thawed, or not archived.
-					// Proceed with bootstrap.
-					msg := fmt.Sprintf(
-						"检测到本地数据库为空，但OSS meta/db/ 下有 %d 个数据库快照（最新：%s）。"+
-							"点击“执行修复”将自动下载最新快照并替换本地库，完成后系统会自动重启以加载新数据库。",
-						len(versions), version,
-					)
-					report.AppliedFixes = append(report.AppliedFixes, msg)
-					if dryRun {
-						report.SkippedFixes = append(report.SkippedFixes,
-							fmt.Sprintf("将执行数据库bootstrap：使用版本 %s，目标路径 %s",
-								version, e.config.Database.Path))
-						e.logger.Info("reconcile: bootstrap scenario detected (dry-run)",
-							"version", version)
-						return report, nil
-					}
-					// apply mode → perform bootstrap, mark NeedRestart, and skip
-					// the normal reconcile pass (DB content will change under us).
-					target := e.config.Database.Path
-					if target == "" {
-						target = "./data/nas-backup.db"
-					}
-					if err := dbBackupSvc.Bootstrap(ctx, "", target); err != nil {
-						msg := fmt.Sprintf("bootstrap failed (version=%s target=%s): %v",
-							version, target, err)
-						report.Errors = append(report.Errors, msg)
-						e.logger.Error("reconcile: bootstrap failed",
-							"version", version, "target", target, "error", err)
-						return report, fmt.Errorf("%s", msg)
-					}
-					report.BootstrapApplied = true
-					report.BootstrapTargetPath = target
-					report.NeedRestart = true
-					report.RestartDelaySeconds = 5
-					report.AppliedFixes = append(report.AppliedFixes,
-						fmt.Sprintf("已成功从OSS恢复数据库（版本 %s → %s），系统即将重启加载新数据库",
-							version, target),
-					)
-					e.logger.Info("reconcile: bootstrap applied",
-						"version", version, "target", target)
-					return report, nil
-				}
-			}
-		}
-	}
 
 	// ── Step 1: gather all three sources ────────────────────────────────
 	if err := e.reconcileGatherAndCompare(ctx, report); err != nil {
@@ -642,9 +459,8 @@ func (e *Engine) reconcileBackupStatus(ctx context.Context, report *ReconcileRep
 		}
 	}
 
-	// Completed FULL backups with no backup_files → candidate for failed.
-	// (Incremental backups with 0 files are normal — no changes since last backup —
-	// and are excluded by ListCompletedBackupsWithoutFiles.)
+	// Completed backups with no backup_files → candidate for failed.
+	// A backup that reports completion but uploaded 0 files is suspicious.
 	completedNoFiles, err := e.db.BackupRepo.ListCompletedBackupsWithoutFiles()
 	if err != nil {
 		err = fmt.Errorf("list completed backups without files: %w", err)
@@ -656,7 +472,7 @@ func (e *Engine) reconcileBackupStatus(ctx context.Context, report *ReconcileRep
 			BackupID: b.ID,
 			From:     models.BackupStatusCompleted,
 			To:       models.BackupStatusFailed,
-			Reason:   "full backup marked completed but has no backup_files rows",
+			Reason:   "backup marked completed but has no backup_files rows",
 		})
 	}
 	return nil
@@ -691,7 +507,7 @@ func (e *Engine) reconcileApplyFixes(ctx context.Context, report *ReconcileRepor
 				"reconcile apply aborted: database is empty (hash_index=0, backup_files=0) "+
 					"but would delete %d OSS objects (OSSOnlyOrphans). This looks like an "+
 					"uninitialized instance pointing at a bucket that already has backups. "+
-					"Run ./restore-cli -config config.yaml bootstrap first to restore the database, "+
+					"Restart the service so it pulls the authoritative oss.db from OSS first, "+
 					"or manually inspect OSSOnlyOrphans in the dry-run report.",
 				len(report.OSSOnlyOrphans),
 			)

@@ -15,16 +15,6 @@ func TestFileStatusConstants(t *testing.T) {
 	}
 }
 
-// TestBackupTypeConstants 测试 BackupType 常量值
-func TestBackupTypeConstants(t *testing.T) {
-	if BackupTypeFull != "full" {
-		t.Errorf("expected BackupTypeFull %q, got %q", "full", BackupTypeFull)
-	}
-	if BackupTypeIncremental != "incremental" {
-		t.Errorf("expected BackupTypeIncremental %q, got %q", "incremental", BackupTypeIncremental)
-	}
-}
-
 // TestBackupStatusConstants 测试 BackupStatus 常量值
 func TestBackupStatusConstants(t *testing.T) {
 	if BackupStatusPending != "pending" {
@@ -97,14 +87,12 @@ func TestBackupRecord(t *testing.T) {
 	now := time.Now()
 	rec := BackupRecord{
 		ID:             1,
-		Type:           BackupTypeFull,
 		Status:         BackupStatusCompleted,
-		BaseBackupID:   nil,
 		TotalFiles:     500,
 		TotalSize:      1024 * 1024 * 100,
 		UploadedSize:   1024 * 1024 * 80,
 		SkippedByDedup: 200,
-		SkippedByInc:   100,
+		FailedFiles:    5,
 		CompressSaved:  1024 * 1024 * 50,
 		StartedAt:      &now,
 		CompletedAt:    &now,
@@ -115,9 +103,6 @@ func TestBackupRecord(t *testing.T) {
 	if rec.ID != 1 {
 		t.Errorf("expected ID 1, got %d", rec.ID)
 	}
-	if rec.Type != BackupTypeFull {
-		t.Errorf("expected Type Full, got %q", rec.Type)
-	}
 	if rec.Status != BackupStatusCompleted {
 		t.Errorf("expected Status Completed, got %q", rec.Status)
 	}
@@ -126,6 +111,9 @@ func TestBackupRecord(t *testing.T) {
 	}
 	if rec.SkippedByDedup != 200 {
 		t.Errorf("expected SkippedByDedup 200, got %d", rec.SkippedByDedup)
+	}
+	if rec.FailedFiles != 5 {
+		t.Errorf("expected FailedFiles 5, got %d", rec.FailedFiles)
 	}
 }
 
@@ -401,20 +389,19 @@ func TestUploadConfig(t *testing.T) {
 // TestRetentionConfig 测试 RetentionConfig 结构体
 func TestRetentionConfig(t *testing.T) {
 	cfg := RetentionConfig{
-		VersionKeepCount:  3,
-		OrphanGraceDays:   180,
-		FullResetInterval: 6,
-		KeepDeletedDays:   90,
+		OrphanGraceDays: 180,
+		KeepDeletedDays: 90,
+		DBBkupKeepCount: 5,
 	}
 
-	if cfg.VersionKeepCount != 3 {
-		t.Errorf("expected VersionKeepCount 3, got %d", cfg.VersionKeepCount)
-	}
 	if cfg.OrphanGraceDays != 180 {
 		t.Errorf("expected OrphanGraceDays 180, got %d", cfg.OrphanGraceDays)
 	}
-	if cfg.FullResetInterval != 6 {
-		t.Errorf("expected FullResetInterval 6, got %d", cfg.FullResetInterval)
+	if cfg.KeepDeletedDays != 90 {
+		t.Errorf("expected KeepDeletedDays 90, got %d", cfg.KeepDeletedDays)
+	}
+	if cfg.DBBkupKeepCount != 5 {
+		t.Errorf("expected DBBkupKeepCount 5, got %d", cfg.DBBkupKeepCount)
 	}
 }
 
@@ -447,7 +434,7 @@ func TestStrategyConfig(t *testing.T) {
 			StorageClass: "ColdArchive",
 		},
 		Retention: RetentionConfig{
-			VersionKeepCount: 1,
+			DBBkupKeepCount: 5,
 		},
 		Encryption: EncryptionConfig{
 			Algorithm: "AES-256-GCM",
@@ -503,11 +490,11 @@ func TestLogListResult(t *testing.T) {
 // TestBackupTriggerRequest 测试 BackupTriggerRequest 结构体
 func TestBackupTriggerRequest(t *testing.T) {
 	req := BackupTriggerRequest{
-		Type: BackupTypeFull,
+		Type: "full",
 	}
 
-	if req.Type != BackupTypeFull {
-		t.Errorf("expected Type Full, got %q", req.Type)
+	if req.Type != "full" {
+		t.Errorf("expected Type %q, got %q", "full", req.Type)
 	}
 }
 

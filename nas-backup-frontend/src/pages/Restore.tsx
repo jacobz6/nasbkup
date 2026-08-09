@@ -6,7 +6,6 @@ import {
 } from 'lucide-react';
 import {
   restoreApi,
-  reconcileApi,
   type RestorableFile,
   type RestoreJobRecord,
 } from '@/utils/api';
@@ -193,12 +192,12 @@ export function Restore() {
   const [selectedSize, setSelectedSize] = useState(0);
 
   // ── Restore config ───────────────────────────────────────────────
-  // NOTE: Output path selection was removed by design — restore always
-  // targets the file's original path as recorded in the backup DB.
-  // Users do NOT get to choose / customise the restore destination.
-  // NOTE: Backup version selection was removed — the system always restores
-  // from the latest backup. This is a disaster recovery system, not a
-  // version management tool.
+  // The restore destination defaults to each file's original path (as
+  // recorded in the backup DB), but the user may override it with a custom
+  // target directory. Backup version selection is not supported — the system
+  // always restores from the latest backup (disaster recovery, not versioning).
+  const [restoreMode, setRestoreMode] = useState<'original' | 'custom'>('original');
+  const [outputDir, setOutputDir] = useState('');
   const [conflictStrategy, setConflictStrategy] = useState<'skip' | 'overwrite' | 'rename'>('skip');
   const [expedited, setExpedited] = useState(false);
   const [restoring, setRestoring] = useState(false);
@@ -344,12 +343,16 @@ export function Restore() {
       return;
     }
 
-    // Always restore to the original path as recorded in the backup DB.
-    // No user selection of target path or backup version is allowed.
+    const toOriginal = restoreMode === 'original';
+    if (!toOriginal && !outputDir.trim()) {
+      addToast({ type: 'error', message: '请填写自定义目标目录' });
+      return;
+    }
+
     const data = {
       paths: selectedPaths,
-      output_dir: '',
-      restore_to_original: true,
+      output_dir: toOriginal ? '' : outputDir.trim(),
+      restore_to_original: toOriginal,
       conflict_strategy: conflictStrategy,
       expedited,
     };
@@ -376,13 +379,17 @@ export function Restore() {
 
   // ── Full restore (all files) ─────────────────────────────────────
   const handleFullRestore = async () => {
-    // Always restore to the original path as recorded in the backup DB.
-    // No user selection of target path or backup version is allowed.
+    const toOriginal = restoreMode === 'original';
+    if (!toOriginal && !outputDir.trim()) {
+      addToast({ type: 'error', message: '请填写自定义目标目录' });
+      return;
+    }
+
     const data = {
       paths: [],
       pattern: '*',
-      output_dir: '',
-      restore_to_original: true,
+      output_dir: toOriginal ? '' : outputDir.trim(),
+      restore_to_original: toOriginal,
       conflict_strategy: conflictStrategy,
       expedited,
     };
@@ -428,14 +435,9 @@ export function Restore() {
   const handleRefreshOSS = async () => {
     setRefreshing(true);
     try {
-      const res = await reconcileApi.run(false);
-      if (res.success) {
-        const report = res.data;
-        const fixCount = report?.applied_fixes?.length ?? 0;
-        addToast({
-          type: 'success',
-          message: `OSS状态同步完成${fixCount > 0 ? `，修复了 ${fixCount} 项不一致` : ''}`,
-        });
+      const res = await restoreApi.refreshOssDb();
+      if (res.success && res.data) {
+        addToast({ type: 'success', message: res.data.message });
         await fetchFiles(1);
         await fetchJobs(1);
       } else {
@@ -847,13 +849,26 @@ export function Restore() {
             </h3>
 
             <div className="space-y-4">
-              {/* Restore destination notice */}
-              <div className="flex items-start gap-2 bg-brand-500/10 border border-brand-500/20 rounded-lg p-3">
-                <Info size={14} className="shrink-0 mt-0.5 text-brand-400" />
-                <div className="text-xs text-slate-300 leading-relaxed">
-                  文件将恢复到其<strong className="text-white">备份时的原始路径</strong>（DB 中记录的
-                  <span className="font-mono text-brand-300"> files.path </span>），不可自定义目标目录。
-                </div>
+              {/* Restore destination */}
+              <div>
+                <label className="block text-sm text-slate-400 mb-1.5">恢复目标</label>
+                <select
+                  value={restoreMode}
+                  onChange={(e) => setRestoreMode(e.target.value as 'original' | 'custom')}
+                  className="input-field text-sm"
+                >
+                  <option value="original">原始路径（备份时记录的 files.path）</option>
+                  <option value="custom">自定义目录</option>
+                </select>
+                {restoreMode === 'custom' && (
+                  <input
+                    type="text"
+                    value={outputDir}
+                    onChange={(e) => setOutputDir(e.target.value)}
+                    placeholder="例如：/tmp/restored"
+                    className="input-field text-sm mt-2"
+                  />
+                )}
               </div>
 
               {/* Conflict strategy */}

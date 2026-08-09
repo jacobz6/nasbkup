@@ -18,15 +18,11 @@ import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { LoadingSkeleton, CardSkeleton } from '@/components/shared/LoadingSkeleton';
 import { useAppStore } from '@/store/useAppStore';
 import { formatFileSize, formatDateTime, formatRelativeTime } from '@/utils/format';
-import { BACKUP_TYPE_MAP, STORAGE_CLASS_MAP } from '@/utils/constants';
+import { STORAGE_CLASS_MAP } from '@/utils/constants';
 import { usePolling } from '@/hooks/usePolling';
 
 const historyColumns: Column<BackupRecord>[] = [
   { key: 'id', header: 'ID', className: 'font-mono' },
-  { key: 'type', header: '类型', render: (r) => {
-    const t = BACKUP_TYPE_MAP[r.type];
-    return <span className={t?.color || 'text-slate-400'}>{t?.label || r.type}</span>;
-  }},
   { key: 'status', header: '状态', render: (r) => <StatusBadge status={r.status} pulse /> },
   { key: 'total_files', header: '文件数' },
   { key: 'total_size', header: '大小', render: (r) => formatFileSize(r.total_size) },

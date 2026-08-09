@@ -34,7 +34,7 @@ func TestNewScheduler(t *testing.T) {
 				Timezone: "Asia/Shanghai",
 			},
 			Retention: config.RetentionConfig{
-				FullResetInterval: 12,
+				DBBkupKeepCount: 5,
 			},
 		},
 	}
@@ -291,7 +291,7 @@ func TestBackupHistoryCreateAndGet(t *testing.T) {
 	database, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	id, err := database.BackupRepo.Create(models.BackupTypeIncremental, nil)
+	id, err := database.BackupRepo.Create()
 	if err != nil {
 		t.Fatalf("Create failed: %v", err)
 	}
@@ -314,9 +314,6 @@ func TestBackupHistoryCreateAndGet(t *testing.T) {
 	if rec.ID != id {
 		t.Errorf("expected ID %d, got %d", id, rec.ID)
 	}
-	if rec.Type != models.BackupTypeIncremental {
-		t.Errorf("expected Type Incremental, got %q", rec.Type)
-	}
 }
 
 func TestBackupHistoryList(t *testing.T) {
@@ -324,7 +321,7 @@ func TestBackupHistoryList(t *testing.T) {
 	defer cleanup()
 
 	for i := 0; i < 5; i++ {
-		_, err := database.BackupRepo.Create(models.BackupTypeFull, nil)
+		_, err := database.BackupRepo.Create()
 		if err != nil {
 			t.Fatalf("Create record %d failed: %v", i, err)
 		}
@@ -339,48 +336,11 @@ func TestBackupHistoryList(t *testing.T) {
 	}
 }
 
-func TestGetLatestFullBackup(t *testing.T) {
-	database, cleanup := setupTestDB(t)
-	defer cleanup()
-
-	// 无记录时应返回 nil
-	latest, err := database.BackupRepo.GetLatestFull()
-	if err != nil {
-		t.Logf("GetLatestFull returned error (expected): %v", err)
-	}
-	if latest != nil {
-		t.Error("expected no latest full backup")
-	}
-
-	// 插入全量备份并完成它
-	id, err := database.BackupRepo.Create(models.BackupTypeFull, nil)
-	if err != nil {
-		t.Fatalf("Create failed: %v", err)
-	}
-	if err := database.BackupRepo.UpdateStatus(id, models.BackupStatusRunning, ""); err != nil {
-		t.Fatalf("UpdateStatus to running failed: %v", err)
-	}
-	if err := database.BackupRepo.UpdateStatus(id, models.BackupStatusCompleted, ""); err != nil {
-		t.Fatalf("UpdateStatus to completed failed: %v", err)
-	}
-
-	latest, err = database.BackupRepo.GetLatestFull()
-	if err != nil {
-		t.Fatalf("GetLatestFull failed: %v", err)
-	}
-	if latest == nil {
-		t.Fatal("expected latest full backup")
-	}
-	if latest.Type != models.BackupTypeFull {
-		t.Errorf("expected Type Full, got %q", latest.Type)
-	}
-}
-
 func TestBackupRepoUpdate(t *testing.T) {
 	database, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	id, _ := database.BackupRepo.Create(models.BackupTypeFull, nil)
+	id, _ := database.BackupRepo.Create()
 
 	// 更新状态
 	err := database.BackupRepo.UpdateStatus(id, models.BackupStatusRunning, "")
@@ -443,19 +403,21 @@ func TestConfigToModelsRetentionConfig(t *testing.T) {
 	cfg := &config.AppConfig{
 		Backup: config.BackupConfig{
 			Retention: config.RetentionConfig{
-				VersionKeepCount:  5,
-				OrphanGraceDays:   120,
-				FullResetInterval: 9,
-				KeepDeletedDays:   60,
+				OrphanGraceDays: 120,
+				KeepDeletedDays: 60,
+				DBBkupKeepCount: 5,
 			},
 		},
 	}
 
 	mc := cfg.ToModelsRetentionConfig()
-	if mc.VersionKeepCount != 5 {
-		t.Errorf("expected VersionKeepCount 5, got %d", mc.VersionKeepCount)
-	}
 	if mc.OrphanGraceDays != 120 {
 		t.Errorf("expected OrphanGraceDays 120, got %d", mc.OrphanGraceDays)
+	}
+	if mc.KeepDeletedDays != 60 {
+		t.Errorf("expected KeepDeletedDays 60, got %d", mc.KeepDeletedDays)
+	}
+	if mc.DBBkupKeepCount != 5 {
+		t.Errorf("expected DBBkupKeepCount 5, got %d", mc.DBBkupKeepCount)
 	}
 }

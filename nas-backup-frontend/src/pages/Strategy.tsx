@@ -131,9 +131,8 @@ export function Strategy() {
             <button className="btn-primary flex items-center gap-1 text-sm" onClick={() => save(() => strategyApi.updateRetention(retention), '保留策略')}><Save size={14} />保存</button>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-            <label className="space-y-1"><span className="text-sm text-slate-400">版本保留数 <span className="text-slate-600">(1=仅最新)</span></span><input type="number" className="input-field" value={retention.version_keep_count} onChange={e => setRetention(d => ({ ...d, version_keep_count: +e.target.value }))} /></label>
+            <label className="space-y-1"><span className="text-sm text-slate-400">OSS DB 备份保留数</span><input type="number" className="input-field" value={retention.db_bkup_keep_count} onChange={e => setRetention(d => ({ ...d, db_bkup_keep_count: +e.target.value }))} /></label>
             <label className="space-y-1"><span className="text-sm text-slate-400">孤儿数据清理天数</span><input type="number" className="input-field" value={retention.orphan_grace_days} onChange={e => setRetention(d => ({ ...d, orphan_grace_days: +e.target.value }))} /></label>
-            <label className="space-y-1"><span className="text-sm text-slate-400">全量备份间隔(月)</span><input type="number" className="input-field" value={retention.full_reset_interval} onChange={e => setRetention(d => ({ ...d, full_reset_interval: +e.target.value }))} /></label>
             <label className="space-y-1"><span className="text-sm text-slate-400">已删除文件保留天数</span><input type="number" className="input-field" value={retention.keep_deleted_days} onChange={e => setRetention(d => ({ ...d, keep_deleted_days: +e.target.value }))} /></label>
           </div>
         </div>

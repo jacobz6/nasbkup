@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -363,7 +362,7 @@ func (r *Router) handleReconcile(w http.ResponseWriter, req *http.Request) {
 		msg = fmt.Sprintf("reconcile completed: %d fixes applied", len(report.AppliedFixes))
 	}
 	_ = r.db.LogRepo.Insert(nil, level, msg,
-		fmt.Sprintf("oss_orphans=%d dangling_ref0=%d dangling_refn=%d orphan_bf=%d ref_mismatch=%d failed_with_files=%d completed_no_files=%d errors=%d bootstrap=%t restart=%t",
+		fmt.Sprintf("oss_orphans=%d dangling_ref0=%d dangling_refn=%d orphan_bf=%d ref_mismatch=%d failed_with_files=%d completed_no_files=%d errors=%d",
 			len(report.OSSOnlyOrphans),
 			len(report.DanglingHashIndexesRefZero),
 			len(report.DanglingHashIndexesRefNonZero),
@@ -372,38 +371,9 @@ func (r *Router) handleReconcile(w http.ResponseWriter, req *http.Request) {
 			len(report.FailedBackupsWithFiles),
 			len(report.CompletedBackupsNoFiles),
 			len(report.Errors),
-			report.BootstrapApplied,
-			report.NeedRestart,
 		))
 
 	r.jsonResponse(w, report, http.StatusOK)
-
-	// If the reconcile pass swapped in a freshly-bootstrapped DB, SQLite will
-	// not pick up the new file because the open *sql.DB handle keeps a fd to
-	// the old (now-replaced) file. Instead of trying to hot-reload (which is
-	// racy, would break in-flight prepared statements, and forces us to
-	// rebuild every repo/svc instance), do a clean process exit — systemd /
-	// docker / manual runners all restart us promptly, and the UI shows a
-	// "服务正在重启" banner per report.RestartDelaySeconds.
-	//
-	// The goroutine deliberately outlives this request handler: the
-	// ResponseWriter has already been flushed (jsonResponse wrote status+body
-	// above), so the HTTP client will see the full 200 response before the
-	// process terminates.
-	if report.NeedRestart {
-		delay := time.Duration(report.RestartDelaySeconds) * time.Second
-		if delay <= 0 {
-			delay = 5 * time.Second
-		}
-		slog.Info("reconcile bootstrap: scheduling process exit for DB reload",
-			"delay", delay, "reason", "bootstrap_applied")
-		go func(d time.Duration) {
-			time.Sleep(d)
-			slog.Info("reconcile bootstrap: exiting process to reload new DB",
-				"pid", os.Getpid())
-			os.Exit(0)
-		}(delay)
-	}
 }
 
 // containsAny reports whether any string in haystack contains substr.
@@ -443,5 +413,40 @@ func (r *Router) handleStorageHealth(w http.ResponseWriter, req *http.Request) {
 	r.jsonResponse(w, map[string]interface{}{
 		"status":     "ok",
 		"latency_ms": duration.Milliseconds(),
+	}, http.StatusOK)
+}
+
+// handleRefreshOSSDB pulls the latest authoritative oss.db from OSS, replacing
+// the local working copy. Local restore_jobs are preserved across the swap.
+// Used by the restore page "更新" button to re-sync with OSS after another
+// machine performed a backup.
+func (r *Router) handleRefreshOSSDB(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		r.jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Use a detached context: pulling + decrypting the DB can take a while
+	// over slow links, and the local DB swap must not be aborted by the
+	// HTTP server's WriteTimeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	pulled, err := r.engine.RefreshFromOSS(ctx)
+	if err != nil {
+		slog.Error("refresh oss.db failed", "error", err)
+		r.jsonError(w, fmt.Sprintf("refresh oss.db failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	msg := "local DB is already up to date (OSS has no oss.db yet)"
+	if pulled {
+		msg = "local DB refreshed from OSS"
+	}
+	slog.Info("refresh oss.db completed", "pulled", pulled)
+	r.jsonResponse(w, map[string]interface{}{
+		"status": "ok",
+		"pulled": pulled,
+		"message": msg,
 	}, http.StatusOK)
 }

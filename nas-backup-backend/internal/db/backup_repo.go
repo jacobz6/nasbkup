@@ -18,26 +18,27 @@ func NewBackupRepository(db *sql.DB) *BackupRepository {
 	return &BackupRepository{db: db}
 }
 
+// backupColumns is the full column list for the backups table.
+const backupColumns = `id, status,
+	total_files, total_size, uploaded_size,
+	skipped_dedup, failed_files, compress_saved,
+	started_at, completed_at, error_message, created_at`
+
 // scanBackupRecord scans a single backup row from a scanner into a BackupRecord.
 func scanBackupRecord(s scanner) (*models.BackupRecord, error) {
 	var (
-		rec          models.BackupRecord
-		baseBackupID sql.NullInt64
-		startedAt    sql.NullString
-		completedAt  sql.NullString
-		createdAt    string
+		rec         models.BackupRecord
+		startedAt   sql.NullString
+		completedAt sql.NullString
+		createdAt   string
 	)
 	if err := s.Scan(
-		&rec.ID, &rec.Type, &rec.Status, &baseBackupID,
+		&rec.ID, &rec.Status,
 		&rec.TotalFiles, &rec.TotalSize, &rec.UploadedSize,
-		&rec.SkippedByDedup, &rec.SkippedByInc, &rec.CompressSaved,
+		&rec.SkippedByDedup, &rec.FailedFiles, &rec.CompressSaved,
 		&startedAt, &completedAt, &rec.ErrorMessage, &createdAt,
 	); err != nil {
 		return nil, err
-	}
-
-	if baseBackupID.Valid {
-		rec.BaseBackupID = &baseBackupID.Int64
 	}
 
 	if startedAt.Valid {
@@ -79,15 +80,13 @@ func scanBackupFileRecord(s scanner) (*models.BackupFileRecord, error) {
 }
 
 // Create inserts a new backup record with status "pending" and returns its ID.
-// If baseBackupID is not nil, the backup is incremental relative to the given full backup.
-func (r *BackupRepository) Create(backupType models.BackupType, baseBackupID *int64) (int64, error) {
+func (r *BackupRepository) Create() (int64, error) {
 	now := Now()
 	result, err := r.db.Exec(`
-		INSERT INTO backups (type, status, base_backup_id, created_at)
-		VALUES (?, 'pending', ?, ?)
-	`, backupType, baseBackupID, now)
+		INSERT INTO backups (status, created_at) VALUES ('pending', ?)
+	`, now)
 	if err != nil {
-		return 0, fmt.Errorf("create backup (type=%s): %w", backupType, err)
+		return 0, fmt.Errorf("create backup: %w", err)
 	}
 
 	id, err := result.LastInsertId()
@@ -99,7 +98,7 @@ func (r *BackupRepository) Create(backupType models.BackupType, baseBackupID *in
 
 // UpdateStatus updates the status of a backup session.
 // If the new status is "running", started_at is set to the current time.
-// If the new status is "completed", "failed", or "cancelled", completed_at is set to the current time.
+// If the new status is terminal (completed, completed_with_errors, failed, cancelled), completed_at is set.
 func (r *BackupRepository) UpdateStatus(id int64, status models.BackupStatus, errorMsg string) error {
 	now := Now()
 
@@ -112,7 +111,8 @@ func (r *BackupRepository) UpdateStatus(id int64, status models.BackupStatus, er
 			return fmt.Errorf("update backup %d status to %q: %w", id, status, err)
 		}
 
-	case models.BackupStatusCompleted, models.BackupStatusFailed, models.BackupStatusCancelled:
+	case models.BackupStatusCompleted, models.BackupStatusCompletedWithErrors,
+		models.BackupStatusFailed, models.BackupStatusCancelled:
 		_, err := r.db.Exec(`
 			UPDATE backups SET status = ?, completed_at = ?, error_message = ? WHERE id = ?
 		`, status, now, errorMsg, id)
@@ -133,17 +133,17 @@ func (r *BackupRepository) UpdateStatus(id int64, status models.BackupStatus, er
 }
 
 // UpdateStats updates the statistics fields of a backup session.
-func (r *BackupRepository) UpdateStats(id int64, totalFiles, totalSize, uploadedSize, skippedDedup, skippedInc int, compressSaved int64) error {
+func (r *BackupRepository) UpdateStats(id int64, totalFiles, totalSize, uploadedSize, skippedDedup, failedFiles int, compressSaved int64) error {
 	_, err := r.db.Exec(`
 		UPDATE backups SET
 			total_files = ?,
 			total_size = ?,
 			uploaded_size = ?,
 			skipped_dedup = ?,
-			skipped_inc = ?,
+			failed_files = ?,
 			compress_saved = ?
 		WHERE id = ?
-	`, totalFiles, totalSize, uploadedSize, skippedDedup, skippedInc, compressSaved, id)
+	`, totalFiles, totalSize, uploadedSize, skippedDedup, failedFiles, compressSaved, id)
 	if err != nil {
 		return fmt.Errorf("update stats for backup %d: %w", id, err)
 	}
@@ -154,11 +154,7 @@ func (r *BackupRepository) UpdateStats(id int64, totalFiles, totalSize, uploaded
 // Returns nil without error if no record is found.
 func (r *BackupRepository) GetByID(id int64) (*models.BackupRecord, error) {
 	row := r.db.QueryRow(`
-		SELECT id, type, status, base_backup_id,
-		       total_files, total_size, uploaded_size,
-		       skipped_dedup, skipped_inc, compress_saved,
-		       started_at, completed_at, error_message, created_at
-		FROM backups WHERE id = ?
+		SELECT `+backupColumns+` FROM backups WHERE id = ?
 	`, id)
 	rec, err := scanBackupRecord(row)
 	if err != nil {
@@ -179,11 +175,7 @@ func (r *BackupRepository) List(limit, offset int) ([]*models.BackupRecord, int6
 	}
 
 	rows, err := r.db.Query(`
-		SELECT id, type, status, base_backup_id,
-		       total_files, total_size, uploaded_size,
-		       skipped_dedup, skipped_inc, compress_saved,
-		       started_at, completed_at, error_message, created_at
-		FROM backups ORDER BY created_at DESC
+		SELECT `+backupColumns+` FROM backups ORDER BY created_at DESC
 		LIMIT ? OFFSET ?
 	`, limit, offset)
 	if err != nil {
@@ -205,15 +197,16 @@ func (r *BackupRepository) List(limit, offset int) ([]*models.BackupRecord, int6
 	return records, total, nil
 }
 
-// GetLatestCompleted retrieves the most recent backup with status "completed".
+// terminalStatuses returns the SQL IN clause values for completed-like statuses.
+func terminalCompletedStatuses() string {
+	return "('completed', 'completed_with_errors')"
+}
+
+// GetLatestCompleted retrieves the most recent backup with status "completed" or "completed_with_errors".
 // Returns nil without error if no completed backup exists.
 func (r *BackupRepository) GetLatestCompleted() (*models.BackupRecord, error) {
 	row := r.db.QueryRow(`
-		SELECT id, type, status, base_backup_id,
-		       total_files, total_size, uploaded_size,
-		       skipped_dedup, skipped_inc, compress_saved,
-		       started_at, completed_at, error_message, created_at
-		FROM backups WHERE status = 'completed'
+		SELECT `+backupColumns+` FROM backups WHERE status IN `+terminalCompletedStatuses()+`
 		ORDER BY created_at DESC LIMIT 1
 	`)
 	rec, err := scanBackupRecord(row)
@@ -224,58 +217,6 @@ func (r *BackupRepository) GetLatestCompleted() (*models.BackupRecord, error) {
 		return nil, fmt.Errorf("get latest completed backup: %w", err)
 	}
 	return rec, nil
-}
-
-// GetLatestFull retrieves the most recent completed full backup.
-// Returns nil without error if no completed full backup exists.
-func (r *BackupRepository) GetLatestFull() (*models.BackupRecord, error) {
-	row := r.db.QueryRow(`
-		SELECT id, type, status, base_backup_id,
-		       total_files, total_size, uploaded_size,
-		       skipped_dedup, skipped_inc, compress_saved,
-		       started_at, completed_at, error_message, created_at
-		FROM backups WHERE status = 'completed' AND type = 'full'
-		ORDER BY created_at DESC LIMIT 1
-	`)
-	rec, err := scanBackupRecord(row)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("get latest full backup: %w", err)
-	}
-	return rec, nil
-}
-
-// GetIncrementalsSinceFull retrieves all completed incremental backups
-// that are based on the specified full backup, ordered by created_at.
-func (r *BackupRepository) GetIncrementalsSinceFull(fullBackupID int64) ([]*models.BackupRecord, error) {
-	rows, err := r.db.Query(`
-		SELECT id, type, status, base_backup_id,
-		       total_files, total_size, uploaded_size,
-		       skipped_dedup, skipped_inc, compress_saved,
-		       started_at, completed_at, error_message, created_at
-		FROM backups
-		WHERE status = 'completed' AND type = 'incremental' AND base_backup_id = ?
-		ORDER BY created_at
-	`, fullBackupID)
-	if err != nil {
-		return nil, fmt.Errorf("get incrementals since full %d: %w", fullBackupID, err)
-	}
-	defer rows.Close()
-
-	records := make([]*models.BackupRecord, 0)
-	for rows.Next() {
-		rec, err := scanBackupRecord(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan incremental backup row: %w", err)
-		}
-		records = append(records, rec)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate incremental backups: %w", err)
-	}
-	return records, nil
 }
 
 // CountByStatus returns the number of backup records with the given status.
@@ -370,12 +311,6 @@ func (r *BackupRepository) GetBackupFiles(backupID int64) ([]*models.BackupFileR
 
 // GetBackupFileByFileID retrieves a single backup-file junction record for a
 // given (backupID, fileID) pair. Returns nil without error if no record matches.
-//
-// This replaces the previous resolveBackupFile approach which loaded ALL
-// backup_files of a session into memory and linearly scanned them per file,
-// causing O(N×M) behavior (e.g. 1e8 scans when restoring 1000 files from a
-// 100k-file backup). The indexed PRIMARY KEY (backup_id, file_id) makes this a
-// single-row lookup.
 func (r *BackupRepository) GetBackupFileByFileID(backupID, fileID int64) (*models.BackupFileRecord, error) {
 	row := r.db.QueryRow(`
 		SELECT backup_id, file_id, storage_key, encrypted_iv, auth_tag, compress_type, original_size, stored_size
@@ -411,6 +346,7 @@ func (r *BackupRepository) GetFileRestoreInfo(fileID int64) (*models.BackupFileR
 }
 
 // IsRunning checks whether there is a backup currently in "running" status.
+// Completed_with_errors is a terminal state and NOT considered running.
 func (r *BackupRepository) IsRunning() (bool, error) {
 	var count int64
 	err := r.db.QueryRow(`SELECT COUNT(*) FROM backups WHERE status = 'running'`).Scan(&count)
@@ -422,11 +358,7 @@ func (r *BackupRepository) IsRunning() (bool, error) {
 
 // GetRunning returns the currently running backup record, or nil if none.
 func (r *BackupRepository) GetRunning() (*models.BackupRecord, error) {
-	row := r.db.QueryRow(`SELECT id, type, status, base_backup_id,
-		total_files, total_size, uploaded_size,
-		skipped_dedup, skipped_inc, compress_saved,
-		started_at, completed_at, error_message, created_at
-		FROM backups WHERE status = 'running' LIMIT 1`)
+	row := r.db.QueryRow(`SELECT `+backupColumns+` FROM backups WHERE status = 'running' LIMIT 1`)
 	rec, err := scanBackupRecord(row)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -454,13 +386,11 @@ func (r *BackupRepository) CleanupStaleRunning() (int64, error) {
 // ListFailedBackupsWithFiles returns failed backups that still have backup_files
 // rows attached. These are candidates for status correction: a backup that was
 // marked failed but whose files were actually uploaded should be re-evaluated.
+// completed_with_errors backups are intentionally excluded — they are already
+// correctly classified as "partially succeeded".
 func (r *BackupRepository) ListFailedBackupsWithFiles() ([]*models.BackupRecord, error) {
 	rows, err := r.db.Query(`
-		SELECT id, type, status, base_backup_id,
-		       total_files, total_size, uploaded_size,
-		       skipped_dedup, skipped_inc, compress_saved,
-		       started_at, completed_at, error_message, created_at
-		FROM backups
+		SELECT `+backupColumns+` FROM backups
 		WHERE status = 'failed'
 		  AND EXISTS (SELECT 1 FROM backup_files WHERE backup_id = backups.id)
 		ORDER BY id
@@ -484,19 +414,15 @@ func (r *BackupRepository) ListFailedBackupsWithFiles() ([]*models.BackupRecord,
 	return records, nil
 }
 
-// ListCompletedBackupsWithoutFiles returns completed FULL backups that have no
-// backup_files rows. An incremental backup with 0 files is normal (no changes
-// since last backup), so incremental backups are excluded from this check.
-// Only full backups with 0 files are suspicious and worth flagging.
+// ListCompletedBackupsWithoutFiles returns completed backups that have no
+// backup_files rows. A backup that reports completion but uploaded 0 files is
+// suspicious and worth flagging. Includes both 'completed' and
+// 'completed_with_errors' (a backup with errors that uploaded 0 files is
+// suspicious regardless of partial success).
 func (r *BackupRepository) ListCompletedBackupsWithoutFiles() ([]*models.BackupRecord, error) {
 	rows, err := r.db.Query(`
-		SELECT id, type, status, base_backup_id,
-		       total_files, total_size, uploaded_size,
-		       skipped_dedup, skipped_inc, compress_saved,
-		       started_at, completed_at, error_message, created_at
-		FROM backups
-		WHERE status = 'completed'
-		  AND type = 'full'
+		SELECT `+backupColumns+` FROM backups
+		WHERE status IN ('completed', 'completed_with_errors')
 		  AND NOT EXISTS (SELECT 1 FROM backup_files WHERE backup_id = backups.id)
 		ORDER BY id
 	`)
@@ -544,8 +470,7 @@ func (r *BackupRepository) CountAllBackupFiles() (int64, error) {
 }
 
 // ListAllBackupFileStorageKeys returns the set of distinct storage_key values
-// referenced by backup_files. Used by the reconciler to detect orphan backup_files
-// rows whose storage_key is missing from hash_index.
+// referenced by backup_files.
 func (r *BackupRepository) ListAllBackupFileStorageKeys() (map[string]int, error) {
 	rows, err := r.db.Query(
 		`SELECT storage_key, COUNT(*) AS ref_count FROM backup_files GROUP BY storage_key`,
@@ -573,8 +498,7 @@ func (r *BackupRepository) ListAllBackupFileStorageKeys() (map[string]int, error
 }
 
 // DeleteBackupFilesByStorageKey removes all backup_files rows referencing the
-// given storage_key. Used by the reconciler when the storage_key has no
-// corresponding OSS object AND no hash_index entry (fully orphaned backup_files).
+// given storage_key.
 func (r *BackupRepository) DeleteBackupFilesByStorageKey(storageKey string) (int64, error) {
 	res, err := r.db.Exec(
 		`DELETE FROM backup_files WHERE storage_key = ?`, storageKey,

@@ -941,8 +941,25 @@ func (sm *StorageManager) List(ctx context.Context, prefix string) ([]string, er
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+		stderrStr := strings.TrimSpace(stderr.String())
+		// rclone lsf returns exit code 3 if the listed directory doesn't
+		// exist. For a backup root (e.g. "data/") this is a legitimate
+		// "empty OSS" state (fresh install, never backed up), not a fatal
+		// error — return an empty list so reconciliation and other
+		// callers proceed instead of failing. Mirrors the not-found
+		// tolerance applied elsewhere in this file.
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 3 {
+			lowerStderr := strings.ToLower(stderrStr)
+			if strings.Contains(lowerStderr, "not found") ||
+				strings.Contains(lowerStderr, "no such file") ||
+				strings.Contains(lowerStderr, "doesn't exist") ||
+				strings.Contains(lowerStderr, "does not exist") ||
+				strings.Contains(lowerStderr, "directory not found") {
+				return nil, nil
+			}
+		}
 		return nil, fmt.Errorf("rclone lsf %q: %w (stderr: %s)",
-			remoteSpec, err, strings.TrimSpace(stderr.String()))
+			remoteSpec, err, stderrStr)
 	}
 
 	var keys []string

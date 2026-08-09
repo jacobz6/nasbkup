@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/nas-backup/internal/compress"
@@ -24,16 +25,16 @@ import (
 
 // Engine orchestrates the full backup pipeline.
 type Engine struct {
-	db           *db.Database
-	scanner      *scanner.Scanner
-	dedup        *dedup.Deduplicator
-	compressor   *compress.Compressor
-	encryptor    *crypto.Encryptor
-	storage      *storage.StorageManager
-	config       *config.AppConfig
-	logger       *slog.Logger
-	progress     *ProgressBroker
-	dbBackupSvc  *DBBackupService // optional: syncs encrypted DB to OSS after each backup
+	db          *db.Database
+	scanner     *scanner.Scanner
+	dedup       *dedup.Deduplicator
+	compressor  *compress.Compressor
+	encryptor   *crypto.Encryptor
+	storage     *storage.StorageManager
+	config      *config.AppConfig
+	logger      *slog.Logger
+	progress    *ProgressBroker
+	dbBackupSvc *DBBackupService // optional: syncs encrypted DB to OSS after each backup
 
 	mu              sync.Mutex
 	runningBackupID int64
@@ -67,13 +68,12 @@ func (e *Engine) SetDBBackupService(svc *DBBackupService) {
 
 // getDBBackupSvc returns the engine's DBBackupService, lazily constructing one
 // from the existing storage/encryptor/config/database dependencies if it was
-// never injected. This lets the reconciler's bootstrap-from-OSS path work even
-// when the engine was assembled by test helpers or lightweight callers that
-// skipped the explicit SetDBBackupService call.
+// never injected. This lets InitFromOSS work even when the engine was
+// assembled by test helpers or lightweight callers that skipped the explicit
+// SetDBBackupService call.
 //
 // Returns nil if the underlying storage or encryptor is unavailable (e.g.
-// tests running without OSS configured) — callers should fall through to the
-// non-bootstrap reconcile path in that case.
+// tests running without OSS configured).
 func (e *Engine) getDBBackupSvc() *DBBackupService {
 	if e.dbBackupSvc != nil {
 		return e.dbBackupSvc
@@ -90,190 +90,179 @@ func (e *Engine) ProgressBroker() *ProgressBroker {
 	return e.progress
 }
 
-// RunFullBackup executes a full backup synchronously.
-func (e *Engine) RunFullBackup(ctx context.Context) error {
-	e.mu.Lock()
-	// Mutual exclusion: check no restore is running.
-	restoreRunning, _ := e.db.RestoreJobRepo.IsRunning()
-	if restoreRunning {
-		e.mu.Unlock()
-		return fmt.Errorf("a restore is currently running; backup and restore cannot run concurrently")
+// InitFromOSS initializes the local DB from OSS at service startup.
+// It probes OSS reachability with exponential backoff retry (up to 10 minutes),
+// then either pulls the authoritative oss.db or falls back to the local DB.
+//
+// OSS reachability is a hard prerequisite: if OSS is unreachable after the
+// retry budget, the service cannot start and a fatal error is returned.
+func (e *Engine) InitFromOSS(ctx context.Context) error {
+	svc := e.getDBBackupSvc()
+	if svc == nil {
+		return fmt.Errorf("cannot init from OSS: storage or encryptor not configured")
 	}
-	if e.runningBackupID > 0 {
-		e.mu.Unlock()
-		return fmt.Errorf("a backup is already running")
+
+	// Probe OSS reachability with exponential backoff (1s, 2s, 4s... max 60s),
+	// for up to 10 minutes total.
+	if err := e.waitForOSS(ctx, svc); err != nil {
+		return fmt.Errorf("OSS not reachable: %w", err)
 	}
-	running, err := e.db.BackupRepo.IsRunning()
+
+	// Try to pull the authoritative DB from OSS.
+	pulled, err := svc.PullOSSDB(ctx)
 	if err != nil {
-		e.mu.Unlock()
-		return fmt.Errorf("check running backup: %w", err)
+		return fmt.Errorf("pull oss.db: %w", err)
 	}
-	if running {
-		e.mu.Unlock()
-		return fmt.Errorf("a backup is already running")
-	}
-
-	// Bootstrap guard: refuse to backup on an uninitialized instance when OSS
-	// already contains backup data. Without this, a fresh empty database would
-	// either (a) overwrite existing OSS objects with different-IV ciphertexts
-	// (corrupting other instances' backups), or (b) trigger reconcile/GC to
-	// delete all existing OSS objects.
-	if err := e.checkBootstrapRequired(ctx); err != nil {
-		e.mu.Unlock()
-		return err
+	if pulled {
+		// Reopen DB connection against the pulled file.
+		if err := e.db.Reopen(); err != nil {
+			return fmt.Errorf("reopen db after pull: %w", err)
+		}
+		// Re-bind the DBBackupService to the new connection so WAL checkpoint
+		// and integrity_check in PushOSSDB use the correct handle.
+		e.dbBackupSvc = NewDBBackupService(e.encryptor, e.storage, e.config, e.db.Conn())
+		e.logger.Info("initialized local DB from OSS")
+		return nil
 	}
 
-	backupID, err := e.db.BackupRepo.Create(models.BackupTypeFull, nil)
-	if err != nil {
-		e.mu.Unlock()
-		return fmt.Errorf("create backup record: %w", err)
-	}
-	e.mu.Unlock()
-
-	return e.executeBackup(ctx, backupID, models.BackupTypeFull, nil)
+	// OSS has no oss.db — first-time deployment. The local DB (already opened
+	// by main.go with migrations) serves as the initial empty DB.
+	e.logger.Info("OSS has no oss.db, starting with empty local DB (first-time deployment)")
+	return nil
 }
 
-// RunIncrementalBackup executes an incremental backup synchronously.
-func (e *Engine) RunIncrementalBackup(ctx context.Context) error {
-	e.mu.Lock()
-	// Mutual exclusion: check no restore is running.
-	restoreRunning, _ := e.db.RestoreJobRepo.IsRunning()
-	if restoreRunning {
-		e.mu.Unlock()
-		return fmt.Errorf("a restore is currently running; backup and restore cannot run concurrently")
-	}
-	if e.runningBackupID > 0 {
-		e.mu.Unlock()
-		return fmt.Errorf("a backup is already running")
-	}
-	running, err := e.db.BackupRepo.IsRunning()
-	if err != nil {
-		e.mu.Unlock()
-		return fmt.Errorf("check running backup: %w", err)
-	}
-	if running {
-		e.mu.Unlock()
-		return fmt.Errorf("a backup is already running")
-	}
+// waitForOSS probes OSS reachability with exponential backoff.
+// Returns nil as soon as OSS responds; returns an error if the deadline is reached.
+func (e *Engine) waitForOSS(ctx context.Context, svc *DBBackupService) error {
+	const (
+		maxWait      = 10 * time.Minute
+		initialDelay = 1 * time.Second
+		maxDelay     = 60 * time.Second
+	)
 
-	latestFull, err := e.db.BackupRepo.GetLatestFull()
-	if err != nil {
-		e.mu.Unlock()
-		return fmt.Errorf("get latest full backup: %w", err)
-	}
-	if latestFull == nil {
-		e.mu.Unlock()
-		return fmt.Errorf("no full backup found; run a full backup first")
-	}
-	baseBackupID := latestFull.ID
+	deadline := time.Now().Add(maxWait)
+	delay := initialDelay
 
-	// Bootstrap guard (same as RunFullBackup).
-	if err := e.checkBootstrapRequired(ctx); err != nil {
-		e.mu.Unlock()
-		return err
-	}
+	for {
+		probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		_, err := svc.OSSDBExists(probeCtx)
+		cancel()
+		if err == nil {
+			return nil // OSS is reachable
+		}
 
-	backupID, err := e.db.BackupRepo.Create(models.BackupTypeIncremental, &baseBackupID)
-	if err != nil {
-		e.mu.Unlock()
-		return fmt.Errorf("create backup record: %w", err)
-	}
-	e.mu.Unlock()
+		if time.Now().After(deadline) {
+			return fmt.Errorf("OSS not reachable after %v (last error: %w)", maxWait, err)
+		}
 
-	return e.executeBackup(ctx, backupID, models.BackupTypeIncremental, &baseBackupID)
+		e.logger.Warn("OSS not reachable, retrying", "error", err, "delay", delay)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		delay *= 2
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+	}
 }
 
-// determineBackupType automatically decides whether to run a full or incremental backup.
-// It returns the concrete backup type (full or incremental) and the base backup ID for incrementals.
-func (e *Engine) determineBackupType() (models.BackupType, *int64, error) {
-	latestFull, err := e.db.BackupRepo.GetLatestFull()
-	if err != nil {
-		return models.BackupTypeFull, nil, fmt.Errorf("get latest full backup: %w", err)
-	}
-	if latestFull == nil || latestFull.CompletedAt == nil {
-		e.logger.Info("no completed full backup found, will run full backup")
-		return models.BackupTypeFull, nil, nil
+// pullAndPreserveRestoreJobs pulls the latest oss.db from OSS, preserving
+// local restore_jobs across the DB overwrite. Returns (true, nil) if the DB
+// was pulled; (false, nil) if OSS had no oss.db (first-time deployment).
+func (e *Engine) pullAndPreserveRestoreJobs(ctx context.Context) (bool, error) {
+	svc := e.getDBBackupSvc()
+	if svc == nil {
+		return false, nil
 	}
 
-	intervalMonths := e.config.Backup.Retention.FullResetInterval
-	if intervalMonths > 0 {
-		cutoff := time.Now().AddDate(0, -intervalMonths, 0)
-		if latestFull.CompletedAt.Before(cutoff) {
-			e.logger.Info("full reset interval reached, will run full backup",
-				"last_full", latestFull.CompletedAt, "interval_months", intervalMonths)
-			return models.BackupTypeFull, nil, nil
+	// Export local restore_jobs before DB overwrite.
+	localJobs, err := e.db.RestoreJobRepo.ExportAll()
+	if err != nil {
+		return false, fmt.Errorf("export restore jobs: %w", err)
+	}
+
+	// Pull oss.db from OSS (overwrites local DB file).
+	pulled, err := svc.PullOSSDB(ctx)
+	if err != nil {
+		return false, fmt.Errorf("pull oss.db: %w", err)
+	}
+	if !pulled {
+		// OSS has no oss.db — first-time deployment, keep local DB as-is.
+		return false, nil
+	}
+
+	// Reopen DB connection against the new file.
+	if err := e.db.Reopen(); err != nil {
+		return false, fmt.Errorf("reopen db after pull: %w", err)
+	}
+
+	// Re-bind the DBBackupService to the new connection.
+	e.dbBackupSvc = NewDBBackupService(e.encryptor, e.storage, e.config, e.db.Conn())
+
+	// Import restore_jobs back into the fresh DB.
+	if len(localJobs) > 0 {
+		if err := e.db.RestoreJobRepo.ImportBatch(localJobs); err != nil {
+			e.logger.Warn("failed to re-import restore jobs after pull", "error", err)
 		}
 	}
 
-	id := latestFull.ID
-	e.logger.Info("will run incremental backup", "base_backup_id", id)
-	return models.BackupTypeIncremental, &id, nil
+	return true, nil
+}
+
+// RefreshFromOSS pulls the latest authoritative oss.db from OSS, preserving
+// local restore_jobs across the DB overwrite. It is exposed for the
+// "refresh-oss-db" API so the operator can manually re-sync the local DB from
+// OSS without restarting the service (e.g. after another machine performed a
+// backup). Returns (true, nil) when a new DB was pulled; (false, nil) when OSS
+// has no oss.db yet (first-time deployment).
+func (e *Engine) RefreshFromOSS(ctx context.Context) (bool, error) {
+	return e.pullAndPreserveRestoreJobs(ctx)
+}
+
+// RunBackup executes a backup synchronously.
+func (e *Engine) RunBackup(ctx context.Context) error {
+	e.mu.Lock()
+	if err := e.preBackupCheck(); err != nil {
+		e.mu.Unlock()
+		return err
+	}
+
+	// Pull latest DB from OSS before creating the backup record, so the
+	// record lives in the freshest possible state.
+	if _, err := e.pullAndPreserveRestoreJobs(ctx); err != nil {
+		e.mu.Unlock()
+		return fmt.Errorf("pull oss.db before backup: %w", err)
+	}
+
+	backupID, err := e.db.BackupRepo.Create()
+	if err != nil {
+		e.mu.Unlock()
+		return fmt.Errorf("create backup record: %w", err)
+	}
+	e.mu.Unlock()
+
+	return e.executeBackup(ctx, backupID)
 }
 
 // StartBackup creates a backup record and starts the backup asynchronously.
 // Returns the backup ID immediately so callers can track progress via the API.
-// Use BackupTypeAuto to let the system automatically determine full vs incremental.
-func (e *Engine) StartBackup(backupType models.BackupType) (int64, error) {
+func (e *Engine) StartBackup() (int64, error) {
 	e.mu.Lock()
-	// Mutual exclusion: check no restore is running.
-	restoreRunning, _ := e.db.RestoreJobRepo.IsRunning()
-	if restoreRunning {
-		e.mu.Unlock()
-		return 0, fmt.Errorf("a restore is currently running; backup and restore cannot run concurrently")
-	}
-	if e.runningBackupID > 0 {
-		e.mu.Unlock()
-		return 0, fmt.Errorf("a backup is already running")
-	}
-
-	running, err := e.db.BackupRepo.IsRunning()
-	if err != nil {
-		e.mu.Unlock()
-		return 0, fmt.Errorf("check running backup: %w", err)
-	}
-	if running {
-		e.mu.Unlock()
-		return 0, fmt.Errorf("a backup is already running")
-	}
-
-	var (
-		actualType   models.BackupType
-		baseBackupID *int64
-	)
-
-	if backupType == models.BackupTypeAuto {
-		actualType, baseBackupID, err = e.determineBackupType()
-		if err != nil {
-			e.mu.Unlock()
-			return 0, err
-		}
-	} else {
-		actualType = backupType
-		if backupType == models.BackupTypeIncremental {
-			latestFull, err := e.db.BackupRepo.GetLatestFull()
-			if err != nil {
-				e.mu.Unlock()
-				return 0, fmt.Errorf("get latest full backup: %w", err)
-			}
-			if latestFull == nil {
-				e.mu.Unlock()
-				return 0, fmt.Errorf("no full backup found; run a full backup first")
-			}
-			id := latestFull.ID
-			baseBackupID = &id
-		}
-	}
-
-	// Bootstrap guard (same as RunFullBackup). Must run synchronously before
-	// returning the backup ID to the caller — otherwise the API has already
-	// returned success but the async goroutine will reject it with a confusing
-	// "bootstrap required" error that nobody receives.
-	if err := e.checkBootstrapRequired(context.Background()); err != nil {
+	if err := e.preBackupCheck(); err != nil {
 		e.mu.Unlock()
 		return 0, err
 	}
 
-	backupID, err := e.db.BackupRepo.Create(actualType, baseBackupID)
+	// Pull latest DB from OSS before creating the backup record, so the
+	// record lives in the freshest possible state.
+	if _, err := e.pullAndPreserveRestoreJobs(context.Background()); err != nil {
+		e.mu.Unlock()
+		return 0, fmt.Errorf("pull oss.db before backup: %w", err)
+	}
+
+	backupID, err := e.db.BackupRepo.Create()
 	if err != nil {
 		e.mu.Unlock()
 		return 0, fmt.Errorf("create backup record: %w", err)
@@ -282,12 +271,33 @@ func (e *Engine) StartBackup(backupType models.BackupType) (int64, error) {
 
 	go func() {
 		ctx := context.Background()
-		if err := e.executeBackup(ctx, backupID, actualType, baseBackupID); err != nil {
+		if err := e.executeBackup(ctx, backupID); err != nil {
 			e.logger.Error("async backup failed", "backup_id", backupID, "error", err)
 		}
 	}()
 
 	return backupID, nil
+}
+
+// preBackupCheck performs the mutual-exclusion checks that must hold while
+// the engine mutex is locked. Returns an error if a backup or restore is
+// already running. Caller must hold e.mu.
+func (e *Engine) preBackupCheck() error {
+	restoreRunning, _ := e.db.RestoreJobRepo.IsRunning()
+	if restoreRunning {
+		return fmt.Errorf("a restore is currently running; backup and restore cannot run concurrently")
+	}
+	if e.runningBackupID > 0 {
+		return fmt.Errorf("a backup is already running")
+	}
+	running, err := e.db.BackupRepo.IsRunning()
+	if err != nil {
+		return fmt.Errorf("check running backup: %w", err)
+	}
+	if running {
+		return fmt.Errorf("a backup is already running")
+	}
+	return nil
 }
 
 // Cancel cancels a running backup by its ID.
@@ -343,120 +353,6 @@ func (e *Engine) NeedsReconcile() bool {
 	return false
 }
 
-// IsBootstrapRequired performs the same emptiness-vs-OSS check as
-// checkBootstrapRequired but returns a (bool, string) tuple without raising an
-// error. The dashboard API calls this to surface a prominent "需要先bootstrap"
-// warning in the UI when a fresh instance points at a bucket that already has
-// backups from another environment (or the same environment after a DB reset).
-// Errors during the OSS probe are silently treated as "bootstrap not required"
-// because we cannot tell whether the bucket is empty — the upstream backup
-// entry guard will re-run the check and surface errors properly if the user
-// tries to backup anyway.
-func (e *Engine) IsBootstrapRequired() (bool, string) {
-	// Step 1: local DB has any committed state → bootstrap not required
-	if hashCount, hErr := e.db.HashRepo.CountAll(); hErr == nil && hashCount > 0 {
-		return false, ""
-	}
-	if completed, cErr := e.db.BackupRepo.CountByStatus(models.BackupStatusCompleted); cErr == nil && completed > 0 {
-		return false, ""
-	}
-
-	// Step 2: OSS probe
-	if e.storage == nil {
-		return false, ""
-	}
-	shortCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	prefix := "data/"
-	if e.config.Reconcile.OSSListPrefix != "" {
-		prefix = e.config.Reconcile.OSSListPrefix
-	}
-	var (
-		hasData bool
-		cause   string
-	)
-	if dataKeys, dErr := e.storage.List(shortCtx, prefix); dErr == nil && len(dataKeys) > 0 {
-		hasData = true
-		cause = fmt.Sprintf("OSS 目录 %q 下已有 %d 个备份对象，本环境数据库为空。", prefix, len(dataKeys))
-	}
-	if dbKeys, dbErr := e.storage.List(shortCtx, dbBackupPrefix); dbErr == nil && len(dbKeys) > 0 {
-		hasData = true
-		if cause == "" {
-			cause = fmt.Sprintf("OSS 目录 %q 下已有 %d 个数据库快照，本环境数据库为空。", dbBackupPrefix, len(dbKeys))
-		}
-	}
-	if !hasData {
-		return false, ""
-	}
-	msg := cause + " 请在 nas-backup-backend 目录下执行: " +
-		"./restore-cli -config config.yaml bootstrap"
-	return true, msg
-}
-
-// checkBootstrapRequired detects a dangerous mismatch: the local database is
-// empty (no hash_index rows and no completed backups) but OSS already contains
-// backup data (objects under data/ or meta/db/). This happens when a user
-// installs the backend on a new machine (e.g. NAS) pointing at the same OSS
-// bucket where another machine (e.g. their Mac) has already produced
-// backups. Running a backup in this state would either:
-//
-//   - Re-upload every file with a freshly-generated random IV. While
-//     the application-level Exists() pre-check prevents object overwrite,
-//     uploading identical content under identical storage keys still wastes
-//     bandwidth and time.
-//   - Worse, if the user then clicks "修复" (reconcile apply), the reconciler
-//     would see hash_index empty and classify ALL existing OSS objects as
-//     "orphans" and DELETE them, destroying all cross-instance backups.
-//
-// Instead we force the new environment to run restore-cli bootstrap first,
-// which populates the local database from OSS via the cloud DB snapshot.
-func (e *Engine) checkBootstrapRequired(ctx context.Context) error {
-	// Step 1: cheap in-process check — does the local DB have any content?
-	hashCount, hErr := e.db.HashRepo.CountAll()
-	completedBackups, cErr := e.db.BackupRepo.CountByStatus(models.BackupStatusCompleted)
-	if (hErr == nil && hashCount > 0) || (cErr == nil && completedBackups > 0) {
-		// DB already has some committed state; no bootstrap guard needed.
-		// This also means a truly fresh instance that successfully completed
-		// its very first backup will pass this guard on every subsequent run.
-		return nil
-	}
-
-	// Step 2: DB is empty. Does OSS actually have anything under data/?
-	// Use a short timeout so a misconfigured bucket doesn't hang startup.
-	shortCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	// Probe both the data prefix (backup blobs) and meta/db prefix (cloud DB
-	// snapshots); either having content means another environment has used
-	// this bucket.
-	var hasData bool
-	if e.storage != nil {
-		prefix := "data/"
-		if e.config.Reconcile.OSSListPrefix != "" {
-			prefix = e.config.Reconcile.OSSListPrefix
-		}
-		dataKeys, dErr := e.storage.List(shortCtx, prefix)
-		if dErr == nil && len(dataKeys) > 0 {
-			hasData = true
-		}
-		dbKeys, dbErr := e.storage.List(shortCtx, dbBackupPrefix)
-		if dbErr == nil && len(dbKeys) > 0 {
-			hasData = true
-		}
-	}
-
-	if !hasData {
-		// OSS is empty — first-time backup on a new bucket. Allow.
-		return nil
-	}
-
-	return fmt.Errorf(
-		"bootstrap required: local database is empty but OSS already contains backup data. " +
-			"To share an OSS bucket between environments, first restore the database from OSS using: " +
-			"./restore-cli -config config.yaml bootstrap")
-}
-
 // RunGarbageCollection cleans up orphan data in OSS and the database.
 // It refuses to run while a backup is in progress to avoid deleting objects
 // that are in the process of being uploaded but not yet recorded in
@@ -486,7 +382,7 @@ func (e *Engine) RunGarbageCollection(ctx context.Context) error {
 		return fmt.Errorf(
 			"garbage collection aborted: hash_index is empty. Without a hash index " +
 				"there is no way to distinguish orphan objects from in-use ones. " +
-				"Run ./restore-cli -config config.yaml bootstrap to restore the database first")
+				"Run the service so it pulls the DB from OSS first")
 	}
 
 	graceDays := e.config.Backup.Retention.OrphanGraceDays
@@ -554,13 +450,19 @@ func (e *Engine) logEvent(backupID int64, level models.LogLevel, message, detail
 }
 
 // executeBackup runs the core backup pipeline for a given backup record.
-func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType models.BackupType, baseBackupID *int64) (retErr error) {
+func (e *Engine) executeBackup(ctx context.Context, backupID int64) (retErr error) {
 	// Set up cancellation tracking.
 	ctx, cancel := context.WithCancel(ctx)
 	e.mu.Lock()
 	e.cancelFuncs[backupID] = cancel
 	e.runningBackupID = backupID
 	e.mu.Unlock()
+
+	// failedFiles tracks the number of files that failed during processing.
+	// A partial failure (some files succeed, some fail) results in
+	// status=completed_with_errors rather than a total failure.
+	var failedFiles int
+	var fileErrors []string
 
 	// Cleanup cancellation tracking on exit (runs last due to LIFO).
 	defer func() {
@@ -573,6 +475,8 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 	// Update backup status on exit (runs before cleanup).
 	defer func() {
 		if retErr != nil {
+			// A hard error (scan failure, dedup failure, etc.) before or during
+			// file processing — mark as failed/cancelled.
 			if ctx.Err() != nil {
 				_ = e.db.BackupRepo.UpdateStatus(backupID, models.BackupStatusCancelled, "cancelled")
 				e.logEvent(backupID, models.LogLevelWarn, "backup cancelled", retErr.Error())
@@ -586,6 +490,19 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 				if e.progress != nil {
 					e.progress.PublishPhase(backupID, models.PhaseFailed, fmt.Sprintf("备份失败: %v", retErr))
 				}
+			}
+		} else if failedFiles > 0 {
+			// All pipeline phases completed but some individual files failed.
+			errMsg := fmt.Sprintf("%d file(s) failed: %s", failedFiles, strings.Join(fileErrors, "; "))
+			if len(errMsg) > 2000 {
+				errMsg = errMsg[:2000] + "..."
+			}
+			_ = e.db.BackupRepo.UpdateStatus(backupID, models.BackupStatusCompletedWithErrors, errMsg)
+			e.logEvent(backupID, models.LogLevelWarn, "backup completed with errors",
+				fmt.Sprintf("failed=%d", failedFiles))
+			if e.progress != nil {
+				e.progress.PublishPhase(backupID, models.PhaseCompleted,
+					fmt.Sprintf("备份完成（%d 个文件失败）", failedFiles))
 			}
 		} else {
 			_ = e.db.BackupRepo.UpdateStatus(backupID, models.BackupStatusCompleted, "")
@@ -608,9 +525,8 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 	if err := e.db.BackupRepo.UpdateStatus(backupID, models.BackupStatusRunning, ""); err != nil {
 		return fmt.Errorf("update backup status to running: %w", err)
 	}
-	e.logger.Info("backup started", "backup_id", backupID, "type", backupType)
-	e.logEvent(backupID, models.LogLevelInfo, "backup started",
-		fmt.Sprintf("type=%s", backupType))
+	e.logger.Info("backup started", "backup_id", backupID)
+	e.logEvent(backupID, models.LogLevelInfo, "backup started", "")
 	if e.progress != nil {
 		e.progress.PublishPhase(backupID, models.PhaseScanning, "正在扫描文件...")
 	}
@@ -697,10 +613,13 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 	}
 
 	// ── Phase 4: Separate changes by type ──────────────────────────────
+	// There is no full/incremental distinction: every backup processes all
+	// tracked files. Unchanged files are rewritten to Modified so the dedup
+	// pipeline records them in backup_files (their hash already exists in
+	// hash_index, so no upload happens — dedup skip).
 	var (
 		changedFiles []scanner.FileChange
 		deletedPaths []string
-		skippedInc   int
 	)
 	fileChangeMap := make(map[string]scanner.FileChange)
 	for _, change := range scanResult.Changes {
@@ -709,26 +628,14 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 		case scanner.Deleted:
 			deletedPaths = append(deletedPaths, change.Path)
 		case scanner.Unchanged:
-			if backupType == models.BackupTypeIncremental {
-				skippedInc++
-				continue
-			}
-			// For full backups, rewrite Unchanged → Modified so the dedup
-			// pipeline processes them. Without this, dedup.go skips
-			// Unchanged entirely and a full backup degenerates into an
-			// incremental one (to_upload=0 when all files are unchanged on
-			// disk), never rebuilding hash_index ↔ OSS mappings for objects
-			// that were lost in a previous crash.
+			// Rewrite Unchanged → Modified so dedup processes them and they
+			// get a backup_files entry for this session.
 			rewritten := change
 			rewritten.ChangeType = scanner.Modified
 			changedFiles = append(changedFiles, rewritten)
 		case scanner.Added, scanner.Modified:
 			changedFiles = append(changedFiles, change)
 		}
-	}
-	if skippedInc > 0 {
-		e.logEvent(backupID, models.LogLevelInfo, "增量备份跳过未变更文件",
-			fmt.Sprintf("count=%d", skippedInc))
 	}
 
 	if ctx.Err() != nil {
@@ -781,11 +688,16 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 		}
 	}
 
-	tmpDir, err := os.MkdirTemp("", "nas-backup-*")
+	tmpParent := e.config.TempDir()
+	if err := os.MkdirAll(tmpParent, 0o700); err != nil {
+		return fmt.Errorf("create temp parent directory %q: %w", tmpParent, err)
+	}
+	tmpDir, err := os.MkdirTemp(tmpParent, "nas-backup-*")
 	if err != nil {
-		return fmt.Errorf("create temp directory: %w", err)
+		return fmt.Errorf("create temp directory in %q: %w", tmpParent, err)
 	}
 	defer os.RemoveAll(tmpDir)
+	e.logger.Info("using temp directory", "dir", tmpDir)
 
 	var (
 		totalOriginalSize int64
@@ -801,9 +713,9 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 	// runs after the whole loop). Without this, compressType would be "" and
 	// violate the DB CHECK constraint, failing the entire backup.
 	type pendingMeta struct {
-		encIV       string
+		encIV        string
 		compressType string
-		storedSize  int64
+		storedSize   int64
 	}
 	pendingByHash := make(map[string]pendingMeta)
 
@@ -816,12 +728,69 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 		e.progress.PublishLog(backupID, "info", "开始处理文件",
 			fmt.Sprintf("[%d/%d] %s (%s)", i+1, len(dedupResult.ToUpload), entry.Path, formatSize(entry.Size)))
 
+		// Pre-flight disk space check: require at least 2x the file size as free space
+		// in the temp directory (compressed + encrypted intermediates).
+		// For large files this prevents ENosPC halfway through encryption.
+		if entry.Size > 100*1024*1024 { // only check files > 100MB to avoid statfs overhead
+			freeBytes, spaceErr := availableDiskSpace(tmpDir)
+			if spaceErr != nil {
+				e.logger.Warn("cannot check available disk space", "dir", tmpDir, "error", spaceErr)
+			} else {
+				requiredBytes := entry.Size * 2
+				if freeBytes < requiredBytes {
+					errMsg := fmt.Sprintf("insufficient temp space: have %s, need ~%s for %s",
+						formatSize(freeBytes), formatSize(requiredBytes), entry.Path)
+					e.logEvent(backupID, models.LogLevelError, "文件处理失败",
+						fmt.Sprintf("path=%s error=%s", entry.Path, errMsg))
+					e.logger.Error("skipping file due to insufficient temp space",
+						"path", entry.Path, "free", freeBytes, "required", requiredBytes)
+					failedFiles++
+					fileErrors = append(fileErrors, fmt.Sprintf("%s: %s", entry.Path, errMsg))
+					// Upsert file record first so we can mark it failed
+					fileID, upsertErr := e.db.FileRepo.Upsert(entry.Path, entry.Size, entry.ModTime, entry.NewHash, entry.Inode)
+					if upsertErr == nil {
+						_ = e.db.FileRepo.MarkBackupFailed(fileID, backupID, errMsg)
+					}
+					continue
+				}
+			}
+		}
+
 		fileID, origSize, storedSize, compressType, storageKey, encIV, err := e.processAndUploadFile(
-			ctx, entry, backupType, tmpDir, backupID)
+			ctx, entry, tmpDir, backupID)
 		if err != nil {
 			e.logEvent(backupID, models.LogLevelError, "文件处理失败",
 				fmt.Sprintf("path=%s error=%v", entry.Path, err))
-			return fmt.Errorf("process file %q: %w", entry.Path, err)
+			e.logger.Error("file processing failed, continuing with next file",
+				"path", entry.Path, "error", err)
+			failedFiles++
+			shortErr := err.Error()
+			if len(shortErr) > 300 {
+				shortErr = shortErr[:300] + "..."
+			}
+			fileErrors = append(fileErrors, fmt.Sprintf("%s: %s", entry.Path, shortErr))
+			// Mark the file as failed in the DB. If we have a fileID (from upsert
+			// inside processAndUploadFile before the failure), use it; otherwise
+			// upsert first then mark.
+			if fileID > 0 {
+				_ = e.db.FileRepo.MarkBackupFailed(fileID, backupID, err.Error())
+			} else {
+				// Upsert may have failed; try one more time just to get an ID for status tracking.
+				if fid, upsertErr := e.db.FileRepo.Upsert(entry.Path, entry.Size, entry.ModTime, entry.NewHash, entry.Inode); upsertErr == nil {
+					_ = e.db.FileRepo.MarkBackupFailed(fid, backupID, err.Error())
+				}
+			}
+			// Clean up any partial temp files for this fileID to free space.
+			if fileID > 0 {
+				os.Remove(filepath.Join(tmpDir, fmt.Sprintf("%d_compressed", fileID)))
+				os.Remove(filepath.Join(tmpDir, fmt.Sprintf("%d_encrypted.enc", fileID)))
+			}
+			continue
+		}
+
+		// Mark successful backup for this file.
+		if markErr := e.db.FileRepo.MarkBackupSuccess(fileID, backupID); markErr != nil {
+			e.logger.Warn("failed to mark file backup success", "file_id", fileID, "error", markErr)
 		}
 
 		totalOriginalSize += origSize
@@ -890,12 +859,13 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 		}
 
 		var fileID int64
+		var upsertErr error
 		fc, hasFC := fileChangeMap[skipped.Path]
 		if hasFC {
-			fileID, err = e.db.FileRepo.Upsert(fc.Path, fc.Size, fc.ModTime, fc.NewHash, fc.Inode)
-			if err != nil {
+			fileID, upsertErr = e.db.FileRepo.Upsert(fc.Path, fc.Size, fc.ModTime, fc.NewHash, fc.Inode)
+			if upsertErr != nil {
 				e.logger.Error("upsert file record for dedup'd file",
-					"path", skipped.Path, "error", err)
+					"path", skipped.Path, "error", upsertErr)
 				continue
 			}
 		} else {
@@ -911,6 +881,11 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 				continue
 			}
 			fileID = existingRec.ID
+		}
+
+		// Mark dedup-skipped files as successfully backed up (content already exists in OSS).
+		if markErr := e.db.FileRepo.MarkBackupSuccess(fileID, backupID); markErr != nil {
+			e.logger.Warn("failed to mark dedup'd file backup success", "file_id", fileID, "error", markErr)
 		}
 
 		var encIV, compressType string
@@ -1030,14 +1005,14 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 	// ── Phase 10: Update backup stats ──────────────────────────────────
 	totalFiles := len(dedupResult.ToUpload) + len(dedupResult.Skipped)
 	e.logEvent(backupID, models.LogLevelInfo, "更新备份统计",
-		fmt.Sprintf("total_files=%d total_size=%s uploaded=%s",
-			totalFiles, formatSize(totalOriginalSize), formatSize(totalUploadedSize)))
+		fmt.Sprintf("total_files=%d failed=%d total_size=%s uploaded=%s",
+			totalFiles, failedFiles, formatSize(totalOriginalSize), formatSize(totalUploadedSize)))
 	if err := e.db.BackupRepo.UpdateStats(backupID,
 		totalFiles,
 		int(totalOriginalSize),
 		int(totalUploadedSize),
 		len(dedupResult.Skipped),
-		skippedInc,
+		failedFiles,
 		compressSaved,
 	); err != nil {
 		return fmt.Errorf("update backup stats: %w", err)
@@ -1046,28 +1021,41 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 		e.progress.PublishProgress(backupID, models.PhaseFinalizing, 1, 1, 100)
 	}
 
-	e.logger.Info("backup completed successfully",
-		"backup_id", backupID,
-		"type", backupType,
-		"total_files", totalFiles,
-		"total_size", totalOriginalSize,
-		"uploaded_size", totalUploadedSize,
-		"skipped_dedup", len(dedupResult.Skipped),
-		"skipped_inc", skippedInc,
-		"compress_saved", compressSaved,
-		"deleted", len(deletedPaths))
+	if failedFiles > 0 {
+		e.logger.Warn("backup completed with errors",
+			"backup_id", backupID,
+			"total_files", totalFiles,
+			"failed_files", failedFiles,
+			"total_size", totalOriginalSize,
+			"uploaded_size", totalUploadedSize,
+			"skipped_dedup", len(dedupResult.Skipped),
+			"compress_saved", compressSaved,
+			"deleted", len(deletedPaths))
+	} else {
+		e.logger.Info("backup completed successfully",
+			"backup_id", backupID,
+			"total_files", totalFiles,
+			"total_size", totalOriginalSize,
+			"uploaded_size", totalUploadedSize,
+			"skipped_dedup", len(dedupResult.Skipped),
+			"compress_saved", compressSaved,
+			"deleted", len(deletedPaths))
+	}
 
-	// After a successful backup, sync the encrypted database to OSS for
-	// disaster recovery. This runs asynchronously so it does not block the
-	// backup response. Failures are logged but do not fail the backup.
-	if e.dbBackupSvc != nil {
-		go func() {
-			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			defer cancel()
-			if err := e.dbBackupSvc.BackupDatabase(bgCtx); err != nil {
-				e.logger.Error("automatic database backup to OSS failed", "error", err)
-			}
-		}()
+	// ── Phase 11: Push updated DB to OSS ───────────────────────────────
+	// Sync the encrypted database to OSS as the new authoritative oss.db.
+	// The previous oss.db is renamed to a .bkup. Failures are logged but do
+	// not fail the backup — the files are already uploaded, and the DB will
+	// be synced on the next successful backup.
+	if svc := e.getDBBackupSvc(); svc != nil {
+		pushCtx, pushCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		if err := svc.PushOSSDB(pushCtx); err != nil {
+			e.logger.Error("failed to push oss.db to OSS after backup", "error", err)
+			e.logEvent(backupID, models.LogLevelWarn, "数据库同步到OSS失败", err.Error())
+		} else {
+			e.logEvent(backupID, models.LogLevelInfo, "数据库已同步到OSS", "")
+		}
+		pushCancel()
 	}
 
 	return nil
@@ -1077,7 +1065,6 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64, backupType m
 func (e *Engine) processAndUploadFile(
 	ctx context.Context,
 	entry *dedup.DedupFileEntry,
-	backupType models.BackupType,
 	tmpDir string,
 	backupID int64,
 ) (fileID int64, originalSize int64, storedSize int64, compressType string, storageKey string, encIV string, err error) {
@@ -1138,7 +1125,7 @@ func (e *Engine) processAndUploadFile(
 	if entry.StorageKey != "" {
 		storageKey = entry.StorageKey
 	} else {
-		storageKey = e.generateStorageKey(backupType, entry.NewHash)
+		storageKey = e.generateStorageKey(entry.NewHash)
 	}
 
 	// Upload.
@@ -1177,17 +1164,24 @@ func (e *Engine) processAndUploadFile(
 	return fileID, originalSize, storedSize, compressType, storageKey, encIV, nil
 }
 
-// generateStorageKey builds the OSS object key for a file.
-func (e *Engine) generateStorageKey(backupType models.BackupType, hash string) string {
-	dateStr := time.Now().Format("20060102")
-	typeStr := string(backupType)
-
+// generateStorageKey builds the OSS object key for a file content hash.
+// The key is content-addressed (hash-based), with no backup-type prefix:
+//   data/<hash-prefix>/<hash>.enc
+func (e *Engine) generateStorageKey(hash string) string {
 	hashPrefix := "00"
 	if len(hash) >= 2 {
 		hashPrefix = hash[:2]
 	}
+	return fmt.Sprintf("data/%s/%s.enc", hashPrefix, hash)
+}
 
-	return fmt.Sprintf("data/%s-%s/%s/%s.enc", dateStr, typeStr, hashPrefix, hash)
+// availableDiskSpace returns the number of free bytes available on the filesystem containing dir.
+func availableDiskSpace(dir string) (int64, error) {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(dir, &stat); err != nil {
+		return 0, fmt.Errorf("statfs %q: %w", dir, err)
+	}
+	return int64(stat.Bavail) * int64(stat.Bsize), nil
 }
 
 // formatSize 将字节数格式化为人类可读的字符串。

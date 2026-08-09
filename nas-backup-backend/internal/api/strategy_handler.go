@@ -236,27 +236,23 @@ func (r *Router) handleUpdateUpload(w http.ResponseWriter, req *http.Request) {
 
 // handleGetRetention returns the retention configuration.
 func (r *Router) handleGetRetention(w http.ResponseWriter, req *http.Request) {
-	versionKeepStr, _ := r.db.ConfigRepo.Get("retention.version_keep_count")
 	orphanGraceStr, _ := r.db.ConfigRepo.Get("retention.orphan_grace_days")
-	fullResetStr, _ := r.db.ConfigRepo.Get("retention.full_reset_interval")
 	keepDeletedStr, _ := r.db.ConfigRepo.Get("retention.keep_deleted_days")
+	dbBkupKeepStr, _ := r.db.ConfigRepo.Get("retention.db_bkup_keep_count")
 
 	cfg := &models.RetentionConfig{}
-	if versionKeepStr != "" {
-		cfg.VersionKeepCount, _ = strconv.Atoi(versionKeepStr)
-	}
 	if orphanGraceStr != "" {
 		cfg.OrphanGraceDays, _ = strconv.Atoi(orphanGraceStr)
-	}
-	if fullResetStr != "" {
-		cfg.FullResetInterval, _ = strconv.Atoi(fullResetStr)
 	}
 	if keepDeletedStr != "" {
 		cfg.KeepDeletedDays, _ = strconv.Atoi(keepDeletedStr)
 	}
+	if dbBkupKeepStr != "" {
+		cfg.DBBkupKeepCount, _ = strconv.Atoi(dbBkupKeepStr)
+	}
 
-	// Fallback to app config defaults.
-	if cfg.VersionKeepCount == 0 {
+	// Fallback to app config defaults when DB values are unset.
+	if cfg.OrphanGraceDays == 0 && cfg.KeepDeletedDays == 0 {
 		fallback := r.config.ToModelsRetentionConfig()
 		cfg = &fallback
 	}
@@ -273,10 +269,9 @@ func (r *Router) handleUpdateRetention(w http.ResponseWriter, req *http.Request)
 	}
 
 	kvPairs := map[string]string{
-		"retention.version_keep_count":  strconv.Itoa(cfg.VersionKeepCount),
-		"retention.orphan_grace_days":   strconv.Itoa(cfg.OrphanGraceDays),
-		"retention.full_reset_interval": strconv.Itoa(cfg.FullResetInterval),
-		"retention.keep_deleted_days":   strconv.Itoa(cfg.KeepDeletedDays),
+		"retention.orphan_grace_days":  strconv.Itoa(cfg.OrphanGraceDays),
+		"retention.keep_deleted_days":  strconv.Itoa(cfg.KeepDeletedDays),
+		"retention.db_bkup_keep_count": strconv.Itoa(cfg.DBBkupKeepCount),
 	}
 
 	for key, value := range kvPairs {

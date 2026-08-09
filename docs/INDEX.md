@@ -8,10 +8,9 @@
 
 | 文档 | 说明 | 读者 |
 |------|------|------|
-| [**部署指南 - Docker（推荐）**](DEPLOYMENT_DOCKER.md) | Docker Compose 一键部署，最快 5 分钟启动 | 所有用户 |
-| [部署指南 - 生产环境](DEPLOYMENT_PRODUCTION.md) | Debian 裸机部署，systemd + Nginx | 运维人员 |
-| [部署指南 - 测试环境](DEPLOYMENT_TESTENV.md) | 开发测试环境部署，支持热重载 | 开发者 |
+| [**部署指南**](DEPLOYMENT.md) | Docker / Debian 裸机 / 测试环境三种部署方式（推荐 Docker） | 所有用户 |
 | [恢复操作指南](RESTORE_GUIDE.md) | 数据恢复全流程（日常误删/灾难恢复/全盘迁移） | 所有用户 |
+| [故障排查](TROUBLESHOOTING.md) | 环境/配置/代码/解冻/恢复各类问题排查 | 所有用户 |
 
 ---
 
@@ -19,21 +18,9 @@
 
 | 文档 | 说明 | 读者 |
 |------|------|------|
-| [**代码百科 WIKI**](WIKI.md) | 完整代码架构详解（100+ KB）：模块、API、数据库、流程 | 开发者/AI |
+| [**代码百科 WIKI**](WIKI.md) | 完整代码架构详解：模块、API、数据库、流程、Bug 修复记录 | 开发者/AI |
 | [脚本说明](SCRIPTS.md) | 所有辅助脚本的用途和使用方法 | 运维/开发者 |
-| [验收报告](ACCEPTANCE_REPORT.md) | 生产可行性验收报告：云端闭环验证、Bug 修复记录、已知限制 | 运维/评估者 |
-
----
-
-## 📋 设计与规划文档
-
-这些文档是开发过程中的设计资料，供二次开发参考：
-
-| 文档 | 说明 |
-|------|------|
-| [需求对齐](ALIGNMENT.md) | 恢复功能需求边界与验收标准 |
-| [架构设计](DESIGN.md) | 恢复功能技术架构与模块设计 |
-| [任务拆分](TASKS.md) | 开发任务拆分与进度追踪 |
+| [AGENTS.md](../AGENTS.md) | AI Agent 运行手册：项目结构、命令、调试、验证链路 | 开发者/AI |
 
 ---
 
@@ -41,7 +28,8 @@
 
 ```
 nasbkup_system/
-├── README.md                    # 项目主页（你正在看的项目根目录）
+├── README.md                    # 项目主页（GitHub）
+├── AGENTS.md                    # AI Agent 运行手册
 ├── docker-compose.yml           # Docker Compose 编排
 ├── Dockerfile                   # Docker 三阶段构建
 ├── docker/                      # Docker 配置
@@ -53,7 +41,7 @@ nasbkup_system/
 │   │   ├── nas-backup/          # HTTP 服务入口
 │   │   └── restore-cli/         # CLI 恢复工具
 │   ├── internal/                # 内部包（api/backup/scanner/dedup 等）
-│   ├── scripts/                 # 后端脚本
+│   ├── scripts/                 # 后端辅助脚本
 │   └── data/                    # 运行时数据（DB/密钥/日志）
 ├── nas-backup-frontend/         # React 前端
 │   ├── src/
@@ -61,8 +49,22 @@ nasbkup_system/
 │   │   ├── components/          # UI 组件
 │   │   └── utils/               # 工具函数
 │   └── dist/                    # 构建产物
-├── docs/                        # 文档中心（本目录）
-└── nas_file_generator.py        # 测试文件生成器
+├── scripts/                     # 部署/启停/验证脚本
+│   ├── deploy.sh                # 统一部署（macOS + Debian）
+│   ├── start.sh                 # 统一启停
+│   ├── update-debian.sh         # Debian 代码更新
+│   ├── verify-e2e.sh            # E2E 测试入口
+│   ├── verify_e2e.py            # Python E2E 测试套件
+│   ├── verify_cloud_archive.py  # 云端归档验证
+│   ├── nas_file_generator.py    # 测试数据生成器
+│   └── lib/                     # 脚本公共函数库
+└── docs/                        # 文档中心（本目录）
+    ├── INDEX.md                 # 文档索引
+    ├── WIKI.md                  # 代码百科
+    ├── DEPLOYMENT.md            # 部署指南
+    ├── TROUBLESHOOTING.md       # 故障排查
+    ├── RESTORE_GUIDE.md         # 恢复操作指南
+    └── SCRIPTS.md               # 脚本说明
 ```
 
 ---
@@ -112,10 +114,11 @@ nasbkup_system/
 
 ## 📞 获取帮助
 
-1. 首先阅读 [Docker 部署指南](DEPLOYMENT_DOCKER.md) 完成部署
+1. 首先阅读 [部署指南](DEPLOYMENT.md) 完成部署
 2. 日常使用参考 [恢复操作指南](RESTORE_GUIDE.md)
-3. 二次开发查阅 [代码百科 WIKI](WIKI.md)
-4. 脚本问题查看 [脚本说明](SCRIPTS.md)
+3. 遇到问题查阅 [故障排查](TROUBLESHOOTING.md)
+4. 二次开发查阅 [代码百科 WIKI](WIKI.md)
+5. 脚本问题查看 [脚本说明](SCRIPTS.md)
 
 ---
 

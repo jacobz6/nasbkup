@@ -84,6 +84,20 @@ nasbkup_system/
 ├── README.md                    # 项目主页（GitHub）
 ├── docker-compose.yml           # Docker Compose 编排
 ├── Dockerfile                   # Docker 三阶段构建
+├── scripts/                     # 部署/启停/验证脚本
+│   ├── deploy.sh                # 统一部署（macOS + Debian 自动适配）
+│   ├── start.sh                 # 统一启停（macOS nohup / Debian systemd）
+│   ├── update-debian.sh         # Debian 代码更新（git pull + 构建 + 重启）
+│   ├── verify-e2e.sh            # E2E 测试入口
+│   ├── verify_e2e.py            # Python E2E 测试套件
+│   ├── verify_cloud_archive.py  # 云端归档解冻验证
+│   ├── nas_file_generator.py    # 测试数据生成器
+│   ├── upgrade-rclone-debian.sh # rclone 升级
+│   ├── generate_report.py       # 测试报告生成
+│   └── lib/                     # 脚本公共函数库
+│       ├── common.sh            # 颜色/路径/端口/HTTP 通用函数
+│       ├── deploy-macos.sh      # macOS 部署模块（被 deploy.sh source）
+│       └── deploy-debian.sh     # Debian 部署模块（被 deploy.sh source）
 ├── nas-backup-backend/          # Go 后端服务
 │   ├── cmd/nas-backup/          # HTTP 服务入口
 │   │   └── main.go
@@ -112,9 +126,7 @@ nasbkup_system/
 │   ├── scripts/                 # 辅助脚本
 │   │   ├── setup-rclone.sh      # rclone 交互式配置
 │   │   ├── patch-rclone-crypt-password.sh # 修复 rclone crypt 密码
-│   │   ├── backup.sh            # CLI 手动触发备份
-│   │   └── backup_restore_test.py # 备份恢复闭环测试
-│   ├── run_tests.sh             # 一键测试脚本
+│   │   └── backup.sh            # CLI 手动触发备份
 │   ├── config.yaml.example      # 配置文件示例
 │   ├── go.mod / go.sum
 │   └── README.md
@@ -148,15 +160,10 @@ nasbkup_system/
 ├── docs/                        # 文档中心
 │   ├── INDEX.md                 # 文档索引
 │   ├── WIKI.md                  # 代码百科（本文件）
-│   ├── DEPLOYMENT_DOCKER.md     # Docker 部署指南
-│   ├── DEPLOYMENT_PRODUCTION.md # 生产环境部署指南
-│   ├── DEPLOYMENT_TESTENV.md    # 测试环境部署指南
+│   ├── DEPLOYMENT.md            # 部署指南（Docker/裸机/测试三合一）
+│   ├── TROUBLESHOOTING.md       # 故障排查（环境/配置/代码/解冻/恢复）
 │   ├── RESTORE_GUIDE.md         # 恢复操作指南
-│   ├── SCRIPTS.md               # 脚本说明
-│   ├── ALIGNMENT.md             # 需求对齐文档
-│   ├── DESIGN.md                # 架构设计文档
-│   └── TASKS.md                 # 任务拆分文档
-└── nas_file_generator.py        # 测试数据生成器
+│   └── SCRIPTS.md               # 脚本说明
 ```
 
 ### 架构分层
@@ -1954,7 +1961,7 @@ npm run preview  # 预览构建结果
    - `add_header Cache-Control 'no-cache';`
    - `add_header X-Accel-Buffering no;`（告诉 Nginx 不要缓冲）
 
-详见 [DEPLOYMENT_PRODUCTION.md](DEPLOYMENT_PRODUCTION.md)（生产环境裸机部署）或 [DEPLOYMENT_DOCKER.md](DEPLOYMENT_DOCKER.md)（Docker 部署）
+详见 [DEPLOYMENT.md](DEPLOYMENT.md)（Docker / 裸机 / 测试环境部署指南）
 
 ---
 
@@ -1980,11 +1987,11 @@ CLI 触发备份的便捷脚本，支持：
 
 ### nas_file_generator.py
 
-**文件**: `nas_file_generator.py`
+**文件**: `scripts/nas_file_generator.py`
 
 测试数据生成器，用于生成模拟 NAS 文件系统：
-- 按文件数量生成：`python nas_file_generator.py --count 1000 --output /tmp/nas_test`
-- 按总大小生成：`python nas_file_generator.py --size 10GB --output /tmp/nas_test`
+- 按文件数量生成：`python scripts/nas_file_generator.py --count 1000 --output /tmp/nas_test`
+- 按总大小生成：`python scripts/nas_file_generator.py --size 10GB --output /tmp/nas_test`
 - 模拟不同文件类型（文档、图片、视频、代码等）
 - 模拟目录结构
 
@@ -2460,3 +2467,42 @@ OSS 存储使用  ≤  已上传部分原始大小  ≤  总文件大小
 压缩节省 + OSS 存储使用  ≈  已上传部分原始大小（去重后）
 去重节省 + 已上传部分原始大小  ≈  总文件大小 × 重复率
 ```
+
+---
+
+## 附录 B：历史关键 Bug 修复记录（2026-08 验收）
+
+> 本节记录 2026-08 生产验收期间发现的 3 个影响云端闭环的关键 Bug 及其根因修复，供后续诊断类似问题参考。
+
+### B.1 OSS 凭证无法从 config.yaml 读取（严重）
+
+**文件**: [internal/config/config.go](file:///Users/jacobzhang/工作区/code/nasbkup_system/nas-backup-backend/internal/config/config.go)
+
+**根因**: `OSSConfig.AccessKeyID` 和 `AccessKeySecret` 字段被标记为 `yaml:"-"`，导致配置文件中的 OSS 密钥被忽略，只能从环境变量读取。
+
+**修复**: 将 yaml 标签改为 `yaml:"access_key_id"` 和 `yaml:"access_key_secret"`。凭证读取优先级：环境变量 → config.yaml → rclone.conf（向后兼容）。
+
+### B.2 rclone crypt `.bin` 后缀导致 OSS SDK 404（严重）
+
+**文件**: [internal/storage/storage.go](file:///Users/jacobzhang/工作区/code/nasbkup_system/nas-backup-backend/internal/storage/storage.go)
+
+**根因**: rclone crypt remote 即使在 `filename_encryption=off` 时，仍会给所有上传文件追加 `.bin` 后缀（如 `file.enc` → `file.enc.bin`）。代码直接用数据库记录的 `storage_key`（不带 .bin）调用 OSS SDK，导致 `NoSuchKey` 404。
+
+**修复**: 新增 `ossObjectKey()` 辅助函数，当使用 crypt remote（`remote_name != "oss"`）时自动追加 `.bin` 后缀；`CheckRestored` 和 `RestoreObject` 均使用实际 OSS key 调用 SDK，并包含无后缀回退逻辑。
+
+### B.3 归档存储检测逻辑错误 + RestoreObject MalformedXML（严重）
+
+**文件**: [internal/storage/storage.go](file:///Users/jacobzhang/工作区/code/nasbkup_system/nas-backup-backend/internal/storage/storage.go)
+
+**根因**:
+- `CheckRestored` 逻辑错误：原代码认为 `X-Oss-Restore` 头为空表示对象不在归档存储、可直接下载。但归档对象从未被请求解冻时该头确实为空，可对象仍需先解冻才能下载。
+- `RestoreObject` XML 格式错误：原用 `RestoreObjectDetail` 并传 `Tier=Expedited/Standard`，但阿里云归档存储（Archive）**不支持** `JobParameters/Tier` 参数（仅冷归档/深度归档支持），导致 `MalformedXML: GlacierJobParameters is not supported`。
+- 加急恢复不适用：阿里云归档存储（Archive）不支持 Expedited（1-10 分钟），仅冷归档支持。归档存储只有标准恢复（1-10 小时）。
+
+**修复**:
+- 重写 `CheckRestored`：先检查 `X-Oss-Storage-Class` 头判断是否为归档存储类型，再结合 `X-Oss-Restore` 头判断恢复状态。`x-oss-restore` header 两种值（**都带引号**）：`ongoing-request="true"`（解冻中）/ `ongoing-request="false", expiry-date="..."`（已解冻）。
+- 改用 `RestoreObjectXML(ossKey, "<RestoreRequest><Days>7</Days></RestoreRequest>")` 发送最小合法 XML body，只传 Days 不传 Tier，适配阿里云归档存储 API。`expedited` 参数记录警告日志并自动降级到标准恢复。
+- 新增 `isArchiveStorageClass()` 辅助函数判断归档存储类型。
+
+> ⚠️ **避坑**: `RestoreObjectDetail(RestoreConfiguration{Days:7})` 在 SDK 内部会强制给 `Tier=""` 填上 `"Standard"`，对 Archive 桶必踩 MalformedXML 坑。必须用 `RestoreObjectXML` 发送精确 body。
+

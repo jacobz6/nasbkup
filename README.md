@@ -125,13 +125,11 @@ ls -la ./data/
 | 文档 | 说明 |
 |------|------|
 | [📖 文档中心](docs/INDEX.md) | 所有文档的索引入口 |
-| [🐳 Docker 部署指南](docs/DEPLOYMENT_DOCKER.md) | Docker Compose 部署完整说明（推荐） |
-| [🖥️ 生产环境部署](docs/DEPLOYMENT_PRODUCTION.md) | Debian 裸机部署，systemd + Nginx |
-| [🧪 测试环境部署](docs/DEPLOYMENT_TESTENV.md) | 开发测试环境，支持热重载 |
+| [🚀 部署指南](docs/DEPLOYMENT.md) | Docker / Debian 裸机 / 测试环境三种部署方式 |
 | [💾 恢复操作指南](docs/RESTORE_GUIDE.md) | 数据恢复全流程（日常误删/灾难恢复/全盘迁移） |
-| [📚 代码百科 WIKI](docs/WIKI.md) | 完整代码架构详解（100+ KB） |
+| [🔧 故障排查](docs/TROUBLESHOOTING.md) | 环境/配置/代码/解冻/恢复各类问题排查 |
+| [📚 代码百科 WIKI](docs/WIKI.md) | 完整代码架构详解（架构/API/Schema/Bug 修复记录） |
 | [📜 脚本说明](docs/SCRIPTS.md) | 所有辅助脚本的用途和使用方法 |
-| [✅ 验收报告](docs/ACCEPTANCE_REPORT.md) | 生产可行性验收报告：云端闭环验证、Bug 修复记录 |
 
 ## 📁 项目结构
 
@@ -169,22 +167,23 @@ nasbkup_system/
 │   │   └── utils/               # API 客户端等工具
 │   └── package.json
 ├── scripts/                     # 部署与验证脚本
-│   ├── deploy-macos.sh          # macOS 一键部署脚本
+│   ├── deploy.sh                # 统一部署（macOS + Debian 自动适配）
+│   ├── start.sh                 # 统一启停（macOS nohup / Debian systemd）
+│   ├── update-debian.sh         # Debian 代码更新
 │   ├── verify-e2e.sh            # 端到端验证脚本
 │   ├── verify_e2e.py            # E2E 验证（Python）
 │   ├── verify_cloud_archive.py  # 云端归档验证
+│   ├── nas_file_generator.py    # 测试数据生成器
 │   ├── generate_report.py       # 验收报告生成器
-│   └── TROUBLESHOOTING.md       # 故障排查指南
+│   └── lib/                     # 脚本公共函数库
 ├── docs/                        # 文档中心
 │   ├── INDEX.md                 # 文档索引
 │   ├── WIKI.md                  # 代码百科
-│   ├── DEPLOYMENT_DOCKER.md     # Docker 部署指南
-│   ├── DEPLOYMENT_PRODUCTION.md # 生产环境部署
-│   ├── DEPLOYMENT_TESTENV.md    # 测试环境部署
+│   ├── DEPLOYMENT.md            # 部署指南（Docker/裸机/测试三合一）
+│   ├── TROUBLESHOOTING.md       # 故障排查
 │   ├── RESTORE_GUIDE.md         # 恢复操作指南
-│   ├── SCRIPTS.md               # 脚本说明
-│   └── ACCEPTANCE_REPORT.md     # 验收报告
-└── nas_file_generator.py        # 测试文件生成器
+│   └── SCRIPTS.md               # 脚本说明
+└── AGENTS.md                    # AI Agent 运行手册
 ```
 
 ## 🔒 安全设计
@@ -234,13 +233,15 @@ npm run dev
 
 ```bash
 cd nas-backup-backend
-./run_tests.sh
+export PATH="$HOME/go-sdk/go/bin:$PATH"
+go vet ./...
+CGO_ENABLED=1 go test -count=1 -short -timeout 300s ./...
 ```
 
 ### 生成测试数据
 
 ```bash
-python3 nas_file_generator.py --output /tmp/test-files --count 500
+python3 scripts/nas_file_generator.py --output /tmp/test-files --count 500
 ```
 
 ## ⚠️ 免责声明

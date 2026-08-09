@@ -21,11 +21,6 @@ func (r *Router) handleDashboardStats(w http.ResponseWriter, req *http.Request) 
 	_, memRunning := r.engine.RunningBackupID()
 	isRunning := dbRunning || memRunning
 
-	// Bootstrap detection: fresh instance pointed at a bucket that already has
-	// backups from another environment. The flag + message surface prominently
-	// on the dashboard so the user knows to run `restore-cli bootstrap`.
-	bootstrapRequired, bootstrapMsg := r.engine.IsBootstrapRequired()
-
 	// OSS quota is stored in config_kv (set via the Strategy page upload config).
 	ossQuotaBytes := int64(0)
 	if quotaStr, _ := r.db.ConfigRepo.Get("upload.oss_quota_bytes"); quotaStr != "" {
@@ -62,8 +57,6 @@ func (r *Router) handleDashboardStats(w http.ResponseWriter, req *http.Request) 
 		BackupCount:         backupCount,
 		UniqueHashCount:     uniqueHashes,
 		NeedsReconcile:      r.engine.NeedsReconcile(),
-		BootstrapRequired:   bootstrapRequired,
-		BootstrapMessage:    bootstrapMsg,
 		OSSInfo: models.OSSInfo{
 			StorageClass: storageClass,
 			Endpoint:     r.config.OSS.Endpoint,

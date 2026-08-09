@@ -3,7 +3,7 @@
 # NAS Backup System - Complete E2E Verification Script
 # ==============================================================================
 # This script:
-#   1. Ensures the backend is built (runs deploy-macos.sh if needed)
+#   1. Ensures the backend is built (runs deploy.sh if needed)
 #   2. Starts the backend server
 #   3. Runs the Python E2E verification suite
 #   4. Generates an HTML acceptance report
@@ -54,7 +54,7 @@ done
 if [[ "$SKIP_BUILD" == "false" ]]; then
     if [[ ! -f "$BACKEND_BIN" ]] || [[ ! -f "$CONFIG_FILE" ]]; then
         step "Backend not built or not configured. Running deploy script..."
-        bash "${SCRIPT_DIR}/deploy-macos.sh" --skip-deps
+        bash "${SCRIPT_DIR}/deploy.sh" --skip-deps
     else
         success "Backend binary and config found, skipping build (use --skip-build to skip this check)"
     fi

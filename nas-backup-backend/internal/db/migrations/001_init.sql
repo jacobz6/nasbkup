@@ -20,16 +20,18 @@ CREATE INDEX IF NOT EXISTS idx_files_status  ON files (status);
 CREATE INDEX IF NOT EXISTS idx_files_inode   ON files (inode);
 
 -- Backup session records.
+-- Each backup is a single session; there is no full/incremental distinction
+-- and no "base backup" chain. status includes 'completed_with_errors' for
+-- sessions where some files failed but others succeeded.
 CREATE TABLE IF NOT EXISTS backups (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    type            TEXT    NOT NULL CHECK (type IN ('full', 'incremental')),
-    status          TEXT    NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'completed', 'failed', 'cancelled')),
-    base_backup_id  INTEGER,
+    status          TEXT    NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'running', 'completed', 'completed_with_errors', 'failed', 'cancelled')),
     total_files     INTEGER NOT NULL DEFAULT 0,
     total_size      INTEGER NOT NULL DEFAULT 0,
     uploaded_size   INTEGER NOT NULL DEFAULT 0,
     skipped_dedup   INTEGER NOT NULL DEFAULT 0,
-    skipped_inc     INTEGER NOT NULL DEFAULT 0,
+    failed_files    INTEGER NOT NULL DEFAULT 0,
     compress_saved  INTEGER NOT NULL DEFAULT 0,
     started_at      TEXT,
     completed_at    TEXT,
@@ -38,7 +40,6 @@ CREATE TABLE IF NOT EXISTS backups (
 );
 
 CREATE INDEX IF NOT EXISTS idx_backups_status    ON backups (status);
-CREATE INDEX IF NOT EXISTS idx_backups_type      ON backups (type);
 CREATE INDEX IF NOT EXISTS idx_backups_created   ON backups (created_at);
 
 -- Many-to-many: which files were included in which backup session.

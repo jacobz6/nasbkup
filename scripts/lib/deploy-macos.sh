@@ -1,0 +1,402 @@
+#!/bin/bash
+# ==============================================================================
+# NAS Backup System - macOS 部署模块（被 deploy.sh source 引入）
+# ==============================================================================
+# 提供函数：deploy_main
+# 依赖全局变量（由 common.sh / deploy.sh 设置）：
+#   SCRIPT_DIR / PROJECT_ROOT / BACKEND_DIR / FRONTEND_DIR / DATA_DIR
+#   CONFIG_FILE / SKIP_DEPS / USE_REAL_OSS
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# macOS 部署主函数
+# ------------------------------------------------------------------------------
+deploy_main() {
+    # macOS 专用路径检测（覆盖 detect_paths 的默认值，macOS 使用项目内路径）
+    PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+    BACKEND_DIR="${PROJECT_ROOT}/nas-backup-backend"
+    FRONTEND_DIR="${PROJECT_ROOT}/nas-backup-frontend"
+    DATA_DIR="${BACKEND_DIR}/data"
+    CONFIG_FILE="${BACKEND_DIR}/config.yaml"
+    RCLONE_CONFIG="${DATA_DIR}/rclone.conf"
+
+    local test_dir="${PROJECT_ROOT}/test-env"
+    local local_cloud_dir="${test_dir}/local-cloud-storage"
+    local test_source_dir="${test_dir}/source-files"
+    local test_restore_dir="${test_dir}/restore-output"
+
+    # ------------------------------------------------------------------
+    # Pre-flight
+    # ------------------------------------------------------------------
+    step "Pre-flight 检查"
+    [[ "$(uname -s)" == "Darwin" ]] || fail "macOS 模块仅支持 macOS，当前: $(uname -s)"
+    success "运行于 macOS $(sw_vers -productVersion)"
+
+    # ------------------------------------------------------------------
+    # Step 1: Homebrew + 依赖
+    # ------------------------------------------------------------------
+    if [[ "$SKIP_DEPS" == "false" ]]; then
+        step "检查 Homebrew"
+        if ! command -v brew &>/dev/null; then
+            info "安装 Homebrew..."
+            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+            [[ -f /opt/homebrew/bin/brew ]] && eval "$(/opt/homebrew/bin/brew shellenv)"
+        fi
+        success "Homebrew 可用: $(brew --version | head -1)"
+
+        step "通过 Homebrew 安装系统依赖"
+        local brew_pkgs=()
+        command -v go      &>/dev/null || brew_pkgs+=(go)
+        command -v node    &>/dev/null || brew_pkgs+=(node)
+        command -v rclone  &>/dev/null || brew_pkgs+=(rclone)
+        command -v zstd    &>/dev/null || brew_pkgs+=(zstd)
+        command -v python3 &>/dev/null || brew_pkgs+=(python3)
+        command -v openssl &>/dev/null || brew_pkgs+=(openssl)
+
+        if [[ ${#brew_pkgs[@]} -gt 0 ]]; then
+            info "安装: ${brew_pkgs[*]}"
+            brew install "${brew_pkgs[@]}"
+        else
+            info "所有系统依赖已安装"
+        fi
+
+        for dep in go node rclone zstd python3 openssl; do
+            command -v "$dep" &>/dev/null && success "$dep: 已安装" || fail "$dep 安装失败"
+        done
+
+        step "安装 Python 依赖"
+        pip3 install --break-system-packages requests 2>/dev/null || pip3 install requests
+        success "Python requests 已安装"
+    else
+        info "跳过依赖安装 (--skip-deps)"
+    fi
+
+    # ------------------------------------------------------------------
+    # Step 2: 验证构建工具链
+    # ------------------------------------------------------------------
+    step "验证构建工具链"
+    export GOPATH="${GOPATH:-$HOME/go}"
+    export PATH="${GOPATH}/bin:/usr/local/go/bin:/opt/homebrew/bin:$PATH"
+    success "Go: $(go version | awk '{print $3}')"
+    success "Node.js: $(node --version) (npm $(npm --version))"
+
+    # ------------------------------------------------------------------
+    # Step 3: 测试环境目录
+    # ------------------------------------------------------------------
+    step "创建测试环境目录"
+    mkdir -p "$DATA_DIR" "${DATA_DIR}/logs" "$local_cloud_dir" "$test_source_dir" "$test_restore_dir"
+    success "数据目录: ${DATA_DIR}"
+    success "本地云存储: ${local_cloud_dir}"
+
+    # ------------------------------------------------------------------
+    # Step 4: 主密钥
+    # ------------------------------------------------------------------
+    step "生成主加密密钥"
+    local master_key="${DATA_DIR}/master.key"
+    if [[ ! -f "$master_key" ]]; then
+        openssl rand -hex 32 > "$master_key"
+        chmod 600 "$master_key"
+        success "主密钥已生成: ${master_key}"
+    else
+        success "主密钥已存在: ${master_key}"
+    fi
+
+    # ------------------------------------------------------------------
+    # Step 5: rclone 配置
+    # ------------------------------------------------------------------
+    step "配置 rclone"
+
+    if [[ "$USE_REAL_OSS" == "true" ]]; then
+        info "配置真实阿里云 OSS..."
+        read -rp "OSS Endpoint (如 oss-cn-hangzhou.aliyuncs.com): " oss_endpoint
+        read -rp "OSS Bucket 名称: " oss_bucket
+        read -rp "Access Key ID: " oss_ak
+        read -rsp "Access Key Secret: " oss_sk; echo ""
+
+        if [[ -x "${BACKEND_DIR}/scripts/setup-rclone.sh" ]]; then
+            "${BACKEND_DIR}/scripts/setup-rclone.sh" \
+                --endpoint "$oss_endpoint" --bucket "$oss_bucket" \
+                --ak "$oss_ak" --sk "$oss_sk" --config-path "$RCLONE_CONFIG"
+        else
+            fail "setup-rclone.sh 不存在于 ${BACKEND_DIR}/scripts/"
+        fi
+    else
+        info "配置本地文件系统 remote（离线测试模式）..."
+        local pw1 pw2
+        pw1=$(rclone obscure "$(openssl rand -base64 32)")
+        pw2=$(rclone obscure "$(openssl rand -base64 32)")
+        cat > "$RCLONE_CONFIG" <<EOF
+# Rclone 配置 - 本地测试模式（$(date -Iseconds)）
+# 使用本地文件系统 + 客户端加密模拟云存储
+
+[oss]
+type = local
+
+[oss-crypt]
+type = crypt
+remote = oss:${local_cloud_dir}
+password = ${pw1}
+password2 = ${pw2}
+filename_encryption = standard
+directory_name_encryption = true
+EOF
+        chmod 600 "$RCLONE_CONFIG"
+    fi
+
+    rclone config show --config "$RCLONE_CONFIG" &>/dev/null && success "rclone 配置验证通过" || fail "rclone 配置验证失败"
+
+    # ------------------------------------------------------------------
+    # Step 6: 生成 config.yaml
+    # ------------------------------------------------------------------
+    step "生成应用配置 config.yaml"
+    _generate_macos_config "$CONFIG_FILE" "$test_dir" "$test_source_dir"
+    success "配置文件已写入: ${CONFIG_FILE}"
+
+    # ------------------------------------------------------------------
+    # Step 7: rclone 二进制
+    # ------------------------------------------------------------------
+    step "设置 rclone 二进制"
+    mkdir -p "${BACKEND_DIR}/bin"
+    if command -v rclone &>/dev/null; then
+        cp "$(which rclone)" "${BACKEND_DIR}/bin/rclone"
+        chmod +x "${BACKEND_DIR}/bin/rclone"
+        success "已复制 rclone 到 ./bin/rclone"
+    elif [[ -f "${BACKEND_DIR}/bin/rclone" ]]; then
+        success "rclone 已存在于 ./bin/rclone"
+    else
+        info "下载 rclone ${RCLONE_ARCH}..."
+        local rclone_ver="v1.75.0"
+        curl -L -o /tmp/rclone.zip "https://downloads.rclone.org/${rclone_ver}/rclone-${rclone_ver}-osx-${RCLONE_ARCH}.zip"
+        unzip -o /tmp/rclone.zip -d /tmp/
+        cp "/tmp/rclone-${rclone_ver}-osx-${RCLONE_ARCH}/rclone" "${BACKEND_DIR}/bin/rclone"
+        chmod +x "${BACKEND_DIR}/bin/rclone"
+        rm -rf "/tmp/rclone-${rclone_ver}-osx-${RCLONE_ARCH}" /tmp/rclone.zip
+        success "已下载 rclone ${rclone_ver} 到 ./bin/rclone"
+    fi
+
+    # ------------------------------------------------------------------
+    # Step 8: 构建后端
+    # ------------------------------------------------------------------
+    step "构建 Go 后端"
+    cd "$BACKEND_DIR"
+    info "下载 Go 模块..."
+    go mod download
+    success "Go 模块已下载"
+
+    info "编译 nas-backup..."
+    CGO_ENABLED=1 go build -o nas-backup ./cmd/nas-backup/
+    success "后端二进制已构建: ${BACKEND_DIR}/nas-backup"
+
+    info "编译 restore-cli..."
+    CGO_ENABLED=1 go build -o restore-cli ./cmd/restore-cli/
+    success "restore-cli 已构建: ${BACKEND_DIR}/restore-cli"
+
+    info "运行后端单元测试..."
+    if go test ./internal/... -v -count=1 -short 2>&1 | tail -20; then
+        success "单元测试通过"
+    else
+        warn "部分测试有问题（DB 相关测试可能预期失败）"
+    fi
+
+    # ------------------------------------------------------------------
+    # Step 9: 构建前端
+    # ------------------------------------------------------------------
+    step "构建 React 前端"
+    cd "$FRONTEND_DIR"
+
+    if [[ ! -d node_modules ]]; then
+        info "安装 npm 依赖..."
+        npm install
+    else
+        info "npm 依赖已存在，运行 npm ci 确保一致性..."
+        npm ci 2>/dev/null || npm install
+    fi
+    success "npm 依赖已就绪"
+
+    info "构建生产前端..."
+    npm run build
+    success "前端已构建: ${FRONTEND_DIR}/dist/"
+
+    # ------------------------------------------------------------------
+    # Step 10: 环境信息 + 便捷脚本
+    # ------------------------------------------------------------------
+    step "生成环境信息与便捷脚本"
+
+    cat > "${SCRIPT_DIR}/env-macos.sh" <<EOF
+# 使用方法: source scripts/env-macos.sh
+export PROJECT_ROOT="${PROJECT_ROOT}"
+export BACKEND_DIR="${BACKEND_DIR}"
+export FRONTEND_DIR="${FRONTEND_DIR}"
+export DATA_DIR="${DATA_DIR}"
+export CONFIG_FILE="${CONFIG_FILE}"
+export RCLONE_CONFIG="${RCLONE_CONFIG}"
+export PATH="${GOPATH}/bin:/usr/local/go/bin:/opt/homebrew/bin:\$PATH"
+EOF
+    success "环境文件: scripts/env-macos.sh"
+
+    _generate_convenience_scripts
+
+    # ------------------------------------------------------------------
+    # 完成
+    # ------------------------------------------------------------------
+    echo ""
+    echo -e "${GREEN}${BOLD}======================================================================${NC}"
+    echo -e "${GREEN}${BOLD}  NAS Backup System - macOS 部署完成！${NC}"
+    echo -e "${GREEN}${BOLD}======================================================================${NC}"
+    echo ""
+    echo -e "  ${BOLD}环境:${NC}"
+    echo -e "    后端二进制:   ${BACKEND_DIR}/nas-backup"
+    echo -e "    前端构建:     ${FRONTEND_DIR}/dist/"
+    echo -e "    配置文件:      ${CONFIG_FILE}"
+    echo -e "    数据目录:     ${DATA_DIR}"
+    echo -e "    本地云存储:   ${local_cloud_dir}"
+    echo ""
+    echo -e "  ${BOLD}快速开始:${NC}"
+    echo -e "    1. 加载环境:   source scripts/env-macos.sh"
+    echo -e "    2. 启动服务:   ./scripts/start.sh start"
+    echo -e "    3. 打开浏览器: http://localhost:5173"
+    echo -e "    4. 运行 E2E:   ./scripts/verify-e2e.sh"
+    echo ""
+    echo -e "  ${BOLD}切换到真实 OSS:${NC}"
+    echo -e "    ./scripts/deploy.sh --with-oss"
+    echo ""
+}
+
+# ------------------------------------------------------------------------------
+# 生成 macOS 本地测试配置
+# ------------------------------------------------------------------------------
+_generate_macos_config() {
+    local cfg="$1"
+    local test_dir="$2"
+    local test_source_dir="$3"
+
+    cat > "$cfg" <<EOF
+# NAS Backup System - macOS 本地部署配置（$(date -Iseconds)）
+# 模式: $([[ "$USE_REAL_OSS" == "true" ]] && echo "阿里云 OSS" || echo "本地测试（本地文件系统模拟云存储）")
+
+server:
+  host: "127.0.0.1"
+  port: 8080
+  read_timeout_sec: 30
+  write_timeout_sec: 120
+  restore_base_dirs:
+    - "${test_dir}"
+
+database:
+  path: "./data/nas-backup.db"
+
+backup:
+  directories:
+    - path: "${test_source_dir}"
+      recursive: true
+      enabled: true
+      description: "E2E 验证测试源目录"
+
+  exclusions:
+    - pattern: "*.tmp"
+      rule_type: "extension"
+      enabled: true
+    - pattern: "*.log"
+      rule_type: "extension"
+      enabled: true
+    - pattern: ".DS_Store"
+      rule_type: "pattern"
+      enabled: true
+    - pattern: "Thumbs.db"
+      rule_type: "pattern"
+      enabled: true
+    - pattern: "node_modules"
+      rule_type: "directory"
+      enabled: true
+    - pattern: ".git"
+      rule_type: "directory"
+      enabled: true
+
+  size_limit:
+    max_file_size: 0
+    min_file_size: 0
+
+  schedule:
+    enabled: false
+    cron_expr: "0 3 1 * *"
+    timezone: "Asia/Shanghai"
+
+  compression:
+    enabled: true
+    algorithm: "zstd"
+    level: 19
+    skip_types:
+      - ".mp4"
+      - ".mkv"
+      - ".mov"
+      - ".jpg"
+      - ".jpeg"
+      - ".png"
+      - ".webp"
+      - ".gif"
+      - ".mp3"
+      - ".zip"
+      - ".7z"
+      - ".gz"
+      - ".bz2"
+      - ".xz"
+      - ".pdf"
+
+  retention:
+    version_keep_count: 5
+    orphan_grace_days: 30
+    full_reset_interval_months: 6
+    keep_deleted_days: 30
+
+  encryption:
+    algorithm: "AES-256-GCM"
+    key_file_path: "./data/master.key"
+
+oss:
+  endpoint: ""
+  bucket: ""
+  access_key_id: ""
+  access_key_secret: ""
+  region: ""
+
+rclone:
+  binary_path: "./bin/rclone"
+  config_path: "./data/rclone.conf"
+  remote_name: "oss-crypt"
+
+logging:
+  level: "info"
+  file_path: "./data/logs/nas-backup.log"
+  max_size_mb: 50
+  max_files: 10
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# 生成便捷启动脚本
+# ------------------------------------------------------------------------------
+_generate_convenience_scripts() {
+    cat > "${SCRIPT_DIR}/start-backend.sh" <<'STARTSCRIPT'
+#!/bin/bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${PROJECT_ROOT}/nas-backup-backend"
+echo "启动 NAS Backup 后端 http://127.0.0.1:8080 ... (Ctrl+C 停止)"
+exec ./nas-backup -config config.yaml
+STARTSCRIPT
+    chmod +x "${SCRIPT_DIR}/start-backend.sh"
+
+    cat > "${SCRIPT_DIR}/start-frontend-dev.sh" <<'STARTSCRIPT'
+#!/bin/bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${PROJECT_ROOT}/nas-backup-frontend"
+echo "启动 Vite 开发服务器 http://localhost:5173 ... (API 代理到 8080)"
+exec npm run dev
+STARTSCRIPT
+    chmod +x "${SCRIPT_DIR}/start-frontend-dev.sh"
+
+    success "便捷脚本已生成: scripts/start-backend.sh, scripts/start-frontend-dev.sh"
+}

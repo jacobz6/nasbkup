@@ -3,18 +3,18 @@
 # NAS Backup System - Debian 生产环境 代码更新 + 重建 + 重启 脚本
 # ==============================================================================
 # 场景: Git pull 拉了新代码后，需要重新构建前后端并重启服务。
-#       此脚本是 start-debian.sh 的"代码更新专用"配套脚本。
+#       此脚本是 start.sh 的"代码更新专用"配套脚本。
 #
 # 流程:
 #   1. (可选) git pull 拉取最新代码
 #   2. 备份当前运行的二进制和 dist/（便于快速回滚）
 #   3. 构建 Go 后端二进制 (nas-backup + restore-cli)
 #   4. 构建 React 前端 (vite build, 用本地 vite 不用 npx，避免 NAS 上 node 版本坑)
-#   5. 调用 start-debian.sh restart 重启后端 + reload Nginx
-#   6. 调用 start-debian.sh health 做三重健康检查
+#   5. 调用 start.sh restart 重启后端 + reload Nginx
+#   6. 调用 start.sh health 做三重健康检查
 #
-# 与 start-debian.sh 的分工:
-#   - start-debian.sh:  进程管理 (start/stop/restart/status/logs/health)
+# 与 start.sh 的分工:
+#   - start.sh:  进程管理 (start/stop/restart/status/logs/health)
 #   - update-debian.sh: 代码更新 (git pull + 构建 + 触发 restart + health)
 #
 # 用法:
@@ -72,7 +72,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ------------------------------------------------------------------------------
-# 路径自动检测（与 deploy-debian.sh / start-debian.sh 保持一致）
+# 路径自动检测（与 lib/deploy-debian.sh / start.sh 保持一致）
 # ------------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DETECTED_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -91,9 +91,9 @@ BACKEND_BIN="${BACKEND_DIR}/nas-backup"
 RESTORE_CLI_BIN="${BACKEND_DIR}/restore-cli"
 BACKUP_DIR="${DATA_DIR}/rollback-backups/$(date +%Y%m%d_%H%M%S)"
 
-START_SCRIPT="${SCRIPT_DIR}/start-debian.sh"
+START_SCRIPT="${SCRIPT_DIR}/start.sh"
 
-# 加常用 binary 进 PATH（与 deploy-debian.sh 一致，避免 sudo 下 PATH 被重置丢工具）
+# 加常用 binary 进 PATH（与 lib/deploy-debian.sh 一致，避免 sudo 下 PATH 被重置丢工具）
 COMMON_USER_PATHS=(
     "/usr/local/sbin" "/usr/local/bin"
     "/usr/sbin" "/usr/bin" "/sbin" "/bin"
@@ -157,7 +157,7 @@ preflight() {
         echo -e "${RED}环境缺失：${NC}"
         printf '  - %s\n' "${missing[@]}"
         echo ""
-        echo "请先运行部署脚本: sudo ./scripts/deploy-debian.sh --skip-deps"
+        echo "请先运行部署脚本: sudo ./scripts/deploy.sh --skip-deps"
         exit 1
     fi
 
@@ -309,7 +309,7 @@ build_backend() {
 
     cd "$BACKEND_DIR"
 
-    # 中国镜像链（与 deploy-debian.sh 一致）
+    # 中国镜像链（与 lib/deploy-debian.sh 一致）
     export GOPROXY="https://goproxy.cn,https://mirrors.aliyun.com/goproxy/,https://goproxy.io,direct"
     export GOSUMDB="sum.golang.google.cn"
     export GO111MODULE=on
@@ -323,7 +323,7 @@ build_backend() {
     local tmp_restore="${BACKEND_DIR}/.tmp-restore-cli"
 
     info "编译 nas-backup (CGO=1, ldflags -s -w) ..."
-    # 构建参数与 deploy-debian.sh 完全一致
+    # 构建参数与 lib/deploy-debian.sh 完全一致
     CGO_ENABLED=1 GOOS=linux GOARCH="$GOARCH" \
         go build -buildvcs=false -ldflags="-s -w" \
         -o "$tmp_bin" ./cmd/nas-backup/ \
@@ -371,7 +371,7 @@ build_frontend() {
 
     cd "$FRONTEND_DIR"
 
-    # 中国镜像（与 deploy-debian.sh 一致）
+    # 中国镜像（与 lib/deploy-debian.sh 一致）
     export npm_config_registry="https://registry.npmmirror.com"
 
     # 仅 node_modules 不存在时 npm install（省时间）
@@ -450,8 +450,8 @@ do_update() {
     echo -e "${GREEN}${BOLD}======================================================================${NC}"
     echo -e "  ${BOLD}访问地址:${NC}     http://${server_ip}:9000"
     echo -e "  ${BOLD}回滚命令:${NC}     sudo ./scripts/update-debian.sh rollback"
-    echo -e "  ${BOLD}查看状态:${NC}     sudo ./scripts/start-debian.sh status"
-    echo -e "  ${BOLD}查看日志:${NC}     sudo ./scripts/start-debian.sh logs app"
+    echo -e "  ${BOLD}查看状态:${NC}     sudo ./scripts/start.sh status"
+    echo -e "  ${BOLD}查看日志:${NC}     sudo ./scripts/start.sh logs app"
     echo ""
 }
 

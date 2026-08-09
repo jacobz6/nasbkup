@@ -289,3 +289,103 @@ func (r *RestoreJobRepository) CleanupStaleRunning() (int64, error) {
 	}
 	return res.RowsAffected()
 }
+
+// restoreJobAllColumns is the full column list used by ExportAll/ImportBatch.
+const restoreJobAllColumns = `id, status, paths, pattern, backup_id, output_dir, expedited, conflict_strategy,
+	total_files, restored_files, failed_files, total_size, restored_size, elapsed_ms,
+	error_message, created_at, started_at, completed_at`
+
+// ExportAll reads all restore_jobs rows. Used by PullOSSDB to preserve local
+// restore job history across DB-overwrite: the caller snapshots the rows into
+// memory before the local DB file is replaced, then calls ImportBatch to write
+// them back after the new DB is reopened.
+func (r *RestoreJobRepository) ExportAll() ([]*models.RestoreJobRecord, error) {
+	rows, err := r.db.Query(`
+		SELECT ` + restoreJobAllColumns + ` FROM restore_jobs ORDER BY id
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("export restore jobs: %w", err)
+	}
+	defer rows.Close()
+
+	records := make([]*models.RestoreJobRecord, 0)
+	for rows.Next() {
+		rec, err := scanRestoreJob(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan restore job row during export: %w", err)
+		}
+		records = append(records, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate restore jobs during export: %w", err)
+	}
+	return records, nil
+}
+
+// ImportBatch inserts restore_jobs rows in a single transaction, preserving
+// the original IDs. Called after PullOSSDB + Database.Reopen to write back the
+// local restore job history that was exported before the DB swap.
+func (r *RestoreJobRepository) ImportBatch(records []*models.RestoreJobRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin transaction for import restore jobs: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO restore_jobs (id, status, paths, pattern, backup_id, output_dir, expedited, conflict_strategy,
+			total_files, restored_files, failed_files, total_size, restored_size, elapsed_ms,
+			error_message, created_at, started_at, completed_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare import restore job insert: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, rec := range records {
+		pathsJSON, err := json.Marshal(rec.Paths)
+		if err != nil {
+			return fmt.Errorf("marshal paths for restore job %d: %w", rec.ID, err)
+		}
+		failedJSON, err := json.Marshal(rec.FailedFiles)
+		if err != nil {
+			return fmt.Errorf("marshal failed_files for restore job %d: %w", rec.ID, err)
+		}
+
+		startedAt := sql.NullString{}
+		if rec.StartedAt != nil {
+			startedAt.String = rec.StartedAt.Format(time.RFC3339)
+			startedAt.Valid = true
+		}
+		completedAt := sql.NullString{}
+		if rec.CompletedAt != nil {
+			completedAt.String = rec.CompletedAt.Format(time.RFC3339)
+			completedAt.Valid = true
+		}
+		elapsedMs := sql.NullInt64{}
+		if rec.ElapsedMs > 0 {
+			elapsedMs.Int64 = rec.ElapsedMs
+			elapsedMs.Valid = true
+		}
+
+		if _, err := stmt.Exec(
+			rec.ID, string(rec.Status), string(pathsJSON), rec.Pattern, rec.BackupID,
+			rec.OutputDir, rec.Expedited, rec.ConflictStrategy,
+			rec.TotalFiles, rec.RestoredFiles, string(failedJSON),
+			rec.TotalSize, rec.RestoredSize, elapsedMs,
+			rec.ErrorMessage, rec.CreatedAt.Format(time.RFC3339), startedAt, completedAt,
+		); err != nil {
+			return fmt.Errorf("insert restore job %d during import: %w", rec.ID, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit import restore jobs: %w", err)
+	}
+	return nil
+}

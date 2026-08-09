@@ -8,7 +8,7 @@
 
 **适用读者**：NAS 系统管理员、运维人员。
 
-**前置假设**：读者具备基本的 Linux 命令行操作能力，了解本系统的基本部署架构（参见 [DEPLOYMENT_DOCKER.md](DEPLOYMENT_DOCKER.md) 或 [DEPLOYMENT_PRODUCTION.md](DEPLOYMENT_PRODUCTION.md)）。
+**前置假设**：读者具备基本的 Linux 命令行操作能力，了解本系统的基本部署架构（参见 [DEPLOYMENT.md](DEPLOYMENT.md)）。
 
 ---
 
@@ -188,14 +188,14 @@
 
 1. 必备二件套（`master.key`、`rclone.conf`）已从异地安全备份中取回。
 2. 阿里云 OSS 中的备份数据完好（可在 OSS 控制台确认 bucket 中有数据）。
-3. 准备好新环境（一台 Linux 服务器，推荐使用 Docker 部署，参见 [DEPLOYMENT_DOCKER.md](DEPLOYMENT_DOCKER.md)；裸机部署参见 [DEPLOYMENT_PRODUCTION.md](DEPLOYMENT_PRODUCTION.md)）。
+3. 准备好新环境（一台 Linux 服务器，推荐使用 Docker 部署，参见 [DEPLOYMENT.md](DEPLOYMENT.md)）。
 4. 原始 NAS 至少完成过一次成功的备份（数据库已自动同步到 OSS）。
 
 ### 操作步骤
 
 #### 1. 准备新环境
 
-推荐使用 Docker 部署（参见 [DEPLOYMENT_DOCKER.md](DEPLOYMENT_DOCKER.md)），或按照裸机部署指引（参见 [DEPLOYMENT_PRODUCTION.md](DEPLOYMENT_PRODUCTION.md)）完成基础环境搭建：
+推荐使用 Docker 部署（参见 [DEPLOYMENT.md](DEPLOYMENT.md)）完成基础环境搭建：
 
 ```bash
 # 安装系统依赖
@@ -374,7 +374,7 @@ sudo systemctl enable nas-backup
 sudo systemctl start nas-backup
 ```
 
-配置 Nginx（参见 [DEPLOYMENT_PRODUCTION.md](DEPLOYMENT_PRODUCTION.md) 第 4 节），然后通过浏览器访问验证系统正常运行。
+配置 Nginx（参见 [DEPLOYMENT.md](DEPLOYMENT.md) 裸机部署章节），然后通过浏览器访问验证系统正常运行。
 
 #### 6. 使用 Web UI 或 CLI 恢复数据
 

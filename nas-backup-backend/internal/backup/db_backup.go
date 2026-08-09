@@ -2,6 +2,12 @@
 // This module encrypts the local SQLite database and uploads it to OSS so that
 // in a total-loss scenario only the master.key and rclone.conf are needed to
 // fully bootstrap a new NAS from cloud backups.
+//
+// The OSS bucket holds a single authoritative DB snapshot (oss.db.enc +
+// oss.db.iv). On every push the previous snapshot is renamed to a .bkup
+// (kept up to db_bkup_keep_count, default 5) so accidental pushes or
+// corruption can be rolled back. There is no multi-version history: the local
+// data/nas-backup.db is the working copy of the same logical database.
 package backup
 
 import (
@@ -12,6 +18,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -22,15 +29,23 @@ import (
 )
 
 const (
-	// dbBackupPrefix is the OSS key prefix for database backups.
-	dbBackupPrefix = "meta/db"
+	// ossDBPrefix is the OSS key prefix under which the authoritative DB
+	// snapshot and its .bkup history live.
+	ossDBPrefix = "meta/db"
 
-	// dbBackupKeepVersions is the number of historical database backup versions to retain.
-	// Bumped from 3 → 10 to support multiple environments sharing one OSS bucket.
-	// With 3 a new environment's DB backup could silently prune older snapshots
-	// created by another instance, forcing the earlier instance through the
-	// (much slower) "rebuild hash_index from files + OSS" disaster recovery path.
-	dbBackupKeepVersions = 10
+	// ossDBEncKey is the OSS object key for the current authoritative
+	// encrypted DB snapshot.
+	ossDBEncKey = "meta/db/oss.db.enc"
+
+	// ossDBIVKey is the OSS object key for the IV that decrypts ossDBEncKey.
+	ossDBIVKey = "meta/db/oss.db.iv"
+
+	// dbBkupTimestampLayout is the timestamp format embedded in .bkup names.
+	// Minute precision is enough — pushes are at most a few per day.
+	dbBkupTimestampLayout = "200601021504"
+
+	// defaultDBBkupKeepCount is used when the config value is unset or invalid.
+	defaultDBBkupKeepCount = 5
 )
 
 // DBBackupService handles encrypted database snapshots to cloud storage.
@@ -38,15 +53,15 @@ type DBBackupService struct {
 	encryptor *crypto.Encryptor
 	storage   *storage.StorageManager
 	dbPath    string       // path to the local SQLite database file
-	dbConn    *sql.DB      // raw DB connection for WAL checkpoint
+	dbConn    *sql.DB      // raw DB connection for WAL checkpoint (may be nil)
 	config    *config.AppConfig
 	logger    *slog.Logger
 }
 
 // NewDBBackupService creates a new DBBackupService.
 // dbConn is the live *sql.DB connection used to checkpoint the WAL before
-// copying the database file. It may be nil (e.g. in restore-cli bootstrap),
-// in which case WAL checkpoint is skipped.
+// copying the database file. It may be nil (e.g. during initial bootstrap
+// before the DB has been opened), in which case WAL checkpoint is skipped.
 func NewDBBackupService(enc *crypto.Encryptor, stor *storage.StorageManager, cfg *config.AppConfig, dbConn *sql.DB) *DBBackupService {
 	return &DBBackupService{
 		encryptor: enc,
@@ -58,300 +73,282 @@ func NewDBBackupService(enc *crypto.Encryptor, stor *storage.StorageManager, cfg
 	}
 }
 
-// BackupDatabase creates an encrypted copy of the local database and uploads it
-// to OSS. It also prunes old versions beyond dbBackupKeepVersions.
-// The remote key format is: meta/db/nas-backup-YYYYMMDD-HHMMSS.db.enc
-// A companion IV file is stored as: meta/db/nas-backup-YYYYMMDD-HHMMSS.db.iv
-func (s *DBBackupService) BackupDatabase(ctx context.Context) error {
+// bkupKeepCount returns the configured .bkup retention count, falling back to
+// the default when the config value is non-positive.
+func (s *DBBackupService) bkupKeepCount() int {
+	if s.config == nil || s.config.Backup.Retention.DBBkupKeepCount <= 0 {
+		return defaultDBBkupKeepCount
+	}
+	return s.config.Backup.Retention.DBBkupKeepCount
+}
+
+// OSSDBExists reports whether OSS currently holds an authoritative DB snapshot
+// (oss.db.enc). Existence of the IV is assumed when the .enc is present.
+func (s *DBBackupService) OSSDBExists(ctx context.Context) (bool, error) {
+	exists, err := s.storage.Exists(ctx, ossDBEncKey)
+	if err != nil {
+		return false, fmt.Errorf("check oss.db.enc existence: %w", err)
+	}
+	return exists, nil
+}
+
+// PullOSSDB downloads the authoritative DB snapshot from OSS, decrypts it, and
+// atomically overwrites the local database file.
+//
+// Returns (false, nil) when OSS has no oss.db.enc — this is the first-time
+// deployment case; the caller should initialize an empty local DB instead.
+//
+// PullOSSDB performs a pure file-level swap. It does NOT close or reopen the
+// *sql.DB connection — the caller is responsible for DB lifecycle management
+// (close before pull, reopen after) when the DB is already open. The engine
+// wraps this with restore_jobs preservation in pullOSSDBForBackup.
+func (s *DBBackupService) PullOSSDB(ctx context.Context) (bool, error) {
 	if s.encryptor == nil || s.storage == nil {
-		return fmt.Errorf("database backup requires both encryptor and storage manager")
+		return false, fmt.Errorf("pull oss.db requires both encryptor and storage manager")
 	}
 
-	// Verify the database file exists.
-	if _, err := os.Stat(s.dbPath); err != nil {
-		return fmt.Errorf("database file not found: %s: %w", s.dbPath, err)
+	exists, err := s.OSSDBExists(ctx)
+	if err != nil {
+		return false, err
+	}
+	if !exists {
+		return false, nil
 	}
 
-	// Step 0: Checkpoint the SQLite WAL so all committed transactions are
-	// written to the main database file before we copy it. Without this,
-	// recent writes in the -wal file would be missing from the backup.
-	if s.dbConn != nil {
-		if _, err := s.dbConn.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
-			s.logger.Warn("failed to checkpoint WAL, backup may be incomplete", "error", err)
+	tmpDir := os.TempDir()
+	localEnc := filepath.Join(tmpDir, "oss.db.pull.enc")
+	localIV := filepath.Join(tmpDir, "oss.db.pull.iv")
+	localDec := filepath.Join(tmpDir, "oss.db.pull.dec")
+	defer os.Remove(localEnc)
+	defer os.Remove(localIV)
+	defer os.Remove(localDec)
+
+	if err := s.storage.Download(ctx, ossDBEncKey, localEnc); err != nil {
+		return false, fmt.Errorf("download oss.db.enc: %w", err)
+	}
+	if err := s.storage.Download(ctx, ossDBIVKey, localIV); err != nil {
+		return false, fmt.Errorf("download oss.db.iv: %w", err)
+	}
+
+	ivData, err := os.ReadFile(localIV)
+	if err != nil {
+		return false, fmt.Errorf("read oss.db.iv: %w", err)
+	}
+	iv := strings.TrimSpace(string(ivData))
+
+	if err := s.encryptor.DecryptFile(localEnc, localDec, iv); err != nil {
+		return false, fmt.Errorf("decrypt oss.db: %w", err)
+	}
+
+	// Ensure the target directory exists (first-time bootstrap on a fresh host).
+	if dir := filepath.Dir(s.dbPath); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return false, fmt.Errorf("create db directory %s: %w", dir, err)
 		}
 	}
 
-	timestamp := time.Now().UTC().Format("20060102-150405")
-	baseName := fmt.Sprintf("nas-backup-%s.db", timestamp)
-	remoteEncKey := fmt.Sprintf("%s/%s.enc", dbBackupPrefix, baseName)
-	remoteIVKey := fmt.Sprintf("%s/%s.iv", dbBackupPrefix, baseName)
+	// Remove any stale -wal/-shm sidecars so the swapped-in DB is opened clean.
+	for _, suffix := range []string{"-wal", "-shm"} {
+		_ = os.Remove(s.dbPath + suffix)
+	}
 
-	// Step 1: Copy database to a temp file using streaming to avoid loading
-	// the entire file into memory.
+	// Atomic-ish swap: rename decrypted file over the local DB path.
+	if err := os.Rename(localDec, s.dbPath); err != nil {
+		return false, fmt.Errorf("overwrite local db: %w", err)
+	}
+
+	s.logger.Info("pulled oss.db from OSS", "path", s.dbPath)
+	return true, nil
+}
+
+// PushOSSDB uploads the local database as the new authoritative oss.db in OSS.
+// The previous oss.db is renamed to a timestamped .bkup before the new one is
+// uploaded, and superseded .bkup entries beyond the configured keep-count are
+// pruned.
+//
+// PushOSSDB is a no-op when the local DB file is missing.
+func (s *DBBackupService) PushOSSDB(ctx context.Context) error {
+	if s.encryptor == nil || s.storage == nil {
+		return fmt.Errorf("push oss.db requires both encryptor and storage manager")
+	}
+	if _, err := os.Stat(s.dbPath); err != nil {
+		return fmt.Errorf("local database file not found: %s: %w", s.dbPath, err)
+	}
+
+	// Step 1: checkpoint WAL so all committed transactions are in the main file.
+	if s.dbConn != nil {
+		if _, err := s.dbConn.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+			s.logger.Warn("wal checkpoint failed, snapshot may be incomplete", "error", err)
+		}
+	}
+
+	// Step 2: integrity check — refuse to upload a corrupt DB.
+	if s.dbConn != nil {
+		var ok string
+		if err := s.dbConn.QueryRow("PRAGMA integrity_check").Scan(&ok); err != nil {
+			return fmt.Errorf("integrity_check query failed: %w", err)
+		}
+		if ok != "ok" {
+			return fmt.Errorf("integrity_check failed: %s", ok)
+		}
+	}
+
 	tmpDir := os.TempDir()
-	localCopy := filepath.Join(tmpDir, fmt.Sprintf("%s.copy", baseName))
+	localEnc := filepath.Join(tmpDir, "oss.db.push.enc")
+	localIV := filepath.Join(tmpDir, "oss.db.push.iv")
+	localCopy := filepath.Join(tmpDir, "oss.db.push.copy")
+	defer os.Remove(localEnc)
+	defer os.Remove(localIV)
+	defer os.Remove(localCopy)
+
+	// Step 3: stream-copy the DB file (avoids loading the whole file into memory).
 	if err := copyFile(s.dbPath, localCopy); err != nil {
 		return fmt.Errorf("copy database for encryption: %w", err)
 	}
-	defer os.Remove(localCopy)
 
-	// Step 2: Encrypt the database copy.
-	localEnc := filepath.Join(tmpDir, baseName+".enc")
+	// Step 4: encrypt the copy.
 	iv, err := s.encryptor.EncryptFile(localCopy, localEnc)
 	if err != nil {
-		os.Remove(localEnc)
 		return fmt.Errorf("encrypt database: %w", err)
 	}
-	defer os.Remove(localEnc)
-
-	// Step 3: Upload encrypted database to OSS.
-	s.logger.Info("uploading database backup", "key", remoteEncKey)
-	if err := s.storage.Upload(ctx, localEnc, remoteEncKey); err != nil {
-		return fmt.Errorf("upload encrypted database: %w", err)
-	}
-
-	// Step 4: Upload IV file. This is CRITICAL — without the IV, the
-	// encrypted database cannot be decrypted. If this fails, we must
-	// delete the orphaned .enc file from OSS to avoid leaving an
-	// unrecoverable backup that looks valid.
-	ivFile := filepath.Join(tmpDir, baseName+".iv")
-	if err := os.WriteFile(ivFile, []byte(iv), 0600); err != nil {
-		os.Remove(ivFile)
-		// Best-effort cleanup of the orphaned .enc file in OSS.
-		_ = s.storage.Delete(ctx, remoteEncKey)
+	if err := os.WriteFile(localIV, []byte(iv), 0o600); err != nil {
 		return fmt.Errorf("write IV file: %w", err)
 	}
-	defer os.Remove(ivFile)
 
-	s.logger.Info("uploading database backup IV", "key", remoteIVKey)
-	if err := s.storage.Upload(ctx, ivFile, remoteIVKey); err != nil {
-		// IV upload failed — the .enc file in OSS is useless without it.
-		// Delete the orphaned .enc to avoid a false sense of security.
-		s.logger.Error("failed to upload IV file, deleting orphaned encrypted database", "error", err)
-		if delErr := s.storage.Delete(ctx, remoteEncKey); delErr != nil {
-			s.logger.Error("failed to cleanup orphaned encrypted database", "cleanup_error", delErr)
+	// Step 5: rename the previous authoritative snapshot to a .bkup (if any).
+	if prevExists, pErr := s.OSSDBExists(ctx); pErr == nil && prevExists {
+		if err := s.archivePreviousOSSDB(ctx); err != nil {
+			// Non-fatal: the new snapshot can still be uploaded; the old one
+			// will simply not be retained as a .bkup.
+			s.logger.Warn("failed to archive previous oss.db", "error", err)
 		}
-		return fmt.Errorf("upload IV file (encrypted database cleaned up): %w", err)
+	} else if pErr != nil {
+		s.logger.Warn("failed to check previous oss.db existence", "error", pErr)
 	}
 
-	// Step 5: Prune old versions.
-	if err := s.pruneOldVersions(ctx); err != nil {
-		// Non-fatal: the current backup is safe.
-		s.logger.Warn("failed to prune old database backups", "error", err)
+	// Step 6: upload the new .enc and .iv. If the .iv upload fails we must
+	// delete the orphaned .enc to avoid leaving an unrecoverable snapshot.
+	s.logger.Info("uploading oss.db", "key", ossDBEncKey)
+	if err := s.storage.Upload(ctx, localEnc, ossDBEncKey); err != nil {
+		return fmt.Errorf("upload oss.db.enc: %w", err)
+	}
+	if err := s.storage.Upload(ctx, localIV, ossDBIVKey); err != nil {
+		s.logger.Error("failed to upload oss.db.iv, deleting orphaned oss.db.enc", "error", err)
+		_ = s.storage.Delete(ctx, ossDBEncKey)
+		return fmt.Errorf("upload oss.db.iv (orphaned .enc cleaned up): %w", err)
 	}
 
-	s.logger.Info("database backup completed", "key", remoteEncKey)
+	// Step 7: prune superseded .bkup entries beyond the keep-count.
+	if err := s.pruneBkups(ctx); err != nil {
+		s.logger.Warn("failed to prune oss.db .bkup entries", "error", err)
+	}
+
+	s.logger.Info("pushed oss.db to OSS")
 	return nil
 }
 
-// pruneOldVersions lists all database backup versions in OSS and deletes
-// the oldest ones beyond dbBackupKeepVersions.
-func (s *DBBackupService) pruneOldVersions(ctx context.Context) error {
-	keys, err := s.storage.List(ctx, dbBackupPrefix)
+// archivePreviousOSSDB downloads the current oss.db.enc/.iv and re-uploads them
+// under a timestamped .bkup name, preserving the previous snapshot as a
+// rollback point.
+func (s *DBBackupService) archivePreviousOSSDB(ctx context.Context) error {
+	ts := time.Now().UTC().Format(dbBkupTimestampLayout)
+	bkupEnc := fmt.Sprintf("%s/oss.db.version%s.bkup.enc", ossDBPrefix, ts)
+	bkupIV := fmt.Sprintf("%s/oss.db.version%s.bkup.iv", ossDBPrefix, ts)
+
+	tmpDir := os.TempDir()
+	prevEnc := filepath.Join(tmpDir, "oss.db.prev.enc")
+	prevIV := filepath.Join(tmpDir, "oss.db.prev.iv")
+	defer os.Remove(prevEnc)
+	defer os.Remove(prevIV)
+
+	if err := s.storage.Download(ctx, ossDBEncKey, prevEnc); err != nil {
+		return fmt.Errorf("download previous oss.db.enc: %w", err)
+	}
+	if err := s.storage.Download(ctx, ossDBIVKey, prevIV); err != nil {
+		return fmt.Errorf("download previous oss.db.iv: %w", err)
+	}
+	if err := s.storage.Upload(ctx, prevEnc, bkupEnc); err != nil {
+		return fmt.Errorf("upload previous oss.db to .bkup.enc: %w", err)
+	}
+	if err := s.storage.Upload(ctx, prevIV, bkupIV); err != nil {
+		// Clean up the orphaned .bkup.enc — a .bkup without its IV is useless.
+		_ = s.storage.Delete(ctx, bkupEnc)
+		return fmt.Errorf("upload previous oss.db to .bkup.iv: %w", err)
+	}
+	s.logger.Info("archived previous oss.db", "bkup_enc", bkupEnc)
+	return nil
+}
+
+// bkupEncPattern matches the .bkup.enc object key and captures the timestamp.
+var bkupEncPattern = regexp.MustCompile(`^meta/db/oss\.db\.version(\d{12})\.bkup\.enc$`)
+
+// pruneBkups lists all .bkup.enc objects under meta/db/, sorts them by
+// timestamp descending, and deletes the .enc+.iv pair for any entry beyond the
+// configured keep-count.
+func (s *DBBackupService) pruneBkups(ctx context.Context) error {
+	keys, err := s.storage.List(ctx, ossDBPrefix)
 	if err != nil {
-		return fmt.Errorf("list database backups: %w", err)
+		return fmt.Errorf("list %s: %w", ossDBPrefix, err)
 	}
 
-	// Extract unique base names (strip .enc/.iv suffix) and collect all keys.
-	versions := make(map[string][]string) // baseName → [keys]
-	for _, key := range keys {
-		// key format: "meta/db/nas-backup-20060102-150405.db.enc" or ".iv"
-		base := strings.TrimSuffix(key, ".enc")
-		base = strings.TrimSuffix(base, ".iv")
-		if base != key {
-			versions[base] = append(versions[base], key)
-		}
-	}
-
-	// Sort base names descending (newest first) and delete extras.
-	sorted := make([]string, 0, len(versions))
-	for base := range versions {
-		sorted = append(sorted, base)
-	}
-	sort.Sort(sort.Reverse(sort.StringSlice(sorted)))
-
-	if len(sorted) <= dbBackupKeepVersions {
-		return nil
-	}
-
-	// Delete versions beyond the keep count.
-	var toDelete []string
-	for _, base := range sorted[dbBackupKeepVersions:] {
-		toDelete = append(toDelete, versions[base]...)
-	}
-
+	toDelete := pruneBkupsKeys(keys, s.bkupKeepCount())
 	if len(toDelete) == 0 {
 		return nil
 	}
 
-	s.logger.Info("pruning old database backups", "count", len(toDelete))
+	s.logger.Info("pruning superseded oss.db .bkup entries", "count", len(toDelete)/2)
 	return s.storage.DeleteBatch(ctx, toDelete)
 }
 
-// ListVersions returns all available database backup versions from OSS.
-// Each entry is the base name (without .enc/.iv suffix).
-func (s *DBBackupService) ListVersions(ctx context.Context) ([]string, error) {
-	keys, err := s.storage.List(ctx, dbBackupPrefix)
-	if err != nil {
-		return nil, fmt.Errorf("list database backups: %w", err)
-	}
-
-	seen := make(map[string]bool)
-	var versions []string
-	for _, key := range keys {
-		base := strings.TrimSuffix(key, ".enc")
-		base = strings.TrimSuffix(base, ".iv")
-		if base != key && !seen[base] {
-			seen[base] = true
-			versions = append(versions, base)
-		}
-	}
-	sort.Sort(sort.Reverse(sort.StringSlice(versions)))
-	return versions, nil
-}
-
-// Bootstrap downloads the specified database backup version from OSS,
-// decrypts it, and replaces the local database file. This is used for
-// disaster recovery when setting up a new NAS.
+// pruneBkupsKeys determines which .bkup.enc/.iv pairs should be deleted given
+// the full set of object keys under meta/db/ and a keep-count. Timestamps are
+// sorted descending (newest first); the first keepCount entries are retained
+// and the remainder are returned for deletion (both .enc and .iv keys).
 //
-// If the OSS bucket uses archive/cold storage class for database backups,
-// Bootstrap will automatically submit a thaw request and poll until the
-// object is downloadable (up to maxThawWait). This mirrors the thaw flow
-// used by the file restore path in restore.go.
-func (s *DBBackupService) Bootstrap(ctx context.Context, version string, targetDBPath string) error {
-	if version == "" {
-		// Find latest version.
-		versions, err := s.ListVersions(ctx)
-		if err != nil {
-			return fmt.Errorf("list versions: %w", err)
-		}
-		if len(versions) == 0 {
-			return fmt.Errorf("no database backups found in OSS")
-		}
-		version = versions[0]
+// Exported as a pure function so unit tests can cover the pruning logic without
+// constructing a DBBackupService or StorageManager.
+func pruneBkupsKeys(keys []string, keepCount int) []string {
+	type bkup struct {
+		timestamp string
+		encKey    string
+		ivKey     string
 	}
-
-	encKey := fmt.Sprintf("%s.enc", version)
-	ivKey := fmt.Sprintf("%s.iv", version)
-
-	// Ensure the target directory exists.
-	targetDir := filepath.Dir(targetDBPath)
-	if targetDir != "" && targetDir != "." {
-		if err := os.MkdirAll(targetDir, 0755); err != nil {
-			return fmt.Errorf("create target directory %s: %w", targetDir, err)
-		}
-	}
-
-	// Step A: Thaw archived objects if needed. Database backups are small
-	// (typically < 50MB) so thawing should complete well within the 6h
-	// timeout even on Archive tier (usually 1-10 hours).
-	if err := s.ensureRestored(ctx, encKey); err != nil {
-		return fmt.Errorf("thaw encrypted database: %w", err)
-	}
-	if err := s.ensureRestored(ctx, ivKey); err != nil {
-		return fmt.Errorf("thaw IV file: %w", err)
-	}
-
-	// Step B: Download encrypted database.
-	tmpDir := os.TempDir()
-	localEnc := filepath.Join(tmpDir, filepath.Base(encKey))
-	if err := s.storage.Download(ctx, encKey, localEnc); err != nil {
-		return fmt.Errorf("download encrypted database: %w", err)
-	}
-	defer os.Remove(localEnc)
-
-	// Step C: Download IV file.
-	localIV := filepath.Join(tmpDir, filepath.Base(ivKey))
-	if err := s.storage.Download(ctx, ivKey, localIV); err != nil {
-		return fmt.Errorf("download IV file: %w", err)
-	}
-	defer os.Remove(localIV)
-
-	ivData, err := os.ReadFile(localIV)
-	if err != nil {
-		return fmt.Errorf("read IV file: %w", err)
-	}
-	iv := strings.TrimSpace(string(ivData))
-
-	// Decrypt to target path.
-	if err := s.encryptor.DecryptFile(localEnc, targetDBPath, iv); err != nil {
-		return fmt.Errorf("decrypt database: %w", err)
-	}
-
-	s.logger.Info("database bootstrapped from OSS", "version", version, "target", targetDBPath)
-	return nil
-}
-
-// maxThawWait is the maximum time Bootstrap will wait for an archived
-// database snapshot to be thawed. Database backups are small (typically
-// <50MB) so they should thaw within 1-10 hours on Archive tier; 6 hours
-// is a safe upper bound that matches the file restore path.
-const bootstrapMaxThawWait = 6 * time.Hour
-
-// bootstrapThawPollInterval is how often Bootstrap polls the archive
-// restore status while waiting for thaw completion.
-const bootstrapThawPollInterval = 30 * time.Second
-
-// ensureRestored checks whether an OSS object is in an archived storage class
-// and, if so, submits a restore request and waits until it becomes
-// downloadable (or the context is cancelled / maxThawWait elapses).
-// Non-archived objects (Standard/IA) pass through immediately.
-func (s *DBBackupService) ensureRestored(ctx context.Context, remoteKey string) error {
-	// Fast path: check if already restored or non-archive.
-	restored, err := s.storage.CheckRestored(remoteKey)
-	if err == nil && restored {
-		return nil
-	}
-	if err != nil {
-		s.logger.Info("check restore status failed, will attempt thaw anyway",
-			"key", remoteKey, "error", err)
-	}
-
-	// Initiate thaw request. Use standard (non-expedited) because Archive
-	// tier does not support expedited restore.
-	if err := s.storage.RestoreObject(remoteKey, false); err != nil {
-		// "RestoreAlreadyInProgress" or non-archived state is fine.
-		errMsg := err.Error()
-		if strings.Contains(errMsg, "RestoreAlreadyInProgress") ||
-			strings.Contains(errMsg, "OK") ||
-			strings.Contains(errMsg, "OperationNotSupported") ||
-			strings.Contains(errMsg, "InvalidObjectState") {
-			s.logger.Info("object thaw already in progress or not archived, proceeding",
-				"key", remoteKey)
-			return nil
-		}
-		return fmt.Errorf("initiate restore for %q: %w", remoteKey, err)
-	}
-
-	s.logger.Info("database bootstrap: thaw initiated, waiting for completion",
-		"key", remoteKey)
-
-	// Poll until thaw completes or timeout.
-	deadline := time.Now().Add(bootstrapMaxThawWait)
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(bootstrapThawPollInterval):
-		}
-
-		restored, err = s.storage.CheckRestored(remoteKey)
-		if err != nil {
-			s.logger.Warn("check restore status during poll, retrying",
-				"key", remoteKey, "error", err)
+	byTS := make(map[string]*bkup)
+	for _, key := range keys {
+		m := bkupEncPattern.FindStringSubmatch(key)
+		if m == nil {
 			continue
 		}
-		if restored {
-			s.logger.Info("database bootstrap: thaw completed", "key", remoteKey)
-			return nil
+		ts := m[1]
+		b, ok := byTS[ts]
+		if !ok {
+			b = &bkup{timestamp: ts}
+			byTS[ts] = b
 		}
-		s.logger.Info("database bootstrap: still thawing, waiting...",
-			"key", remoteKey, "elapsed", time.Since(deadline.Add(-bootstrapMaxThawWait)).Round(time.Second))
-
-		if time.Now().After(deadline) {
-			return fmt.Errorf("object %q not restored after %v", remoteKey, bootstrapMaxThawWait)
-		}
+		b.encKey = key
+		b.ivKey = fmt.Sprintf("%s/oss.db.version%s.bkup.iv", ossDBPrefix, ts)
 	}
+
+	if len(byTS) <= keepCount {
+		return nil
+	}
+
+	sorted := make([]string, 0, len(byTS))
+	for ts := range byTS {
+		sorted = append(sorted, ts)
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(sorted)))
+
+	// Guard against negative keepCount (treated as 0 => delete everything).
+	if keepCount < 0 {
+		keepCount = 0
+	}
+	var toDelete []string
+	for _, ts := range sorted[keepCount:] {
+		b := byTS[ts]
+		toDelete = append(toDelete, b.encKey, b.ivKey)
+	}
+	return toDelete
 }
 
 // copyFile copies a file from src to dst using streaming to avoid loading

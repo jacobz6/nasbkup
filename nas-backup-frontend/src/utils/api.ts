@@ -14,10 +14,16 @@ export interface PaginatedResponse<T> {
   size: number;
 }
 
+const METHODS_REQUIRING_BODY = ['POST', 'PUT', 'PATCH'];
+
 async function request<T>(
   endpoint: string,
   options?: RequestInit
 ): Promise<APIResponse<T>> {
+  const method = (options?.method || 'GET').toUpperCase();
+  const needsBody = METHODS_REQUIRING_BODY.includes(method);
+  const hasBody = options?.body !== undefined && options?.body !== null;
+
   const url = `${API_BASE}${endpoint}`;
   const res = await fetch(url, {
     headers: {
@@ -25,6 +31,7 @@ async function request<T>(
       ...options?.headers,
     },
     ...options,
+    ...(needsBody && !hasBody ? { body: '{}' } : {}),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
@@ -65,10 +72,10 @@ export const dashboardApi = {
 
 // Backup
 export const backupApi = {
-  trigger: (type?: 'full' | 'incremental' | 'auto') =>
+  trigger: () =>
     request<{ backup_id: number; status: string }>('/backup/trigger', {
       method: 'POST',
-      body: JSON.stringify(type ? { type } : {}),
+      body: JSON.stringify({}),
     }),
   cancel: (backupId?: number) =>
     request<{ status: string }>(
@@ -204,14 +211,11 @@ export interface DashboardStats {
 
 export interface BackupRecord {
   id: number;
-  type: string;
   status: string;
-  base_backup_id: number | null;
   total_files: number;
   total_size: number;
   uploaded_size: number;
   skipped_dedup: number;
-  skipped_inc: number;
   compress_saved: number;
   started_at: string | null;
   completed_at: string | null;
@@ -262,10 +266,9 @@ export interface UploadConfig {
 }
 
 export interface RetentionConfig {
-  version_keep_count: number;
   orphan_grace_days: number;
-  full_reset_interval: number;
   keep_deleted_days: number;
+  db_bkup_keep_count: number;
 }
 
 export interface EncryptionConfig {
@@ -302,6 +305,9 @@ export interface FSEntry {
   partial_backup: boolean;
   has_update: boolean;
   will_backup: boolean;
+  last_backup_status?: 'success' | 'failed' | '';
+  last_backup_error?: string;
+  last_backup_at?: string;
 }
 
 export interface FSBrowseResult {
@@ -515,6 +521,14 @@ export const restoreApi = {
     request<{ status: string }>(`/restore/jobs/${id}/cancel`, { method: 'POST' }),
   listBackups: (page = 1, size = 50) =>
     paginatedRequest<BackupRecord>('/backups', { page, size }),
+  // Pull the latest authoritative oss.db from OSS, replacing the local working
+  // copy. Used by the restore page "更新" button to re-sync after another
+  // machine performed a backup.
+  refreshOssDb: () =>
+    request<{ status: string; pulled: boolean; message: string }>(
+      '/restore/refresh-oss-db',
+      { method: 'POST' }
+    ),
 };
 
 export function createRestoreProgressStream(

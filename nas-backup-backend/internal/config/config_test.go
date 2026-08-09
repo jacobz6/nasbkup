@@ -64,10 +64,9 @@ backup:
     algorithm: "zstd"
     level: 10
   retention:
-    version_keep_count: 3
     orphan_grace_days: 90
-    full_reset_interval_months: 6
     keep_deleted_days: 30
+    db_bkup_keep_count: 5
   encryption:
     algorithm: "AES-256-GCM"
     key_file_path: "` + tmpDir + `/master.key"
@@ -228,20 +227,19 @@ func TestToModelsRetentionConfig(t *testing.T) {
 	cfg := &AppConfig{
 		Backup: BackupConfig{
 			Retention: RetentionConfig{
-				VersionKeepCount:  5,
-				OrphanGraceDays:   120,
-				FullResetInterval: 9,
-				KeepDeletedDays:   60,
+				OrphanGraceDays: 120,
+				KeepDeletedDays: 60,
+				DBBkupKeepCount: 7,
 			},
 		},
 	}
 
 	modelsCfg := cfg.ToModelsRetentionConfig()
-	if modelsCfg.VersionKeepCount != 5 {
-		t.Errorf("expected VersionKeepCount 5, got %d", modelsCfg.VersionKeepCount)
-	}
 	if modelsCfg.OrphanGraceDays != 120 {
 		t.Errorf("expected OrphanGraceDays 120, got %d", modelsCfg.OrphanGraceDays)
+	}
+	if modelsCfg.DBBkupKeepCount != 7 {
+		t.Errorf("expected DBBkupKeepCount 7, got %d", modelsCfg.DBBkupKeepCount)
 	}
 }
 

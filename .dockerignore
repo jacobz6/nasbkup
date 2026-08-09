@@ -63,7 +63,6 @@ nas-backup-backend/data/
 nas-backup-backend/config.yaml
 
 # ---- 测试脚本 / 临时数据 ----
-nas_file_generator.py
-DEPLOYMENT_testenv.md
+scripts/nas_file_generator.py
 *.tmp
 *.temp

@@ -20,6 +20,7 @@ var migrationFS embed.FS
 // Database wraps a sql.DB connection and provides access to all repositories.
 type Database struct {
 	db              *sql.DB
+	path            string // filesystem path, kept so Reopen() can re-open after PullOSSDB
 	FileRepo        *FileRepository
 	BackupRepo      *BackupRepository
 	HashRepo        *HashRepository
@@ -47,24 +48,9 @@ func Open(dbPath string) (*Database, error) {
 		return nil, fmt.Errorf("create database directory: %w", err)
 	}
 
-	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=1")
+	db, err := openConnection(dbPath)
 	if err != nil {
-		return nil, fmt.Errorf("open database %s: %w", dbPath, err)
-	}
-
-	// SQLite performance tuning.
-	pragmas := []string{
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA synchronous=NORMAL",
-		"PRAGMA cache_size=-64000", // 64MB cache
-		"PRAGMA temp_store=MEMORY",
-		"PRAGMA mmap_size=268435456", // 256MB mmap
-	}
-	for _, p := range pragmas {
-		if _, err := db.Exec(p); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("set pragma %q: %w", p, err)
-		}
+		return nil, err
 	}
 
 	if err := runMigrations(db); err != nil {
@@ -72,15 +58,72 @@ func Open(dbPath string) (*Database, error) {
 		return nil, fmt.Errorf("run migrations: %w", err)
 	}
 
-	d := &Database{db: db}
+	d := &Database{db: db, path: dbPath}
+	d.initRepos(db)
+
+	return d, nil
+}
+
+// initRepos (re)creates all repository wrappers around the given connection.
+// Called by both Open and Reopen so the repos always point at the live *sql.DB.
+func (d *Database) initRepos(db *sql.DB) {
 	d.FileRepo = NewFileRepository(db)
 	d.BackupRepo = NewBackupRepository(db)
 	d.HashRepo = NewHashRepository(db)
 	d.LogRepo = NewLogRepository(db)
 	d.ConfigRepo = NewConfigRepository(db)
 	d.RestoreJobRepo = NewRestoreJobRepository(db)
+}
 
-	return d, nil
+// Reopen closes the current database connection and opens a fresh one at the
+// same path, re-running migrations and re-binding all repositories.
+//
+// This is used after PullOSSDB overwrites the local DB file: the old *sql.DB
+// still references the pre-overwrite inode, so it must be closed and a new
+// connection opened against the new file.
+//
+// There is a brief window during which concurrent readers using the old
+// repository pointers may see "database closed" errors. Callers should handle
+// such errors gracefully (the HTTP layer already does). In practice the window
+// is sub-second and backups run at off-peak hours.
+func (d *Database) Reopen() error {
+	if d.db != nil {
+		_ = d.db.Close()
+	}
+	db, err := openConnection(d.path)
+	if err != nil {
+		return fmt.Errorf("reopen database %s: %w", d.path, err)
+	}
+	if err := runMigrations(db); err != nil {
+		db.Close()
+		return fmt.Errorf("run migrations after reopen: %w", err)
+	}
+	d.db = db
+	d.initRepos(db)
+	return nil
+}
+
+// openConnection opens a SQLite connection with the standard pragmas used by
+// this project. Shared by Open and Reopen.
+func openConnection(dbPath string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=1")
+	if err != nil {
+		return nil, fmt.Errorf("open database %s: %w", dbPath, err)
+	}
+	pragmas := []string{
+		"PRAGMA journal_mode=WAL",
+		"PRAGMA synchronous=NORMAL",
+		"PRAGMA cache_size=-64000",
+		"PRAGMA temp_store=MEMORY",
+		"PRAGMA mmap_size=268435456",
+	}
+	for _, p := range pragmas {
+		if _, err := db.Exec(p); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("set pragma %q: %w", p, err)
+		}
+	}
+	return db, nil
 }
 
 // Close closes the underlying database connection.

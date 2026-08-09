@@ -1,5 +1,5 @@
 // Package api - 集成测试
-// 基于 test-cases.md 测试用例文档编写，覆盖所有可自动化的API端点测试。
+// 覆盖所有可自动化的 API 端点测试（仪表盘/备份/内容/策略/日志/恢复/GC/对账）。
 // 使用 httptest + 真实 SQLite 数据库，不依赖外部 OSS/rclone 服务。
 package api
 
@@ -280,18 +280,6 @@ func TestBackupAPI(t *testing.T) {
 	env := setupTestEnv(t)
 	defer env.cleanup()
 
-	t.Run("TC-BACKUP-007: 无效type参数", func(t *testing.T) {
-		resp := doRequest(t, env.server, "POST", "/api/backup/trigger",
-			map[string]string{"type": "invalid_type"})
-		defer closeBody(resp)
-		assertStatus(t, resp, http.StatusBadRequest)
-
-		result := decodeAPIResponse(t, resp)
-		if result.Success {
-			t.Error("expected success=false for invalid type")
-		}
-	})
-
 	t.Run("TC-BACKUP-008: 请求体格式错误", func(t *testing.T) {
 		req, _ := http.NewRequest("POST", env.server.URL+"/api/backup/trigger",
 			bytes.NewReader([]byte("not json")))
@@ -318,7 +306,7 @@ func TestBackupAPI(t *testing.T) {
 
 	t.Run("TC-BACKUP-014: 取消stale记录(通过backup_id)", func(t *testing.T) {
 		// 在DB中插入一条running状态记录（模拟进程崩溃后的stale记录）
-		backupID, err := env.database.BackupRepo.Create(models.BackupTypeFull, nil)
+		backupID, err := env.database.BackupRepo.Create()
 		if err != nil {
 			t.Fatalf("create backup record: %v", err)
 		}
@@ -340,7 +328,7 @@ func TestBackupAPI(t *testing.T) {
 
 	t.Run("TC-BACKUP-014b: 取消stale记录(不带backup_id)", func(t *testing.T) {
 		// 在DB中插入一条running状态记录（模拟进程崩溃后的stale记录）
-		backupID, _ := env.database.BackupRepo.Create(models.BackupTypeFull, nil)
+		backupID, _ := env.database.BackupRepo.Create()
 		env.database.BackupRepo.UpdateStatus(backupID, models.BackupStatusRunning, "")
 
 		// 不带backup_id：handler检查DB中的running记录并清理
@@ -887,21 +875,20 @@ func TestRetentionConfig(t *testing.T) {
 	t.Run("TC-RET-002: 更新保留策略", func(t *testing.T) {
 		resp := doRequest(t, env.server, "PUT", "/api/strategy/retention",
 			models.RetentionConfig{
-				VersionKeepCount:  3,
-				OrphanGraceDays:   180,
-				FullResetInterval: 1,
-				KeepDeletedDays:   30,
+				OrphanGraceDays: 180,
+				KeepDeletedDays: 30,
+				DBBkupKeepCount: 5,
 			})
 		defer closeBody(resp)
 		assertStatus(t, resp, http.StatusOK)
 
 		var cfg models.RetentionConfig
 		decodeData(t, resp, &cfg)
-		if cfg.VersionKeepCount != 3 {
-			t.Errorf("expected version_keep_count=3, got %d", cfg.VersionKeepCount)
-		}
 		if cfg.OrphanGraceDays != 180 {
 			t.Errorf("expected orphan_grace_days=180, got %d", cfg.OrphanGraceDays)
+		}
+		if cfg.DBBkupKeepCount != 5 {
+			t.Errorf("expected db_bkup_keep_count=5, got %d", cfg.DBBkupKeepCount)
 		}
 	})
 }
@@ -960,7 +947,7 @@ func TestLogs(t *testing.T) {
 
 	// 预置测试日志数据
 	backupID := int64(1)
-	env.database.BackupRepo.Create(models.BackupTypeFull, nil) // 创建backup_id=1
+	env.database.BackupRepo.Create() // 创建backup_id=1
 	insertTestLog(t, env.database, &backupID, models.LogLevelInfo, "backup started", "detail1")
 	insertTestLog(t, env.database, &backupID, models.LogLevelError, "upload failed", "detail2")
 	insertTestLog(t, env.database, nil, models.LogLevelWarn, "disk almost full", "detail3")
@@ -1116,6 +1103,34 @@ func TestReconcileAPI(t *testing.T) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// 12b. OSS DB 刷新 — TC-OSSDB-*
+// ──────────────────────────────────────────────────────────────────────────────
+
+func TestRefreshOSSDBAPI(t *testing.T) {
+	env := setupTestEnv(t)
+	defer env.cleanup()
+
+	t.Run("TC-OSSDB-001: GET方法不允许", func(t *testing.T) {
+		resp := doGet(t, env.server, "/api/restore/refresh-oss-db")
+		defer closeBody(resp)
+		assertStatus(t, resp, http.StatusMethodNotAllowed)
+	})
+
+	t.Run("TC-OSSDB-002: POST路由可达(参数解析通过)", func(t *testing.T) {
+		// 测试环境 storage 为 nil，RefreshFromOSS 会返回错误(500)，
+		// 但能证明路由已注册、handler 被调用。不应返回 404。
+		resp := doRequest(t, env.server, "POST", "/api/restore/refresh-oss-db", nil)
+		defer closeBody(resp)
+		if resp.StatusCode == http.StatusNotFound {
+			t.Errorf("refresh-oss-db route not registered (404)")
+		}
+		if resp.StatusCode == http.StatusMethodNotAllowed {
+			t.Errorf("POST should be allowed on refresh-oss-db")
+		}
+	})
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // 13. CORS与HTTP中间件 — TC-CORS-*, TC-LOGGING-*
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -1175,7 +1190,7 @@ func TestSystemRecovery(t *testing.T) {
 		defer env.cleanup()
 
 		// 模拟进程崩溃：在DB中插入running状态记录
-		backupID, _ := env.database.BackupRepo.Create(models.BackupTypeFull, nil)
+		backupID, _ := env.database.BackupRepo.Create()
 		env.database.BackupRepo.UpdateStatus(backupID, models.BackupStatusRunning, "")
 
 		// 调用CleanupStaleRunning（服务启动时执行）
@@ -1204,7 +1219,7 @@ func TestSystemRecovery(t *testing.T) {
 		env := setupTestEnv(t)
 		defer env.cleanup()
 
-		backupID, _ := env.database.BackupRepo.Create(models.BackupTypeFull, nil)
+		backupID, _ := env.database.BackupRepo.Create()
 		env.database.BackupRepo.UpdateStatus(backupID, models.BackupStatusPending, "")
 
 		count, _ := env.database.BackupRepo.CleanupStaleRunning()
@@ -1217,7 +1232,7 @@ func TestSystemRecovery(t *testing.T) {
 		env := setupTestEnv(t)
 		defer env.cleanup()
 
-		backupID, _ := env.database.BackupRepo.Create(models.BackupTypeFull, nil)
+		backupID, _ := env.database.BackupRepo.Create()
 		env.database.BackupRepo.UpdateStatus(backupID, models.BackupStatusCompleted, "")
 
 		count, _ := env.database.BackupRepo.CleanupStaleRunning()

@@ -82,9 +82,18 @@ func (r *Router) handleFSBrowse(w http.ResponseWriter, req *http.Request) {
 		fsEntry.InBackup, fsEntry.PartialBackup = r.computeBackupStatus(fullPath, entry.IsDir(), backupDirs)
 		fsEntry.WillBackup = r.willPathBeBackedUp(fullPath, entry.IsDir(), backupDirs, exclusionRules)
 
-		// For files, check if there's an update.
+		// For files, check if there's an update and fetch last backup status.
 		if !entry.IsDir() {
 			fsEntry.HasUpdate = r.fileHasUpdate(fullPath, info)
+
+			// Populate per-file backup status (success/failed/never).
+			if rec, err := r.db.FileRepo.GetByPath(fullPath); err == nil && rec != nil {
+				fsEntry.LastBackupStatus = rec.LastBackupStatus
+				fsEntry.LastBackupError = rec.LastBackupError
+				if rec.LastBackupAt != nil {
+					fsEntry.LastBackupAt = rec.LastBackupAt.Format(time.RFC3339)
+				}
+			}
 		}
 
 		result.Entries = append(result.Entries, fsEntry)

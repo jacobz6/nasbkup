@@ -48,6 +48,7 @@ type BackupConfig struct {
 	Compression CompressionConfig `yaml:"compression"`
 	Retention   RetentionConfig   `yaml:"retention"`
 	Encryption  EncryptionConfig  `yaml:"encryption"`
+	TempDir     string            `yaml:"temp_dir"` // directory for temporary encryption/compression files; empty = use system temp
 }
 
 // DirectoryConfig defines a single directory to back up.
@@ -88,10 +89,9 @@ type CompressionConfig struct {
 
 // RetentionConfig defines data retention and cleanup policies.
 type RetentionConfig struct {
-	VersionKeepCount  int `yaml:"version_keep_count"`
-	OrphanGraceDays   int `yaml:"orphan_grace_days"`
-	FullResetInterval int `yaml:"full_reset_interval_months"`
-	KeepDeletedDays   int `yaml:"keep_deleted_days"`
+	OrphanGraceDays int `yaml:"orphan_grace_days"`
+	KeepDeletedDays int `yaml:"keep_deleted_days"`
+	DBBkupKeepCount int `yaml:"db_bkup_keep_count"` // max number of oss.db .bkup snapshots to retain (default 5)
 }
 
 // EncryptionConfig defines encryption parameters.
@@ -197,10 +197,9 @@ func DefaultConfig() *AppConfig {
 				},
 			},
 			Retention: RetentionConfig{
-				VersionKeepCount:  1,
-				OrphanGraceDays:   180,
-				FullResetInterval: 6,
-				KeepDeletedDays:   180,
+				OrphanGraceDays: 180,
+				KeepDeletedDays: 180,
+				DBBkupKeepCount: 5,
 			},
 			Encryption: EncryptionConfig{
 				Algorithm:   "AES-256-GCM",
@@ -291,13 +290,14 @@ func (c *AppConfig) Validate() error {
 		return fmt.Errorf("orphan_grace_days must be >= 0")
 	}
 
-	if c.Backup.Retention.VersionKeepCount < 1 {
-		return fmt.Errorf("version_keep_count must be >= 1")
-	}
-
 	if c.OSS.Bucket == "" {
 		// Allow starting without OSS config — will be configured via API
 		// or environment variables later.
+	}
+
+	// Validate temp_dir if set: must be an absolute path.
+	if c.Backup.TempDir != "" && !filepath.IsAbs(c.Backup.TempDir) {
+		return fmt.Errorf("backup.temp_dir must be an absolute path, got %q", c.Backup.TempDir)
 	}
 
 	return nil
@@ -313,6 +313,11 @@ func (c *AppConfig) EnsureDataDirs() error {
 		"./data/tmp",
 	}
 
+	// Include configured temp_dir so the directory exists before backup starts.
+	if c.Backup.TempDir != "" {
+		dirs = append(dirs, c.Backup.TempDir)
+	}
+
 	for _, dir := range dirs {
 		if dir == "." || dir == "" {
 			continue
@@ -323,6 +328,16 @@ func (c *AppConfig) EnsureDataDirs() error {
 	}
 
 	return nil
+}
+
+// TempDir returns the directory to use for temporary files during backup.
+// If backup.temp_dir is configured, it is used (and created if needed);
+// otherwise the system default temp directory is returned.
+func (c *AppConfig) TempDir() string {
+	if c.Backup.TempDir != "" {
+		return c.Backup.TempDir
+	}
+	return os.TempDir()
 }
 
 // ToModelsScheduleConfig converts the config-layer type to the models-layer type.
@@ -347,10 +362,9 @@ func (c *AppConfig) ToModelsCompressionConfig() models.CompressionConfig {
 // ToModelsRetentionConfig converts the config-layer type to the models-layer type.
 func (c *AppConfig) ToModelsRetentionConfig() models.RetentionConfig {
 	return models.RetentionConfig{
-		VersionKeepCount:  c.Backup.Retention.VersionKeepCount,
-		OrphanGraceDays:   c.Backup.Retention.OrphanGraceDays,
-		FullResetInterval: c.Backup.Retention.FullResetInterval,
-		KeepDeletedDays:   c.Backup.Retention.KeepDeletedDays,
+		OrphanGraceDays: c.Backup.Retention.OrphanGraceDays,
+		KeepDeletedDays: c.Backup.Retention.KeepDeletedDays,
+		DBBkupKeepCount: c.Backup.Retention.DBBkupKeepCount,
 	}
 }
 

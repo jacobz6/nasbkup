@@ -8,9 +8,9 @@
 
 - [Docker 相关脚本](#docker-相关脚本)
 - [后端脚本](#后端脚本)
-- [部署与验证脚本](#部署与验证脚本)
+- [部署与启停脚本](#部署与启停脚本)
+- [验证脚本](#验证脚本)
 - [测试工具脚本](#测试工具脚本)
-- [项目根目录脚本](#项目根目录脚本)
 
 ---
 
@@ -41,13 +41,6 @@
 | `RCLONE_CONF` | `${DATA_DIR}/rclone.conf` | rclone 配置路径 |
 | `CONFIG_FILE` | `/app/config.yaml` | 应用配置路径 |
 
-**优雅关闭流程**：
-1. 收到终止信号
-2. 向 Nginx 发送 TERM 信号
-3. 向后端发送 TERM 信号，等待最多 30 秒
-4. 超时后强制 KILL 后端进程
-5. 退出
-
 ---
 
 ## 后端脚本
@@ -72,12 +65,16 @@ chmod +x scripts/setup-rclone.sh
 ./scripts/setup-rclone.sh
 ```
 
-**交互流程**：
-1. 输入 OSS Endpoint（如 `oss-cn-hangzhou.aliyuncs.com`）
-2. 输入 Bucket 名称
-3. 输入 AccessKey ID
-4. 输入 AccessKey Secret
-5. 确认配置，自动生成文件
+也支持非交互式参数调用（被 `scripts/deploy.sh` 调用）：
+
+```bash
+./scripts/setup-rclone.sh \
+    --endpoint oss-cn-hangzhou.aliyuncs.com \
+    --bucket my-bucket \
+    --ak LTAIxxx \
+    --sk xxx \
+    --config-path ./data/rclone.conf
+```
 
 ---
 
@@ -96,13 +93,6 @@ cd nas-backup-backend
 chmod +x scripts/patch-rclone-crypt-password.sh
 ./scripts/patch-rclone-crypt-password.sh
 ```
-
-**脚本会**：
-1. 检查 rclone.conf 是否存在
-2. 检查是否有 `[oss-crypt]` 段
-3. 如果 password 缺失，自动生成加密密码
-4. 备份原配置文件为 `rclone.conf.bak`
-5. 写入修复后的配置
 
 ---
 
@@ -130,148 +120,167 @@ chmod +x scripts/backup.sh
 ./scripts/backup.sh auto -c /path/to/config.yaml
 ```
 
-**工作逻辑**：
-1. 检查后端 HTTP 服务是否运行（`/api/dashboard/stats`）
-2. 如果服务运行，通过 API 触发备份
-3. 如果服务未运行，尝试直接调用后端二进制执行备份
-4. 输出备份状态
-
 ---
 
-### `nas-backup-backend/run_tests.sh`
+## 部署与启停脚本
 
-一键测试脚本，执行完整的测试流程。
+以下脚本位于项目根目录的 `scripts/` 文件夹，提供跨平台（macOS + Debian）的统一部署和启停能力。
 
-**位置**：`nas-backup-backend/run_tests.sh`
+### `scripts/deploy.sh`
+
+统一部署脚本，自动检测操作系统（`uname -s`），按平台执行对应部署流程。
+
+**位置**：`scripts/deploy.sh`
+
+**平台行为**：
+- **macOS**：Homebrew 安装依赖、本地文件系统模拟云存储、构建后端 + 前端、生成便捷启动脚本
+- **Debian**：安全模式 apt（绝不 upgrade）、Go/Node/rclone 官方二进制下载、systemd + Nginx、编译后端 + 构建前端
 
 **使用方法**：
 
 ```bash
-cd nas-backup-backend
-chmod +x run_tests.sh
-./run_tests.sh
+# 自动检测平台部署
+./scripts/deploy.sh
+
+# 强制指定平台
+./scripts/deploy.sh --platform macos
+./scripts/deploy.sh --platform debian
+
+# Debian 生产部署（需 root）
+sudo ./scripts/deploy.sh
+
+# 常用选项
+./scripts/deploy.sh --skip-deps           # 跳过系统依赖安装
+./scripts/deploy.sh --skip-frontend       # 跳过前端构建（Debian）
+./scripts/deploy.sh --no-nginx            # 跳过 Nginx 配置（Debian）
+./scripts/deploy.sh --with-oss            # 配置真实 OSS（macOS，交互式）
+./scripts/deploy.sh --install-dir /opt/nas-backup  # 指定安装目录（Debian）
 ```
 
-**执行流程**：
-1. **go vet**：静态代码检查
-2. **单元测试**：运行所有包的单元测试（9 个包）
-3. **API 集成测试**：运行 API 层集成测试
-4. **覆盖率统计**：生成测试覆盖率报告
-5. **E2E 连通性检查**：验证服务可正常启动（可选）
-
-**环境变量**：
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `SKIP_E2E` | `0` | 设为 `1` 跳过 E2E 测试 |
-| `VERBOSE` | `0` | 设为 `1` 输出详细测试日志 |
+**架构说明**：deploy.sh 通过 `source` 引入平台模块：
+- `scripts/lib/common.sh` — 公共函数库（颜色/路径/端口/HTTP）
+- `scripts/lib/deploy-macos.sh` — macOS 部署模块
+- `scripts/lib/deploy-debian.sh` — Debian 部署模块
 
 ---
 
-### `nas-backup-backend/scripts/backup_restore_test.py`
+### `scripts/start.sh`
 
-Python 备份恢复闭环测试脚本，验证完整备份→恢复流程。
+统一启停脚本，自动检测操作系统，按平台管理服务。
 
-**位置**：`nas-backup-backend/scripts/backup_restore_test.py`
+**位置**：`scripts/start.sh`
 
-**功能**：
-- 创建测试文件集
-- 触发备份并等待完成
-- 验证备份数据完整性
-- 执行恢复操作
-- 校验恢复后的文件与原始文件一致
-- 清理测试数据
-
-**依赖**：
-- Python 3.7+
-- requests 库（`pip install requests`）
+**平台行为**：
+- **macOS**：nohup + PID 文件管理后端/前端进程
+- **Debian**：systemctl 管理 nas-backup 服务 + Nginx reload（UGREEN NAS 兼容）
 
 **使用方法**：
 
 ```bash
-cd nas-backup-backend
-pip install requests --break-system-packages
+# 启动（默认）
+./scripts/start.sh start
 
-# 确保后端服务运行中
-python3 scripts/backup_restore_test.py
+# 停止（Debian 模式默认保留 Nginx）
+./scripts/start.sh stop
 
-# 指定 API 地址
-python3 scripts/backup_restore_test.py --api-url http://127.0.0.1:8080
+# 停止后端 + Nginx（Debian，慎用）
+sudo ./scripts/start.sh stop-all
+
+# 重启
+./scripts/start.sh restart
+
+# 查看状态
+./scripts/start.sh status
+
+# API 健康检查（Debian）
+./scripts/start.sh health
+
+# 实时日志
+./scripts/start.sh logs           # 默认 all
+./scripts/start.sh logs be        # 后端 journal
+./scripts/start.sh logs app       # 应用日志文件
+./scripts/start.sh logs fe        # 前端/Nginx 日志
 ```
 
 ---
 
-## 部署与验证脚本
+### `scripts/update-debian.sh`
 
-以下脚本位于项目根目录的 `scripts/` 文件夹，用于 macOS 部署和端到端验证。
+Debian 代码更新脚本，一键完成 git pull + 构建 + 重启 + 健康检查。
 
-### `scripts/deploy-macos.sh`
-
-macOS 一键部署脚本，自动安装依赖、配置环境并启动服务。
-
-**位置**：`scripts/deploy-macos.sh`
-
-**功能**：
-- 检测并安装 Homebrew、Go、Node.js、rclone、zstd 等依赖
-- 自动下载并配置 rclone binary
-- 创建数据目录和日志目录
-- 生成 `master.key` 加密密钥
-- 启动后端服务（后台运行）
-- 运行健康检查验证服务可用性
+**位置**：`scripts/update-debian.sh`
 
 **使用方法**：
 
 ```bash
-chmod +x scripts/deploy-macos.sh
-./scripts/deploy-macos.sh
+sudo ./scripts/update-debian.sh
+
+# 常用选项
+sudo ./scripts/update-debian.sh --no-pull       # 跳过 git pull
+sudo ./scripts/update-debian.sh --no-frontend   # 跳过前端构建
+sudo ./scripts/update-debian.sh --no-backend    # 跳过后端构建
+sudo ./scripts/update-debian.sh --skip-tests    # 跳过 go vet
+
+# 回滚到上一版本
+sudo ./scripts/update-debian.sh rollback
 ```
 
 ---
+
+### `scripts/upgrade-rclone-debian.sh`
+
+rclone 版本升级脚本（Debian）。
+
+**位置**：`scripts/upgrade-rclone-debian.sh`
+
+---
+
+## 验证脚本
 
 ### `scripts/verify-e2e.sh`
 
-端到端验证 Shell 脚本，快速验证备份与恢复核心功能。
+端到端验证 Shell 脚本入口，编排完整的 E2E 测试流程。
 
 **位置**：`scripts/verify-e2e.sh`
 
 **功能**：
-- 启动后端服务（如未运行）
-- 生成测试文件
-- 触发备份并等待完成
-- 执行恢复操作
-- 校验恢复文件完整性
-- 输出验证结果
+- 自动清理旧环境（旧数据库、旧云存储文件）
+- 启动后端进程并等待就绪（重试 30 次）
+- 运行 Python 测试套件（`verify_e2e.py`）
+- 生成 HTML 验收报告
+- 停止后端进程
 
 **使用方法**：
 
 ```bash
 chmod +x scripts/verify-e2e.sh
-./scripts/verify-e2e.sh
+./scripts/verify-e2e.sh              # 完整流程（含构建）
+./scripts/verify-e2e.sh --skip-build # 跳过构建（后端/前端已编译好）
 ```
 
 ---
 
 ### `scripts/verify_e2e.py`
 
-Python 端到端验证脚本，提供更详细的测试覆盖和报告生成。
+Python 端到端验证套件，23 项测试覆盖完整备份恢复闭环。
 
 **位置**：`scripts/verify_e2e.py`
 
-**功能**：
-- 23 项端到端测试用例（API、备份、恢复、对账等）
-- 生成 JSON 格式测试报告（`e2e-report.json`）
-- 生成 HTML 格式验收报告
-- 支持自定义 API 地址和测试参数
+**测试覆盖**：
+- Phase 1: 环境检查（后端可达、rclone 可用、数据库存在、配置存在）
+- Phase 2: 测试数据生成（文本文件、空文件、二进制随机文件、重复文件、深层嵌套文件）
+- Phase 3: 全量备份测试（触发备份、等待完成、验证文件数/压缩率/Dashboard统计）
+- Phase 4: 增量备份测试（修改文件、新增文件、触发增量、验证只处理变更文件）
+- Phase 5: 恢复测试 + SHA256 完整性校验（逐文件哈希比对）
+- Phase 6: 功能特性验证（加密验证、去重验证、空文件、API 正确性）
 
-**依赖**：Python 3.7+
+**依赖**：Python 3.7+（仅标准库）
 
 **使用方法**：
 
 ```bash
 # 确保后端服务运行中
 python3 scripts/verify_e2e.py
-
-# 指定 API 地址
 python3 scripts/verify_e2e.py --api-url http://127.0.0.1:8080
 ```
 
@@ -289,7 +298,7 @@ python3 scripts/verify_e2e.py --api-url http://127.0.0.1:8080
 - 验证解冻后数据完整性
 - 生成云端归档验收报告（HTML + JSON）
 
-**使用前提**：已配置真实 OSS 凭证（`config.yaml`）
+**使用前提**：已配置真实 OSS 凭证（`config.yaml` 的 `oss.*` 段）
 
 **使用方法**：
 
@@ -313,21 +322,13 @@ python3 scripts/generate_report.py --input e2e-report.json --output acceptance-r
 
 ---
 
-### `scripts/TROUBLESHOOTING.md`
-
-故障排查指南，汇总常见问题和解决方案。
-
-**位置**：`scripts/TROUBLESHOOTING.md`
-
----
-
 ## 测试工具脚本
 
-### `nas_file_generator.py`
+### `scripts/nas_file_generator.py`
 
 测试文件生成器，模拟 NAS 文件结构，用于备份功能测试。
 
-**位置**：项目根目录 `nas_file_generator.py`
+**位置**：`scripts/nas_file_generator.py`
 
 **功能**：
 - 生成多种类型的测试文件（文档、图片、视频、音频、代码、压缩包等）
@@ -343,10 +344,10 @@ python3 scripts/generate_report.py --input e2e-report.json --output acceptance-r
 
 ```bash
 # 基本用法：生成 500 个测试文件到指定目录
-python3 nas_file_generator.py --output /mnt/data/test-files --count 500
+python3 scripts/nas_file_generator.py --output /mnt/data/test-files --count 500
 
 # 完整参数
-python3 nas_file_generator.py \
+python3 scripts/nas_file_generator.py \
   --output /mnt/data/test-files \
   --count 1000 \
   --min-size 1KB \
@@ -355,7 +356,7 @@ python3 nas_file_generator.py \
   --seed 42
 
 # 不生成媒体文件（加快速度）
-python3 nas_file_generator.py --output /tmp/test --count 100 --no-media
+python3 scripts/nas_file_generator.py --output /tmp/test --count 100 --no-media
 ```
 
 **参数说明**：
@@ -370,18 +371,6 @@ python3 nas_file_generator.py --output /tmp/test --count 100 --no-media
 | `--seed` | 随机 | 随机种子（用于可复现的测试） |
 | `--no-media` | `false` | 跳过图片/视频/音频生成 |
 
-**生成的文件类型**：
-
-| 类型 | 扩展名 | 说明 |
-|------|--------|------|
-| 文本文档 | `.txt`, `.md`, `.doc`, `.pdf` | 包含随机文本内容 |
-| 图片 | `.jpg`, `.png`, `.gif`, `.webp` | 使用 Pillow 生成真实图片（如有） |
-| 视频 | `.mp4`, `.mkv`, `.avi` | 占位文件（小尺寸） |
-| 音频 | `.mp3`, `.flac`, `.wav` | 占位文件 |
-| 代码 | `.py`, `.go`, `.js`, `.ts`, `.html`, `.css` | 包含示例代码片段 |
-| 压缩包 | `.zip`, `.tar.gz`, `.7z` | 内含小文件 |
-| 数据文件 | `.json`, `.csv`, `.xml`, `.sql` | 结构化数据 |
-
 ---
 
 ## 脚本使用最佳实践
@@ -389,47 +378,41 @@ python3 nas_file_generator.py --output /tmp/test --count 100 --no-media
 ### 首次部署配置流程
 
 ```bash
-# 1. 生成加密密钥
-openssl rand -base64 32 > ./data/master.key
-chmod 600 ./data/master.key
+# 1. 一键部署（自动安装依赖 + 编译 + 配置）
+./scripts/deploy.sh              # macOS
+sudo ./scripts/deploy.sh         # Debian 生产
 
-# 2. 交互式配置 rclone
-./nas-backup-backend/scripts/setup-rclone.sh
+# 2. 启动服务
+./scripts/start.sh start         # macOS
+sudo ./scripts/start.sh start    # Debian
 
-# 3. 启动服务
-docker compose up -d --build
+# 3. 生成测试文件验证备份
+python3 scripts/nas_file_generator.py --output /mnt/nas/test --count 50
 
-# 4. 生成测试文件验证备份
-python3 nas_file_generator.py --output /mnt/nas/test --count 50
-
-# 5. 触发备份测试
+# 4. 触发备份测试
 curl -X POST http://127.0.0.1:8080/api/backup/trigger
 
-# 6. 运行完整测试
-cd nas-backup-backend && ./run_tests.sh
+# 5. 运行完整 E2E 测试
+./scripts/verify-e2e.sh --skip-build
 ```
 
-### 日常维护脚本
+### 日常维护
 
 ```bash
-# 手动备份数据库（Docker 环境）
-#!/bin/bash
-BACKUP_DIR=./db-backups
-DATE=$(date +%Y%m%d_%H%M%S)
-mkdir -p "$BACKUP_DIR"
-cp ./data/nas-backup.db "$BACKUP_DIR/nas-backup_$DATE.db"
-ls -t "$BACKUP_DIR"/nas-backup_*.db | tail -n +31 | xargs -r rm
-```
+# 查看服务状态
+./scripts/start.sh status
 
-```bash
-# 检查服务健康状态
-#!/bin/bash
-if curl -fsS http://127.0.0.1:8080/api/dashboard/stats > /dev/null; then
-    echo "✅ NAS Backup 服务正常"
-else
-    echo "❌ NAS Backup 服务异常"
-    docker compose restart
-fi
+# 健康检查（Debian）
+./scripts/start.sh health
+
+# 查看日志
+./scripts/start.sh logs app
+
+# 代码更新（Debian）
+sudo ./scripts/update-debian.sh
+
+# 手动备份数据库
+sqlite3 nas-backup-backend/data/nas-backup.db ".backup './db-backups/nas-backup_$(date +%Y%m%d).db'"
 ```
 
 ---
@@ -437,7 +420,8 @@ fi
 ## 注意事项
 
 1. **权限问题**：所有 `.sh` 脚本使用前需要添加可执行权限：`chmod +x script.sh`
-2. **路径问题**：执行脚本时注意工作目录，部分脚本假设在特定目录下运行
-3. **密钥安全**：`setup-rclone.sh` 生成的密码请妥善保存，丢失无法恢复数据
-4. **测试数据**：`nas_file_generator.py` 生成的文件仅用于测试，不要与真实数据混放
-5. **Python 依赖**：Python 脚本需要使用 `--break-system-packages` 标志安装依赖（Debian/Ubuntu 系统）
+2. **Debian 需 root**：`deploy.sh` / `start.sh` / `update-debian.sh` 在 Debian 模式下操作 systemd/nginx 需要 root
+3. **路径问题**：执行脚本时注意工作目录，部分脚本假设在项目根目录运行
+4. **密钥安全**：`master.key` 和 `rclone.conf` 请妥善保存，丢失无法恢复数据
+5. **测试数据**：`nas_file_generator.py` 生成的文件仅用于测试，不要与真实数据混放
+6. **Python 依赖**：Python 脚本在 Debian/Ubuntu 系统安装依赖时使用 `--break-system-packages` 标志

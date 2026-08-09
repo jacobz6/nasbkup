@@ -114,10 +114,16 @@ backup:
 
   # Retention policy
   retention:
-    version_keep_count: 1        # Keep only the latest version
     orphan_grace_days: 180       # 6 months before cleaning orphan data
-    full_reset_interval_months: 6 # Full backup every 6 months
     keep_deleted_days: 180       # 6 months before cleaning deleted file data
+    db_bkup_keep_count: 5        # Max number of oss.db .bkup snapshots to keep
+
+  # Temporary directory for compression/encryption intermediate files.
+  # Large files (tens of GB+) require up to 2x the file size as free space here.
+  # If empty, the system default temp directory is used (/tmp on macOS/Linux).
+  # On systems with small /tmp partitions (e.g. NAS devices), point this to a
+  # volume with sufficient free space to avoid "no space left on device" errors.
+  # temp_dir: "/mnt/data/tmp"
 
   # Encryption settings
   encryption:

@@ -6,11 +6,6 @@ export const BACKUP_STATUS_MAP: Record<string, { label: string; color: string }>
   cancelled: { label: '已取消', color: 'text-slate-400' },
 };
 
-export const BACKUP_TYPE_MAP: Record<string, { label: string; color: string }> = {
-  full: { label: '全量', color: 'text-brand-400' },
-  incremental: { label: '增量', color: 'text-violet-400' },
-};
-
 export const LOG_LEVEL_MAP: Record<string, { label: string; color: string; bg: string }> = {
   debug: { label: 'DEBUG', color: 'text-slate-400', bg: 'bg-slate-500/20' },
   info: { label: 'INFO', color: 'text-brand-400', bg: 'bg-brand-500/20' },

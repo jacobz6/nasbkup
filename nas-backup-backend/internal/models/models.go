@@ -19,59 +19,74 @@ const (
 	FileStatusDeleted FileStatus = "deleted"
 )
 
+// FileBackupStatus represents the last backup result for a single file.
+// An empty string means the file has never been backed up (or status unknown).
+type FileBackupStatus string
+
+const (
+	FileBackupStatusSuccess FileBackupStatus = "success" // last backup succeeded
+	FileBackupStatusFailed  FileBackupStatus = "failed"  // last backup failed with error in last_backup_error
+)
+
 // FileRecord represents a single tracked file in the backup index.
 type FileRecord struct {
-	ID        int64      `json:"id"`
-	Path      string     `json:"path"`
-	Size      int64      `json:"size"`
-	ModTime   time.Time  `json:"mod_time"`
-	Hash      string     `json:"hash,omitempty"`
-	Status    FileStatus `json:"status"`
-	BackupID  int64      `json:"backup_id,omitempty"`
-	CreatedAt time.Time  `json:"created_at"`
-	UpdatedAt time.Time  `json:"updated_at"`
+	ID               int64            `json:"id"`
+	Path             string           `json:"path"`
+	Size             int64            `json:"size"`
+	ModTime          time.Time        `json:"mod_time"`
+	Hash             string           `json:"hash,omitempty"`
+	Status           FileStatus       `json:"status"`
+	BackupID         int64            `json:"backup_id,omitempty"`
+	LastBackupStatus FileBackupStatus `json:"last_backup_status,omitempty"`
+	LastBackupError  string           `json:"last_backup_error,omitempty"`
+	LastBackupAt     *time.Time       `json:"last_backup_at,omitempty"`
+	LastBackupID     int64            `json:"last_backup_id,omitempty"`
+	CreatedAt        time.Time        `json:"created_at"`
+	UpdatedAt        time.Time        `json:"updated_at"`
 }
 
 // ---------------------------------------------------------------------------
 // Backup session
 // ---------------------------------------------------------------------------
 
-// BackupType distinguishes full backups from incremental ones.
-type BackupType string
-
-const (
-	BackupTypeFull         BackupType = "full"
-	BackupTypeIncremental  BackupType = "incremental"
-	BackupTypeAuto         BackupType = "auto"
-)
-
 // BackupStatus represents the current state of a backup session.
 type BackupStatus string
 
 const (
-	BackupStatusPending    BackupStatus = "pending"
-	BackupStatusRunning    BackupStatus = "running"
-	BackupStatusCompleted  BackupStatus = "completed"
-	BackupStatusFailed     BackupStatus = "failed"
-	BackupStatusCancelled  BackupStatus = "cancelled"
+	BackupStatusPending              BackupStatus = "pending"
+	BackupStatusRunning              BackupStatus = "running"
+	BackupStatusCompleted            BackupStatus = "completed"
+	BackupStatusCompletedWithErrors  BackupStatus = "completed_with_errors" // some files failed, others succeeded
+	BackupStatusFailed               BackupStatus = "failed"
+	BackupStatusCancelled            BackupStatus = "cancelled"
 )
 
+// IsTerminal returns true if the backup status represents a final state.
+func (s BackupStatus) IsTerminal() bool {
+	switch s {
+	case BackupStatusCompleted, BackupStatusCompletedWithErrors, BackupStatusFailed, BackupStatusCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
 // BackupRecord represents a single backup session.
+// There is no full/incremental distinction and no base-backup chain: every
+// backup is a standalone session.
 type BackupRecord struct {
-	ID             int64       `json:"id"`
-	Type           BackupType  `json:"type"`
+	ID             int64        `json:"id"`
 	Status         BackupStatus `json:"status"`
-	BaseBackupID   *int64      `json:"base_backup_id,omitempty"`
-	TotalFiles     int         `json:"total_files"`
-	TotalSize      int64       `json:"total_size"`
-	UploadedSize   int64       `json:"uploaded_size"`
-	SkippedByDedup int         `json:"skipped_by_dedup"`
-	SkippedByInc   int         `json:"skipped_by_incremental"`
-	CompressSaved  int64       `json:"compress_saved"`
-	StartedAt      *time.Time  `json:"started_at,omitempty"`
-	CompletedAt    *time.Time  `json:"completed_at,omitempty"`
-	ErrorMessage   string      `json:"error_message,omitempty"`
-	CreatedAt      time.Time   `json:"created_at"`
+	TotalFiles     int          `json:"total_files"`
+	TotalSize      int64        `json:"total_size"`
+	UploadedSize   int64        `json:"uploaded_size"`
+	SkippedByDedup int          `json:"skipped_by_dedup"`
+	FailedFiles    int          `json:"failed_files"`
+	CompressSaved  int64        `json:"compress_saved"`
+	StartedAt      *time.Time   `json:"started_at,omitempty"`
+	CompletedAt    *time.Time   `json:"completed_at,omitempty"`
+	ErrorMessage   string       `json:"error_message,omitempty"`
+	CreatedAt      time.Time    `json:"created_at"`
 }
 
 // ---------------------------------------------------------------------------
@@ -166,8 +181,6 @@ type DashboardStats struct {
 	BackupCount         int64        `json:"backup_count"`
 	UniqueHashCount     int64        `json:"unique_hash_count"`
 	NeedsReconcile      bool         `json:"needs_reconcile"`
-	BootstrapRequired   bool         `json:"bootstrap_required"`
-	BootstrapMessage    string       `json:"bootstrap_message,omitempty"`
 	OSSInfo             OSSInfo      `json:"oss_info"`
 	LastBackupTime      *time.Time   `json:"last_backup_time,omitempty"`
 	LastBackupStatus    BackupStatus `json:"last_backup_status"`
@@ -236,10 +249,9 @@ type UploadConfig struct {
 
 // RetentionConfig defines how long to keep old data.
 type RetentionConfig struct {
-	VersionKeepCount   int  `json:"version_keep_count"`    // 1 = latest only
-	OrphanGraceDays    int  `json:"orphan_grace_days"`     // days before cleaning orphan data
-	FullResetInterval  int  `json:"full_reset_interval"`   // months between full resets
-	KeepDeletedDays    int  `json:"keep_deleted_days"`     // days to retain deleted file data
+	OrphanGraceDays  int  `json:"orphan_grace_days"`   // days before cleaning orphan data
+	KeepDeletedDays  int  `json:"keep_deleted_days"`   // days to retain deleted file data
+	DBBkupKeepCount  int  `json:"db_bkup_keep_count"`  // max number of oss.db .bkup snapshots to retain
 }
 
 // EncryptionConfig defines encryption behavior.
@@ -281,8 +293,10 @@ type LogListResult struct {
 // --- Backup trigger ---
 
 // BackupTriggerRequest is the API request body to manually trigger a backup.
+// The legacy "type" field is ignored: every backup is now a standalone
+// session (no full/incremental distinction).
 type BackupTriggerRequest struct {
-	Type BackupType `json:"type"` // "full" or "incremental"
+	Type string `json:"type,omitempty"` // accepted for backward compatibility, ignored
 }
 
 // --- Restore ---
@@ -321,15 +335,18 @@ type RestoreResult struct {
 
 // FSEntry represents a single file or directory entry in the file browser.
 type FSEntry struct {
-	Name      string `json:"name"`
-	Path      string `json:"path"`
-	IsDir     bool   `json:"is_dir"`
-	Size      int64  `json:"size"`
-	ModTime   string `json:"mod_time"`
-	InBackup  bool   `json:"in_backup"`   // Whether this path is covered by a backup directory (full or partial)
-	PartialBackup bool `json:"partial_backup"` // For directories: only some sub-paths are backup targets
-	HasUpdate bool   `json:"has_update"`  // Whether the file has been modified since last backup
-	WillBackup bool  `json:"will_backup"` // Whether this will be included in next backup
+	Name             string           `json:"name"`
+	Path             string           `json:"path"`
+	IsDir            bool             `json:"is_dir"`
+	Size             int64            `json:"size"`
+	ModTime          string           `json:"mod_time"`
+	InBackup         bool             `json:"in_backup"`   // Whether this path is covered by a backup directory (full or partial)
+	PartialBackup    bool             `json:"partial_backup"` // For directories: only some sub-paths are backup targets
+	HasUpdate        bool             `json:"has_update"`  // Whether the file has been modified since last backup
+	WillBackup       bool             `json:"will_backup"` // Whether this will be included in next backup
+	LastBackupStatus FileBackupStatus `json:"last_backup_status,omitempty"` // "success" / "failed" / "" (never backed up)
+	LastBackupError  string           `json:"last_backup_error,omitempty"`  // error message if last_backup_status == "failed"
+	LastBackupAt     string           `json:"last_backup_at,omitempty"`     // RFC3339 timestamp of last backup attempt
 }
 
 // FSBrowseResult is the response for the file system browse API.

@@ -101,6 +101,8 @@ func (r *Router) Setup() http.Handler {
 	r.mux.HandleFunc("GET /api/restore/jobs", r.handleRestoreListJobs)
 	r.mux.HandleFunc("GET /api/restore/jobs/{id}", r.handleRestoreGetJob)
 	r.mux.HandleFunc("POST /api/restore/jobs/{id}/cancel", r.handleRestoreCancelJob)
+	// Refresh local DB from the authoritative oss.db in OSS.
+	r.mux.HandleFunc("POST /api/restore/refresh-oss-db", r.handleRefreshOSSDB)
 
 	// Backups list (for restore version selection)
 	r.mux.HandleFunc("GET /api/backups", r.handleListBackups)

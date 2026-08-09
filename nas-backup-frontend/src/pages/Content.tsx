@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   FolderOpen, Filter, Trash2, Edit2, ToggleLeft, ToggleRight,
-  ChevronRight, Folder, File, ArrowUp, RefreshCw, Plus, Check, AlertCircle, ShieldCheck, ShieldOff,
+  ChevronRight, Folder, File, ArrowUp, RefreshCw, Plus, Check, AlertCircle, ShieldCheck, ShieldOff, XCircle,
 } from 'lucide-react';
 import { DataTable } from '@/components/ui/DataTable';
 import { SlidePanel } from '@/components/ui/SlidePanel';
@@ -246,6 +246,16 @@ function FileBrowser() {
                               <span title="备份范围内"><ShieldCheck size={14} className="text-emerald-400 shrink-0" /></span>
                             )
                           )}
+                          {!entry.is_dir && entry.last_backup_status === 'success' && (
+                            <span title={`上次备份成功: ${entry.last_backup_at ? formatDateTime(entry.last_backup_at) : ''}`}>
+                              <Check size={14} className="text-emerald-500 shrink-0" />
+                            </span>
+                          )}
+                          {!entry.is_dir && entry.last_backup_status === 'failed' && (
+                            <span title={`上次备份失败: ${entry.last_backup_error || ''}${entry.last_backup_at ? ' (' + formatDateTime(entry.last_backup_at) + ')' : ''}`}>
+                              <XCircle size={14} className="text-red-400 shrink-0" />
+                            </span>
+                          )}
                         </div>
                       </td>
                       <td className="py-2.5 px-3 text-slate-500 font-mono text-xs">
@@ -354,6 +364,32 @@ function FileBrowser() {
                   <span className="flex items-center gap-1 text-slate-500 text-sm"><ShieldOff size={14} /> 否</span>
                 )}
               </div>
+
+              {!selectedEntry.is_dir && selectedEntry.last_backup_status && (
+                <>
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-slate-400">上次备份结果</span>
+                    {selectedEntry.last_backup_status === 'success' ? (
+                      <span className="flex items-center gap-1 text-emerald-400 text-sm"><Check size={14} /> 成功</span>
+                    ) : selectedEntry.last_backup_status === 'failed' ? (
+                      <span className="flex items-center gap-1 text-red-400 text-sm"><XCircle size={14} /> 失败</span>
+                    ) : (
+                      <span className="text-slate-500 text-sm">—</span>
+                    )}
+                  </div>
+                  {selectedEntry.last_backup_at && (
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm text-slate-400">上次备份时间</span>
+                      <span className="text-slate-300 text-xs">{formatDateTime(selectedEntry.last_backup_at)}</span>
+                    </div>
+                  )}
+                  {selectedEntry.last_backup_status === 'failed' && selectedEntry.last_backup_error && (
+                    <div className="bg-red-500/10 border border-red-500/20 rounded-lg p-2.5">
+                      <p className="text-xs text-red-400 break-words">{selectedEntry.last_backup_error}</p>
+                    </div>
+                  )}
+                </>
+              )}
             </div>
 
             {/* Actions */}

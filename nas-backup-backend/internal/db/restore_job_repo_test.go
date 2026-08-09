@@ -304,3 +304,160 @@ func TestRestoreJobRepository_GetRunning(t *testing.T) {
 		t.Errorf("expected id=%d, got %d", id, got.ID)
 	}
 }
+
+// TestRestoreJobRepository_ExportImportRoundTrip verifies that ExportAll +
+// ImportBatch preserves all restore_jobs fields (IDs, status, JSON paths,
+// timestamps, nullable fields). This is the exact roundtrip performed by
+// Engine.pullAndPreserveRestoreJobs when OSS DB overwrites the local file.
+func TestRestoreJobRepository_ExportImportRoundTrip(t *testing.T) {
+	database := setupRestoreJobTestDB(t)
+	defer database.Close()
+	repo := database.RestoreJobRepo
+
+	now := time.Now().UTC().Truncate(time.Second)
+	backupID := int64(42)
+	startedAt := now.Add(-1 * time.Minute)
+	completedAt := now
+
+	src := []*models.RestoreJobRecord{
+		{
+			ID:               101,
+			Status:           models.RestoreJobStatusCompleted,
+			Paths:            []string{"/data/a.txt", "/data/b.txt"},
+			Pattern:          "",
+			BackupID:         &backupID,
+			OutputDir:        "/restore/dest",
+			Expedited:        true,
+			ConflictStrategy: "skip",
+			TotalFiles:       2,
+			RestoredFiles:    2,
+			FailedFiles:      nil,
+			TotalSize:        1024,
+			RestoredSize:     1024,
+			ElapsedMs:        5000,
+			ErrorMessage:     "",
+			CreatedAt:        now.Add(-2 * time.Minute),
+			StartedAt:        &startedAt,
+			CompletedAt:      &completedAt,
+		},
+		{
+			ID:               102,
+			Status:           models.RestoreJobStatusFailed,
+			Paths:            []string{"/data/c.txt"},
+			Pattern:          "/data/*.txt",
+			BackupID:         nil,
+			OutputDir:        "__original__",
+			Expedited:        false,
+			ConflictStrategy: "overwrite",
+			TotalFiles:       3,
+			RestoredFiles:    1,
+			FailedFiles:      []string{"/data/c.txt", "/data/d.txt"},
+			TotalSize:        2048,
+			RestoredSize:     512,
+			ElapsedMs:        0,
+			ErrorMessage:     "download failed",
+			CreatedAt:        now.Add(-1 * time.Minute),
+			StartedAt:        nil,
+			CompletedAt:      nil,
+		},
+	}
+
+	// Insert via ImportBatch (which is the write-path after PullOSSDB).
+	if err := repo.ImportBatch(src); err != nil {
+		t.Fatalf("ImportBatch: %v", err)
+	}
+
+	// Export and verify each field survives the roundtrip.
+	got, err := repo.ExportAll()
+	if err != nil {
+		t.Fatalf("ExportAll: %v", err)
+	}
+	if len(got) != len(src) {
+		t.Fatalf("expected %d records, got %d", len(src), len(got))
+	}
+
+	for i, want := range src {
+		r := got[i]
+		if r.ID != want.ID {
+			t.Errorf("[%d] ID: got %d want %d", i, r.ID, want.ID)
+		}
+		if r.Status != want.Status {
+			t.Errorf("[%d] Status: got %q want %q", i, r.Status, want.Status)
+		}
+		if len(r.Paths) != len(want.Paths) {
+			t.Errorf("[%d] Paths length: got %d want %d", i, len(r.Paths), len(want.Paths))
+		} else {
+			for j := range r.Paths {
+				if r.Paths[j] != want.Paths[j] {
+					t.Errorf("[%d] Paths[%d]: got %q want %q", i, j, r.Paths[j], want.Paths[j])
+				}
+			}
+		}
+		if r.Pattern != want.Pattern {
+			t.Errorf("[%d] Pattern: got %q want %q", i, r.Pattern, want.Pattern)
+		}
+		if (r.BackupID == nil) != (want.BackupID == nil) {
+			t.Errorf("[%d] BackupID nil mismatch", i)
+		} else if r.BackupID != nil && *r.BackupID != *want.BackupID {
+			t.Errorf("[%d] BackupID: got %d want %d", i, *r.BackupID, *want.BackupID)
+		}
+		if r.OutputDir != want.OutputDir {
+			t.Errorf("[%d] OutputDir: got %q want %q", i, r.OutputDir, want.OutputDir)
+		}
+		if r.Expedited != want.Expedited {
+			t.Errorf("[%d] Expedited: got %v want %v", i, r.Expedited, want.Expedited)
+		}
+		if r.ConflictStrategy != want.ConflictStrategy {
+			t.Errorf("[%d] ConflictStrategy: got %q want %q", i, r.ConflictStrategy, want.ConflictStrategy)
+		}
+		if r.TotalFiles != want.TotalFiles {
+			t.Errorf("[%d] TotalFiles: got %d want %d", i, r.TotalFiles, want.TotalFiles)
+		}
+		if r.RestoredFiles != want.RestoredFiles {
+			t.Errorf("[%d] RestoredFiles: got %d want %d", i, r.RestoredFiles, want.RestoredFiles)
+		}
+		if len(r.FailedFiles) != len(want.FailedFiles) {
+			t.Errorf("[%d] FailedFiles length: got %d want %d", i, len(r.FailedFiles), len(want.FailedFiles))
+		}
+		if r.TotalSize != want.TotalSize {
+			t.Errorf("[%d] TotalSize: got %d want %d", i, r.TotalSize, want.TotalSize)
+		}
+		if r.RestoredSize != want.RestoredSize {
+			t.Errorf("[%d] RestoredSize: got %d want %d", i, r.RestoredSize, want.RestoredSize)
+		}
+		if r.ErrorMessage != want.ErrorMessage {
+			t.Errorf("[%d] ErrorMessage: got %q want %q", i, r.ErrorMessage, want.ErrorMessage)
+		}
+		if !r.CreatedAt.Equal(want.CreatedAt) {
+			t.Errorf("[%d] CreatedAt: got %v want %v", i, r.CreatedAt, want.CreatedAt)
+		}
+		if (r.StartedAt == nil) != (want.StartedAt == nil) {
+			t.Errorf("[%d] StartedAt nil mismatch", i)
+		} else if r.StartedAt != nil && !r.StartedAt.Equal(*want.StartedAt) {
+			t.Errorf("[%d] StartedAt: got %v want %v", i, r.StartedAt, want.StartedAt)
+		}
+		if (r.CompletedAt == nil) != (want.CompletedAt == nil) {
+			t.Errorf("[%d] CompletedAt nil mismatch", i)
+		} else if r.CompletedAt != nil && !r.CompletedAt.Equal(*want.CompletedAt) {
+			t.Errorf("[%d] CompletedAt: got %v want %v", i, r.CompletedAt, want.CompletedAt)
+		}
+	}
+}
+
+func TestRestoreJobRepository_ExportImportEmpty(t *testing.T) {
+	database := setupRestoreJobTestDB(t)
+	defer database.Close()
+	repo := database.RestoreJobRepo
+
+	// ImportBatch with empty input must be a no-op (no error, no rows).
+	if err := repo.ImportBatch(nil); err != nil {
+		t.Fatalf("ImportBatch(nil): %v", err)
+	}
+	got, err := repo.ExportAll()
+	if err != nil {
+		t.Fatalf("ExportAll after empty import: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("expected 0 records after empty import, got %d", len(got))
+	}
+}
