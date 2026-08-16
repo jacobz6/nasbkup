@@ -122,23 +122,12 @@ deploy_main() {
         fi
     else
         info "配置本地文件系统 remote（离线测试模式）..."
-        local pw1 pw2
-        pw1=$(rclone obscure "$(openssl rand -base64 32)")
-        pw2=$(rclone obscure "$(openssl rand -base64 32)")
         cat > "$RCLONE_CONFIG" <<EOF
 # Rclone 配置 - 本地测试模式（$(date -Iseconds)）
-# 使用本地文件系统 + 客户端加密模拟云存储
+# 使用本地文件系统模拟云存储（无加密层，由应用层 master.key 提供加密）
 
 [oss]
 type = local
-
-[oss-crypt]
-type = crypt
-remote = oss:${local_cloud_dir}
-password = ${pw1}
-password2 = ${pw2}
-filename_encryption = standard
-directory_name_encryption = true
 EOF
         chmod 600 "$RCLONE_CONFIG"
     fi
@@ -362,7 +351,7 @@ oss:
 rclone:
   binary_path: "./bin/rclone"
   config_path: "./data/rclone.conf"
-  remote_name: "oss-crypt"
+  remote_name: "oss"
 
 logging:
   level: "info"

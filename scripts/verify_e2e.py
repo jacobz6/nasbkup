@@ -505,39 +505,33 @@ def run_tests():
     # ==========================================================================
     report.start_phase("Phase 6: Feature Verification")
 
-    # 6a. Encryption: stored files should be unreadable without decryption
-    # rclone crypt encrypts filenames too (when filename_encryption=standard),
-    # so we check for obfuscated filenames + rclone crypt magic header
+    # 6a. Encryption: stored files should be unreadable without decryption.
+    # The application encrypts content with AES-256-GCM (master.key) and stores
+    # objects under storage_key = data/<hash>/<hash>.enc. There is no rclone
+    # crypt layer, so we check for the .enc extension + non-plaintext content.
     all_remote_files = list(LOCAL_CLOUD.rglob("*")) if LOCAL_CLOUD.exists() else []
     remote_files = [f for f in all_remote_files if f.is_file()]
-    has_obfuscated_names = False
-    has_rclone_header = False
+    has_enc_suffix = False
+    has_ciphertext = False
     if remote_files:
-        # Check if filenames look encrypted (base32-like obfuscated names, no original extensions)
-        for f in remote_files[:3]:
-            name = f.name
-            # Encrypted names are long base32 strings without dots/extensions
-            if len(name) > 30 and '.' not in name:
-                has_obfuscated_names = True
-                break
-        # Check for rclone crypt magic header
+        # Check that stored objects carry the app-level .enc extension.
+        if any(f.name.endswith(".enc") for f in remote_files[:3]):
+            has_enc_suffix = True
+        # Check for the AES-GCM ciphertext header / non-plaintext content.
         try:
             with open(remote_files[0], 'rb') as f:
-                header = f.read(16)
-                if b'RCLONE' in header or len(header) > 0:
-                    # rclone crypt files start with a non-trivial binary header
-                    # If we can't read plaintext, encryption is working
-                    sample = remote_files[0].read_bytes()[:200]
-                    import string
+                import string
+                sample = f.read(200)
+                if len(sample) > 0:
                     printable = sum(1 for b in sample if chr(b) in string.printable and chr(b) not in '\x00\xff')
                     if printable / len(sample) < 0.7:  # Less than 70% printable = likely encrypted
-                        has_rclone_header = True
+                        has_ciphertext = True
         except Exception:
             pass
 
-    enc_working = len(remote_files) > 0 and (has_obfuscated_names or has_rclone_header)
+    enc_working = len(remote_files) > 0 and has_enc_suffix and has_ciphertext
     report.record("Client-side encryption", enc_working,
-                  f"Found {len(remote_files)} files in remote storage, filenames/directories obfuscated by rclone crypt")
+                  f"Found {len(remote_files)} files in remote storage, app-level AES-256-GCM encrypted (.enc)")
 
     # Check that encrypted files don't contain plaintext patterns
     plaintext_leak = False

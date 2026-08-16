@@ -64,17 +64,12 @@ if [ ! -f "${RCLONE_CONF}" ]; then
 [oss]
 type = s3
 provider = Aliyun
+env_auth = false
 access_key_id = REPLACE_WITH_YOUR_ACCESS_KEY_ID
 secret_access_key = REPLACE_WITH_YOUR_ACCESS_KEY_SECRET
 endpoint = oss-cn-hangzhou.aliyuncs.com
 acl = private
-
-[oss-crypt]
-type = crypt
-remote = oss:your-bucket-name/nas-backup
-filename_encryption = standard
-directory_name_encryption = true
-password = REPLACE_WITH_RCLONE_CRYPT_PASSWORD
+bucket = your-bucket-name
 EOF
     chmod 600 "${RCLONE_CONF}"
     warn "=========================================================="

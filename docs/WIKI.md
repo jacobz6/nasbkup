@@ -125,7 +125,6 @@ nasbkup_system/
 │   │   └── storage/             # OSS 存储管理（rclone + OSS SDK）
 │   ├── scripts/                 # 辅助脚本
 │   │   ├── setup-rclone.sh      # rclone 交互式配置
-│   │   ├── patch-rclone-crypt-password.sh # 修复 rclone crypt 密码
 │   │   └── backup.sh            # CLI 手动触发备份
 │   ├── config.yaml.example      # 配置文件示例
 │   ├── go.mod / go.sum
@@ -268,7 +267,7 @@ AppConfig
 ├── RcloneConfig          # rclone 配置
 │   ├── BinaryPath        # rclone 二进制路径
 │   ├── ConfigPath        # rclone 配置文件路径
-│   └── RemoteName        # 远程名称 (默认 "oss-crypt")
+│   └── RemoteName        # 远程名称 (默认 "oss")
 └── LoggingConfig         # 日志配置
     ├── Level             # 日志级别
     ├── FilePath          # 日志文件路径
@@ -459,7 +458,6 @@ SQLite 性能优化 PRAGMA：
 | `ListActiveByDirectory` | `(dirPath) ([]*FileRecord, error)` | 查询目录下所有活跃文件（LIKE dirPath/%） |
 | `ListActiveByBackup` | `(backupID, dirPath) ([]*FileRecord, error)` | 查询指定备份中某目录下的文件 |
 | `ListAllPaths` | `() ([]string, error)` | 列出所有文件路径 |
-| `CountActiveByHash` | `() (map[string]int, error)` | 按 hash 统计活跃文件数（用于对账 ref_count 校验） |
 | `MarkDeleted` | `(path) error` | 标记文件为已删除 |
 | `MarkDeletedBatch` | `(paths) error` | 批量标记删除（事务） |
 | `UpdateHash` | `(id, hash) error` | 更新文件哈希 |
@@ -821,7 +819,7 @@ data: {"type":"progress","phase":"uploading","current":150,"total":200,"percent"
 | DanglingHashIndexesRefNonZero | hash_index 有记录且 ref_count>0 但 OSS 无对应对象 | 不自动修复，记录错误 |
 | OrphanBackupFiles | backup_files 有记录但 hash_index 无对应条目 | 自动删除 orphan backup_files 记录 |
 | BackupFilesMissingHashIndexButInOSS | backup_files 指向的 hash_index 不存在但 OSS 有对象 | 自动重建 hash_index 记录（ref_count=1） |
-| RefCountMismatches | hash_index.ref_count 与实际活跃文件数不一致 | 自动修正 ref_count |
+| RefCountMismatches | hash_index.ref_count 与 backup_files 引用数（按 storage_key 分组）不一致 | 自动修正 ref_count |
 | FailedBackupsWithFiles | 备份状态为 failed 但有 backup_files 记录 | 自动修正为 completed 或清理孤立文件 |
 | CompletedBackupsNoFiles | 备份状态为 completed 但无 backup_files 记录 | 自动修正为 failed |
 
@@ -1027,10 +1025,10 @@ type StorageManager struct {
 }
 ```
 
-#### 双层远程配置
+#### 远程配置（OSS 直连，单一远程）
 
-- **[oss]**: 原始 S3 兼容远程（指向阿里云 OSS）
-- **[oss-crypt]**: crypt 远程（包装 oss 远程，提供传输层加密）
+- **[oss]**: 原始 S3 兼容远程（指向阿里云 OSS），**唯一**远程，不再有 crypt 冗余层。
+- 内容加密（AES-256-GCM）由 crypto 模块在应用层负责；文件名/路径**明文**，OSS 对象 key 直接等于 `storage_key`（`data/<hash前2位>/<hash>.enc`）。`rclone.conf` 由 `setup-rclone.sh` 从 `config.yaml` 生成，唯一配置源是 `config.yaml`。
 
 #### 关键方法
 
@@ -1043,7 +1041,7 @@ type StorageManager struct {
 | `Delete` | `(remoteKey) error` | 删除 OSS 对象（rclone delete，3 次重试） |
 | `DeleteBatch` | `(remoteKeys) error` | 批量删除 OSS 对象 |
 | `Exists` | `(remoteKey) (bool, error)` | 检查对象是否存在（rclone lsl） |
-| `RestoreObject` | `(remoteKey, expedited) error` | 发起解冻请求（OSS SDK） |
+| `RestoreObject` | `(remoteKey) error` | 发起标准解冻请求（OSS SDK，最小 XML body，统一标准 Tier；加急解冻已移除） |
 | `CheckRestored` | `(remoteKey) (bool, error)` | 检查对象是否已解冻（检查 X-Oss-Restore 头） |
 | `GetStorageUsage` | `() (int64, error)` | 获取存储使用量（rclone size） |
 | `Ping` | `(ctx) (latencyMs int64, err error)` | OSS 连通性健康检查：向临时文件 `._health_check` 写入 1 字节并删除，测量延迟 |
@@ -1538,7 +1536,7 @@ SSE 实时进度订阅 Hook：
 | hash | TEXT | NOT NULL UNIQUE | SHA-256 哈希 |
 | file_size | INTEGER | NOT NULL DEFAULT 0 | 文件大小 |
 | storage_key | TEXT | NOT NULL DEFAULT '' | OSS 存储键 |
-| ref_count | INTEGER | NOT NULL DEFAULT 0 | 引用计数 |
+| ref_count | INTEGER | NOT NULL DEFAULT 0 | 引用计数（语义 = backup_files 按 storage_key 的引用数，非活跃文件数） |
 | created_at | TEXT | NOT NULL DEFAULT datetime | 创建时间 |
 
 索引: `idx_hash_index_hash`
@@ -2505,4 +2503,63 @@ OSS 存储使用  ≤  已上传部分原始大小  ≤  总文件大小
 - 新增 `isArchiveStorageClass()` 辅助函数判断归档存储类型。
 
 > ⚠️ **避坑**: `RestoreObjectDetail(RestoreConfiguration{Days:7})` 在 SDK 内部会强制给 `Tier=""` 填上 `"Standard"`，对 Archive 桶必踩 MalformedXML 坑。必须用 `RestoreObjectXML` 发送精确 body。
+
+---
+
+## 附录 C：2026-08-16 OSS 直连改造 + 两个非阻塞问题修复记录
+
+> 本节记录 2026-08-16 会话的架构改造与两个被预存的非阻塞问题修复。其中**附录 B.2 的 crypt `.bin` 后缀问题已被 C.1 的「移除 crypt 冗余层」所取代**，阅读 B 节时请注意时序差异。
+
+### C.1 OSS 直连改造：移除 crypt 冗余层，统一到真实 OSS（唯一配置源）
+
+**背景**：早期用 rclone crypt remote（`[oss-crypt]`，`filename_encryption=standard`）做文件名加密，但真实 OSS 桶中对象为若干历史会话上传的明文命名，与 crypt 推导出的 key 不兼容，导致恢复 404。且本项目的真实业务加密是**应用层 AES-256-GCM 内容加密**，crypt 层属冗余。
+
+**改动**：
+- `config.yaml` / `config.yaml.example` 的 `remote_name` 改为 `oss`；`rclone.conf` 由 `setup-rclone.sh` 生成，只保留 `[oss]`，删除 `[oss-crypt]`。**唯一配置源是 `config.yaml`**。
+- 删除 [storage.go](file:///Users/jacobzhang/工作区/code/nasbkup_system/nas-backup-backend/internal/storage/storage.go) 中 crypt 相关逻辑（`buildCryptSection`、`ossObjectKey`、`.bin` 追加/回退），新增 `remoteSpec` 统一构造 `oss:<bucket>/<key>` 路径（S3 后端忽略配置中的 `bucket`，必须写在路径里）。
+- 删除 `scripts/patch-rclone-crypt-password.sh`。
+- **结论**：仍需对象加密——内容加密保留（应用层 AES-256-GCM），但文件名/路径明文；OSS key 直接等于 `storage_key`（`data/<hash前2位>/<hash>.enc`）。安全 + 性能兼顾，且用明文 key 与既有数据兼容。
+
+**业务含义**：SSH 到生产环境后，存量明文对象与新的应用层加密对象共用同一命名空间；恢复时凭 `backup_files.storage_key` 直接定位真实 OSS key，可从任一备份历史无缝还原。
+
+### C.2 SQL 歧义：`ambiguous column name: backup_id`（[file_repo.go](file:///Users/jacobzhang/工作区/code/nasbkup_system/nas-backup-backend/internal/db/file_repo.go)）
+
+**现象**：带 `backup_id` 过滤的「可恢复文件」查询运行时报 `sql: ambiguous column name: backup_id`。
+
+**根因**：`fileColumns` 是逗号分隔的整体字符串，`SearchActiveFiles` / `ListActiveByBackup` 里写成 `SELECT f.` + `fileColumns`，**只给第一个列 `id` 加了 `f.` 前缀**，其余列（含 `backup_id`）未限定；`files` 与 `backup_files` 都有 `backup_id`，JOIN 时即歧义。
+
+**修复**：新增常量 `fileJoinColumns`（每列都带 `f.` 前缀），两处 JOIN 的 SELECT 改用它。
+
+**教训（后续 AI 必须遵守）**：凡是 JOIN `files`↔`backup_files` 的查询，**必须用 `fileJoinColumns`**，禁止 `"f." + fileColumns` 这种只限定首列的错误拼接。
+
+### C.3 `needs_reconcile` 误报：ref_count 口径错误（[hash_repo.go](file:///Users/jacobzhang/工作区/code/nasbkup_system/nas-backup-backend/internal/db/hash_repo.go) + [reconcile.go](file:///Users/jacobzhang/工作区/code/nasbkup_system/nas-backup-backend/internal/backup/reconcile.go)）
+
+**现象**：仪表盘「需要对账」指示灯长期误亮。
+
+**根因**：`ref_count` 的真实语义是**按备份会话逐条写入 `backup_files` 的引用数**（新内容 `Upsert` 置 1、去重跳过 `IncrementRef`、删除时 `DecrementRef`）。但 `HasRefCountMismatches` 与 `reconcileRefCount` 却拿 `files` 表**活跃文件数**（同 hash 去重）作对照。同一文件被多次备份时，ref_count 随会话增长、活跃数恒为 1 → 误报；且 reconcile 会把 ref_count 错误压回活跃数，可能让 GC 删除仍在备份历史中被引用的对象（**潜在数据删除风险**）。
+
+**修复**：两者对照基准统一改为 **backup_files 按 storage_key 分组的引用数**（复用 `ListAllBackupFileStorageKeys`），`HashRefCountMismatches` 则为同口径的单条 SQL。删除不再使用的 `CountActiveByHash`。
+
+**关键不变量**：
+```
+hash_index.ref_count  ==  COUNT(backup_files.storage_key)   // 不是 COUNT(DISTINCT active files)！
+```
+- 口径一旦再次写错，回退到「活跃文件数」会导致：① needs_reconcile 误报；② ref_count 被压到 0 触发 GC 删除备份历史仍需要的对象。
+- 回归测试：`TestFileRepository_JoinByBackup_NoAmbiguousBackupID`、`TestHashRepository_HasRefCountMismatches_CountsBackupFiles`。
+
+### C.4 2026-08-17 最终验收：E2E 连真 OSS 的注意事项（重要）
+
+**背景**：移除 crypt 后，`verify-e2e.sh` 不再走本地 `rclone local + crypt`，而是直接连 `config.yaml` 指定的**真实 OSS 桶**（macnas），会触发真实归档解冻（Archive 解冻约 60s）。后端逻辑本身已验证闭环：真实 Archive 对象 → 解冻 → 下载 → 应用层 AES-256-GCM 解密 → 写入 restore 目录，成功还原。
+
+**E2E 残留失败及归属**（非产品代码缺陷）：
+- `Restore completed: Timed out`（critical）——[verify_e2e.py](file:///Users/jacobzhang/工作区/code/nasbkup_system/scripts/verify_e2e.py) 的 `wait_for_restore_completion` 只接受 `completed`/`failed` 两个终态，**不认 `completed_with_errors`**。只要有一个文件恢复失败（如 `photo1.bin` 报 `decrypt file: nonce mismatch on first chunk`），job 进入 `completed_with_errors` → 轮询超时误判。
+- `Client-side encryption: 0 files`——检查读本地 `test-env/local-cloud-storage`（现在为空），对象实际在真 OSS，属陈旧断言。
+- `Backup types recorded: None`——来自已删除的版本概念（去版本化），恒 FAIL，陈旧断言。
+
+**`nonce mismatch on first chunk` 的根因（高频坑）**：
+> `decrypt file: nonce mismatch on first chunk: file may be corrupted or tampered with`
+- 含义：下载的 OSS 对象密文首块 nonce 与 `backup_files.encrypted_iv` 不一致 → **该密文是用上次/其它主密钥加密的**。
+- 触发条件：OS 桶内残留旧密钥会话上传的对象；新会话去重时 `upload skipped: object already exists in OSS` 跳过重传 → 下载后解密失败。
+- **这不是代码 bug，是脏数据**。验证基线：让 E2E 全绿需 **清空 OSS 桶 + 一次全新完整备份**（当前主密钥下重传所有对象）。
+- 排查：后端日志看到 `upload skipped: object already exists` 后去重置 `master.key` 或清桶即可；不要改解密逻辑。
 

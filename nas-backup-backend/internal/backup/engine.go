@@ -69,6 +69,22 @@ func (e *Engine) SetDBBackupService(svc *DBBackupService) {
 	e.dbBackupSvc = svc
 }
 
+// rebindAfterReopen rebuilds the in-memory scanner and deduplicator against the
+// current DB connection. Reopen() swaps the underlying *sql.DB and re-binds the
+// repos; both Scanner and Deduplicator cache repo pointers at construction time,
+// so they must be recreated after every Reopen or their cached pointers resolve
+// to a closed connection, surfacing as "sql: database is closed" on the next
+// backup (scan or dedup phase).
+func (e *Engine) rebindAfterReopen() {
+	if e.db == nil {
+		return
+	}
+	e.scanner = scanner.NewScanner(e.db.FileRepo, e.db.ConfigRepo)
+	if e.config != nil {
+		e.dedup = dedup.NewDeduplicator(e.db.HashRepo, e.storage, e.config.Storage.Concurrency)
+	}
+}
+
 // getDBBackupSvc returns the engine's DBBackupService, lazily constructing one
 // from the existing storage/encryptor/config/database dependencies if it was
 // never injected. This lets InitFromOSS work even when the engine was
@@ -140,6 +156,8 @@ func (e *Engine) InitFromOSS(ctx context.Context) error {
 		// Re-bind the DBBackupService to the new connection so WAL checkpoint
 		// and integrity_check in PushOSSDB use the correct handle.
 		e.dbBackupSvc = NewDBBackupService(e.encryptor, e.storage, e.config, e.db.Conn())
+		// Recreate scanner/deduplicator against the fresh connection.
+		e.rebindAfterReopen()
 		e.logger.Info("initialized local DB from OSS")
 		return nil
 	}
@@ -196,10 +214,20 @@ func (e *Engine) pullAndPreserveRestoreJobs(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 
-	// Export local restore_jobs before DB overwrite.
+	// Ensure the local schema is up to date before querying restore_jobs.
+	// A stale or older-version local DB may lack the restore_jobs table; running
+	// migrations here brings it up to date instead of failing with "no such table".
+	if err := e.db.EnsureSchema(); err != nil {
+		e.logger.Warn("ensure schema before export restore jobs failed", "error", err)
+	}
+
+	// Export local restore_jobs before DB overwrite. A missing table (e.g. the
+	// authoritative oss.db came from an older version) is not fatal: we simply
+	// have no local restore history to preserve.
 	localJobs, err := e.db.RestoreJobRepo.ExportAll()
 	if err != nil {
-		return false, fmt.Errorf("export restore jobs: %w", err)
+		e.logger.Warn("failed to export restore jobs before pull; continuing without local restore history", "error", err)
+		localJobs = nil
 	}
 
 	// Pull oss.db from OSS (overwrites local DB file).
@@ -219,6 +247,8 @@ func (e *Engine) pullAndPreserveRestoreJobs(ctx context.Context) (bool, error) {
 
 	// Re-bind the DBBackupService to the new connection.
 	e.dbBackupSvc = NewDBBackupService(e.encryptor, e.storage, e.config, e.db.Conn())
+	// Recreate scanner/deduplicator against the fresh connection.
+	e.rebindAfterReopen()
 
 	// Import restore_jobs back into the fresh DB.
 	if len(localJobs) > 0 {
@@ -238,6 +268,57 @@ func (e *Engine) pullAndPreserveRestoreJobs(ctx context.Context) (bool, error) {
 // has no oss.db yet (first-time deployment).
 func (e *Engine) RefreshFromOSS(ctx context.Context) (bool, error) {
 	return e.pullAndPreserveRestoreJobs(ctx)
+}
+
+// StorageStatus summarizes the health of the OSS connection, the authoritative
+// oss.db snapshot in OSS, and the readiness of the backup/restore engine. It
+// backs the dashboard "OSS 存储信息" status light.
+type StorageStatus struct {
+	OSSConnected bool   `json:"oss_connected"` // can reach the OSS remote
+	OSSDBExists  bool   `json:"oss_db_exists"` // oss.db.enc present in OSS
+	OSSDBParsed  bool   `json:"oss_db_parsed"` // working DB is open & queryable
+	Ready        bool   `json:"ready"`         // engine initialized, backup/restore usable
+	OSSError     string `json:"oss_error,omitempty"`
+	DBError      string `json:"db_error,omitempty"`
+}
+
+// StorageStatusFor reports current OSS / DB / engine health for the UI status
+// light. Checks are short and best-effort: OSS reachability via Ping, oss.db
+// presence via Exists, and working-DB parse via a connection Ping. Any failure
+// surfaces as a false flag plus a descriptive error, never as a server error.
+func (e *Engine) StorageStatusFor(ctx context.Context) StorageStatus {
+	st := StorageStatus{Ready: e.Ready()}
+
+	svc := e.getDBBackupSvc()
+	if svc == nil {
+		st.OSSError = "storage not configured"
+		st.DBError = "storage not configured"
+		return st
+	}
+
+	// 1. OSS reachability (backup/restore upload/download).
+	if err := e.storage.Ping(ctx); err != nil {
+		st.OSSError = err.Error()
+		return st
+	}
+	st.OSSConnected = true
+
+	// 2. Does OSS hold an authoritative DB snapshot?
+	exists, err := svc.OSSDBExists(ctx)
+	if err != nil {
+		st.DBError = err.Error()
+		return st
+	}
+	st.OSSDBExists = exists
+
+	// 3. Can the working DB be opened/queried? (parse check)
+	if err := e.db.Conn().Ping(); err != nil {
+		st.DBError = err.Error()
+		return st
+	}
+	st.OSSDBParsed = true
+
+	return st
 }
 
 // RunBackup executes a backup synchronously.
@@ -489,6 +570,29 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64) (retErr erro
 		delete(e.cancelFuncs, backupID)
 		e.runningBackupID = 0
 		e.mu.Unlock()
+	}()
+
+	// Sync the DB to OSS (runs after UpdateStatus, before cleanup). Must
+	// happen AFTER the terminal status (completed / completed_with_errors) is
+	// written: this deferred PushOSSDB uploads the authoritative oss.db, and if
+	// it ran before UpdateStatus the OSS snapshot would still carry a "running"
+	// backup that a later pull would bring back locally, permanently blocking
+	// restore with "a backup is currently running". Hard failures (retErr != nil)
+	// skip the push, matching the original in-pipeline behaviour.
+	defer func() {
+		if retErr != nil {
+			return
+		}
+		if svc := e.getDBBackupSvc(); svc != nil {
+			pushCtx, pushCancel := context.WithTimeout(context.Background(), 30*time.Minute)
+			if err := svc.PushOSSDB(pushCtx); err != nil {
+				e.logger.Error("failed to push oss.db to OSS after backup", "error", err)
+				e.logEvent(backupID, models.LogLevelWarn, "数据库同步到OSS失败", err.Error())
+			} else {
+				e.logEvent(backupID, models.LogLevelInfo, "数据库已同步到OSS", "")
+			}
+			pushCancel()
+		}
 	}()
 
 	// Update backup status on exit (runs before cleanup).
@@ -1061,19 +1165,9 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64) (retErr erro
 			"deleted", len(deletedPaths))
 	}
 
-	// ── Phase 11: Push updated DB to OSS ───────────────────────────────
-	// Sync the encrypted database to OSS as the new authoritative oss.db.
-	// The previous oss.db is renamed to a .bkup (may need thaw if in GLACIER).
-	if svc := e.getDBBackupSvc(); svc != nil {
-		pushCtx, pushCancel := context.WithTimeout(context.Background(), 30*time.Minute)
-		if err := svc.PushOSSDB(pushCtx); err != nil {
-			e.logger.Error("failed to push oss.db to OSS after backup", "error", err)
-			e.logEvent(backupID, models.LogLevelWarn, "数据库同步到OSS失败", err.Error())
-		} else {
-			e.logEvent(backupID, models.LogLevelInfo, "数据库已同步到OSS", "")
-		}
-		pushCancel()
-	}
+	// PushOSSDB now runs in a deferred function AFTER the terminal status is
+	// written (see the defer at the top of executeBackup), so the authoritative
+	// oss.db never carries a "running" backup.
 
 	return nil
 }

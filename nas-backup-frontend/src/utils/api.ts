@@ -185,6 +185,11 @@ export const reconcileApi = {
     ),
 };
 
+// Storage status (OSS connection / oss.db parse / engine readiness)
+export const storageApi = {
+  getStatus: () => request<StorageStatus>('/storage/status'),
+};
+
 // Types
 export interface OSSInfo {
   storage_class: string;
@@ -192,6 +197,16 @@ export interface OSSInfo {
   bucket: string;
   remote_name: string;
   region: string;
+}
+
+// Backend storage/OSS health reported by GET /api/storage/status.
+export interface StorageStatus {
+  oss_connected: boolean;
+  oss_db_exists: boolean;
+  oss_db_parsed: boolean;
+  ready: boolean; // engine initialized → backup/restore usable
+  oss_error?: string;
+  db_error?: string;
 }
 
 export interface DashboardStats {
@@ -448,7 +463,6 @@ export interface RestoreJobRecord {
   pattern: string;
   backup_id: number | null;
   output_dir: string;
-  expedited: boolean;
   conflict_strategy: string;
   total_files: number;
   restored_files: number;
@@ -468,7 +482,6 @@ export interface RestoreRequest {
   backup_id?: number;
   output_dir: string;
   restore_to_original?: boolean;
-  expedited?: boolean;
   conflict_strategy?: 'overwrite' | 'skip' | 'rename';
 }
 

@@ -113,6 +113,9 @@ func (r *Router) Setup() http.Handler {
 
 	// Storage health — verify OSS connectivity / credentials.
 	r.mux.HandleFunc("GET /api/storage/health", r.handleStorageHealth)
+	// Storage status — OSS connection / oss.db parse / engine readiness, for
+	// the dashboard "OSS 存储信息" status light.
+	r.mux.HandleFunc("GET /api/storage/status", r.handleStorageStatus)
 
 	return r.loggingMiddleware(r.corsMiddleware(r.mux))
 }

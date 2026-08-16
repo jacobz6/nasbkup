@@ -152,7 +152,7 @@ oss:
 rclone:
   binary_path: "./bin/rclone"   # Path to rclone binary (use project-bundled copy for version consistency)
   config_path: "./data/rclone.conf"
-  remote_name: "oss-crypt"      # Name of the crypt remote in rclone.conf
+  remote_name: "oss"            # Name of the raw OSS remote in rclone.conf (crypt layer removed; contents are encrypted at rest by the application's master.key)
 
 # ---------------------------------------------------------------------------
 # Logging settings

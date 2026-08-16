@@ -168,7 +168,7 @@ type OSSInfo struct {
 	StorageClass string `json:"storage_class"` // configured storage class (e.g. "ColdArchive", "Archive")
 	Endpoint     string `json:"endpoint"`       // OSS endpoint, e.g. "oss-cn-hangzhou.aliyuncs.com"
 	Bucket       string `json:"bucket"`         // OSS bucket name
-	RemoteName   string `json:"remote_name"`    // rclone remote name, e.g. "oss-crypt"
+	RemoteName   string `json:"remote_name"`    // rclone remote name, e.g. "oss"
 	Region       string `json:"region"`         // OSS region, e.g. "cn-hangzhou"
 }
 

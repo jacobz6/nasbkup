@@ -79,7 +79,7 @@ oss:
 rclone:
   binary_path: "/usr/local/bin/rclone"
   config_path: "` + tmpDir + `/rclone.conf"
-  remote_name: "oss-crypt"
+  remote_name: "oss"
 logging:
   level: "debug"
   file_path: "` + tmpDir + `/logs/nas-backup.log"

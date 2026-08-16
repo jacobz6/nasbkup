@@ -147,6 +147,14 @@ func NewStorageManager(cfg *config.AppConfig) (*StorageManager, error) {
 	return sm, nil
 }
 
+// remoteSpec builds the rclone remote path for the given object key, including
+// the bucket name. rclone's S3 backend for Alibaba OSS operates in cross-bucket
+// mode (the first path segment is the bucket), so the configured bucket must be
+// part of the path — the `bucket` field in rclone.conf is not honored.
+func (sm *StorageManager) remoteSpec(key string) string {
+	return fmt.Sprintf("%s:%s/%s", sm.remoteName, sm.ossBucket, strings.TrimPrefix(key, "/"))
+}
+
 // checkRcloneVersion verifies that the rclone binary is runnable by executing
 // `rclone version`. It parses the version string and stores it for diagnostics
 // and future feature detection (e.g. conditional use of flags that only exist
@@ -171,18 +179,16 @@ func (sm *StorageManager) checkRcloneVersion() error {
 }
 
 // EnsureRcloneConfig checks if the rclone configuration file exists; if not, it
-// generates one from the application configuration. The generated config contains
-// two remotes:
+// generates one from the application configuration. The generated config
+// contains a single remote:
 //
 //   - [oss]: a raw S3-compatible remote pointing at Alibaba Cloud OSS.
-//   - [oss-crypt]: a crypt remote wrapping the raw OSS remote for at-rest
-//     encryption. The RemoteName from config determines which remote is used
-//     for actual operations.
 //
-// If the config file already exists, it is validated: when a crypt remote is
-// configured, its [oss-crypt] section is checked for the required password /
-// password2 fields. If either is missing or empty, the section is patched
-// in place without clobbering other sections the user may have added.
+// The remote name is fixed to "oss"; there is no crypt wrapper layer. Contents
+// are encrypted at rest by the application's master.key instead.
+//
+// If the config file already exists, it is validated and repaired in place
+// without clobbering unrelated sections the user may have added.
 func (sm *StorageManager) EnsureRcloneConfig() error {
 	if _, err := os.Stat(sm.rcloneConf); err == nil {
 		// Config already exists — validate and repair if needed.
@@ -218,32 +224,18 @@ func (sm *StorageManager) generateRcloneConfig() error {
 	sb.WriteString(fmt.Sprintf("bucket = %s\n", sm.ossBucket))
 	sb.WriteString("\n")
 
-	if sm.remoteName != rawRemoteName {
-		password, err := sm.obscurePassword(sm.ossAKSecret)
-		if err != nil {
-			return fmt.Errorf("obscure crypt password: %w", err)
-		}
-		password2, err := sm.obscurePassword(sm.ossAKSecret + "-content-key")
-		if err != nil {
-			return fmt.Errorf("obscure crypt content-key password: %w", err)
-		}
-		sb.WriteString(buildCryptSection(sm.remoteName, rawRemoteName, sm.ossBucket, password, password2))
-	}
-
 	if err := os.WriteFile(sm.rcloneConf, []byte(sb.String()), 0600); err != nil {
 		return fmt.Errorf("write rclone config to %q: %w", sm.rcloneConf, err)
 	}
 	return nil
 }
 
-// repairRcloneConfig validates an existing rclone.conf and patches the crypt
-// remote section if its password / password2 fields are missing or empty.
-// This handles the case where a config was generated without passwords
-// (or with stale credentials) without clobbering unrelated sections.
-// If the configured remote is the raw "oss" remote (no crypt), this is a no-op.
+// repairRcloneConfig validates an existing rclone.conf and persists harmless
+// cleanups (stripping a stale storage_class line and any stray quotes around
+// the bucket name) without clobbering unrelated sections the user may have
+// added. Contents are always encrypted at rest by the application's master.key,
+// so no crypt remote is needed.
 func (sm *StorageManager) repairRcloneConfig() error {
-	rawRemoteName := "oss"
-
 	content, err := os.ReadFile(sm.rcloneConf)
 	if err != nil {
 		return fmt.Errorf("read rclone config: %w", err)
@@ -256,45 +248,12 @@ func (sm *StorageManager) repairRcloneConfig() error {
 	// OSS 400 BadRequest errors.
 	text = stripStorageClass(text)
 
-	// Normalize the crypt section's "remote" field by stripping any quotes
-	// around the bucket name. A value like remote = oss:"bucket" causes rclone
-	// to send literal quote characters as part of the bucket name, which OSS
-	// rejects with 400 BadRequest.
-	text = normalizeRemoteField(text, sm.remoteName)
+	// Normalize the bucket name in the "remote" field by stripping any quotes.
+	// A value like remote = oss:"bucket" causes rclone to send literal quote
+	// characters as part of the bucket name, which OSS rejects with 400.
+	text = normalizeRemoteField(text, "oss")
 
-	if sm.remoteName == rawRemoteName {
-		// Raw remote only — just persist the cleanups above.
-		return os.WriteFile(sm.rcloneConf, []byte(text), 0600)
-	}
-
-	sectionStart, sectionEnd, ok := locateSection(text, sm.remoteName)
-	if !ok {
-		// Crypt section missing entirely — regenerate the whole file.
-		return sm.generateRcloneConfig()
-	}
-
-	section := text[sectionStart:sectionEnd]
-	if fieldValue(section, "password") != "" && fieldValue(section, "password2") != "" {
-		// Passwords already present — just persist the cleanups above.
-		return os.WriteFile(sm.rcloneConf, []byte(text), 0600)
-	}
-
-	password, err := sm.obscurePassword(sm.ossAKSecret)
-	if err != nil {
-		return fmt.Errorf("obscure crypt password: %w", err)
-	}
-	password2, err := sm.obscurePassword(sm.ossAKSecret + "-content-key")
-	if err != nil {
-		return fmt.Errorf("obscure crypt content-key password: %w", err)
-	}
-
-	newSection := buildCryptSection(sm.remoteName, rawRemoteName, sm.ossBucket, password, password2)
-	newText := text[:sectionStart] + newSection + text[sectionEnd:]
-
-	if err := os.WriteFile(sm.rcloneConf, []byte(newText), 0600); err != nil {
-		return fmt.Errorf("write repaired rclone config: %w", err)
-	}
-	return nil
+	return os.WriteFile(sm.rcloneConf, []byte(text), 0600)
 }
 
 // stripStorageClass removes any "storage_class = ..." line from the [oss]
@@ -314,7 +273,7 @@ func stripStorageClass(text string) string {
 }
 
 // normalizeRemoteField strips quotes from the bucket name in the "remote"
-// line of the named crypt section. For example:
+// line of the named section. For example:
 //
 //	remote = oss:"mybucket"   →   remote = oss:mybucket
 //	remote = oss:'mybucket'   →   remote = oss:mybucket
@@ -340,20 +299,6 @@ func normalizeRemoteField(text, sectionName string) string {
 		return text
 	}
 	return text[:start] + newSection + text[end:]
-}
-
-// buildCryptSection returns the text of a [crypt] remote section.
-func buildCryptSection(remoteName, rawRemoteName, bucket, password, password2 string) string {
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("[%s]\n", remoteName))
-	sb.WriteString("type = crypt\n")
-	sb.WriteString(fmt.Sprintf("remote = %s:%s\n", rawRemoteName, bucket))
-	sb.WriteString("filename_encryption = off\n")
-	sb.WriteString("directory_name_encryption = false\n")
-	sb.WriteString(fmt.Sprintf("password = %s\n", password))
-	sb.WriteString(fmt.Sprintf("password2 = %s\n", password2))
-	sb.WriteString("\n")
-	return sb.String()
 }
 
 // locateSection returns the byte offsets of the [name] section in text.
@@ -414,28 +359,6 @@ func readCredentialsFromRcloneConf(rcloneConfPath string) (string, string, bool)
 	return ak, sk, true
 }
 
-// obscurePassword generates an obscured representation of a password for rclone.
-// It uses the configured rclone binary to run the obscure command.
-// If the rclone binary is not available or the command fails, an error is returned
-// to prevent accidentally storing plaintext passwords in the config file.
-func (sm *StorageManager) obscurePassword(plain string) (string, error) {
-	rcloneBin := sm.rcloneBin
-	if rcloneBin == "" {
-		rcloneBin = "rclone"
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, rcloneBin, "obscure", plain)
-	cmd.Stdin = nil
-	if output, err := cmd.Output(); err == nil {
-		return strings.TrimSpace(string(output)), nil
-	}
-	// Refuse to fall back to plaintext — this would expose credentials.
-	// The caller should propagate this error and abort config generation.
-	return "", fmt.Errorf("failed to obscure password: rclone obscure command failed; " +
-		"manually run 'rclone obscure' and use the output in the config")
-}
-
 // Upload uploads a local file to OSS via rclone. It retries up to 3 times with
 // exponential backoff on failure. The context allows cancellation of in-flight
 // uploads (e.g. when the backup is cancelled).
@@ -457,7 +380,7 @@ func (sm *StorageManager) Upload(ctx context.Context, localPath, remoteKey strin
 		fileSize = info.Size()
 	}
 
-	remoteSpec := fmt.Sprintf("%s:%s", sm.remoteName, remoteKey)
+	remoteSpec := sm.remoteSpec(remoteKey)
 
 	// Pre-check: if the object already exists in OSS, skip uploading to avoid
 	// overwriting. In a multi-environment shared-bucket setup, another instance
@@ -504,7 +427,7 @@ func (sm *StorageManager) Download(ctx context.Context, remoteKey, localPath str
 		return fmt.Errorf("rclone binary not found")
 	}
 
-	remoteSpec := fmt.Sprintf("%s:%s", sm.remoteName, remoteKey)
+	remoteSpec := sm.remoteSpec(remoteKey)
 
 	// Ensure the output directory exists.
 	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
@@ -575,7 +498,7 @@ func (sm *StorageManager) DownloadWithThaw(ctx context.Context, remoteKey, local
 			case <-time.After(pollInterval):
 			}
 
-			restored, err := sm.CheckRestored(remoteKey)
+			restored, err = sm.CheckRestored(remoteKey)
 			if err != nil {
 				slog.Warn("check restore status failed, retrying",
 					"key", remoteKey, "error", err)
@@ -608,7 +531,7 @@ func (sm *StorageManager) Delete(ctx context.Context, remoteKey string) error {
 		return fmt.Errorf("delete rejected: storage_key %q looks like a directory (trailing slash)", remoteKey)
 	}
 
-	remoteSpec := fmt.Sprintf("%s:%s", sm.remoteName, remoteKey)
+	remoteSpec := sm.remoteSpec(remoteKey)
 	return sm.withRetry(ctx, defaultRetryCount, func() error {
 		cmd := exec.CommandContext(ctx, sm.rcloneBin,
 			"delete", remoteSpec,
@@ -647,7 +570,7 @@ func (sm *StorageManager) DeleteBatch(ctx context.Context, remoteKeys []string) 
 // --files-only on the exact remote path. This is more reliable than `rclone lsl`
 // for existence checks because:
 //   - lsjson returns a structured JSON array; an empty array reliably means
-//     "not found" regardless of backend type (S3, crypt-wrapped S3, etc.)
+//     "not found" regardless of backend type
 //   - It does not rely on matching error message substrings, which vary across
 //     backends and rclone versions.
 //
@@ -658,7 +581,7 @@ func (sm *StorageManager) Exists(ctx context.Context, remoteKey string) (bool, e
 		return false, fmt.Errorf("rclone binary not found")
 	}
 
-	remoteSpec := fmt.Sprintf("%s:%s", sm.remoteName, remoteKey)
+	remoteSpec := sm.remoteSpec(remoteKey)
 	cmd := exec.CommandContext(ctx, sm.rcloneBin,
 		"lsjson", remoteSpec,
 		"--config", sm.rcloneConf,
@@ -723,20 +646,6 @@ func (sm *StorageManager) Exists(ctx context.Context, remoteKey string) (bool, e
 	return len(entries) > 0, nil
 }
 
-// ossObjectKey converts a rclone-layer storage key to the actual OSS object key.
-// When using the crypt remote wrapper (remoteName != "oss"), rclone appends a
-// ".bin" suffix to all objects even when filename_encryption=off. This suffix
-// is stripped by rclone when listing/reading via the crypt remote, but the
-// raw OSS SDK must use the actual suffixed key.
-func (sm *StorageManager) ossObjectKey(remoteKey string) string {
-	// If using the crypt wrapper (remoteName != raw "oss"), append .bin suffix
-	// to match what rclone actually writes to OSS.
-	if sm.remoteName != "oss" && !strings.HasSuffix(remoteKey, ".bin") {
-		return remoteKey + ".bin"
-	}
-	return remoteKey
-}
-
 // RestoreObject initiates a restore (thaw) request for an archived object.
 //
 // Important note for Aliyun OSS Archive storage (as opposed to Cold Archive):
@@ -756,14 +665,6 @@ func (sm *StorageManager) RestoreObject(remoteKey string, expedited bool) error 
 		return ErrOSSSDKNotConfigured
 	}
 
-	// If expedited was requested, log that Aliyun Archive tier does not
-	// support it and fall back to standard restore (1-10 hours) instead of
-	// failing the whole job.
-	if expedited {
-		slog.Warn("expedited restore requested but Aliyun OSS Archive tier does not support " +
-			"GlacierJobParameters/Tier (expedited is only for Cold Archive); using standard restore (1-10 hours)")
-	}
-
 	client, err := oss.New(sm.ossEndpoint, sm.ossAKID, sm.ossAKSecret)
 	if err != nil {
 		return fmt.Errorf("create OSS client: %w", err)
@@ -774,7 +675,9 @@ func (sm *StorageManager) RestoreObject(remoteKey string, expedited bool) error 
 		return fmt.Errorf("get OSS bucket %q: %w", sm.ossBucket, err)
 	}
 
-	ossKey := sm.ossObjectKey(remoteKey)
+	// The OSS object key is the storage_key itself (no crypt wrapper), so the
+	// restore request targets remoteKey directly.
+	ossKey := remoteKey
 
 	// For Aliyun Archive storage, the restore request body MUST contain ONLY
 	// <Days>; NO <JobParameters><Tier> element is allowed (Archive tier does
@@ -850,8 +753,8 @@ func (sm *StorageManager) CheckRestored(remoteKey string) (bool, error) {
 		return false, nil
 	}
 
-	// Use actual OSS object key (with .bin suffix if using crypt wrapper)
-	ossKey := sm.ossObjectKey(remoteKey)
+	// The OSS object key is the storage_key itself (no crypt wrapper).
+	ossKey := remoteKey
 
 	client, err := oss.New(sm.ossEndpoint, sm.ossAKID, sm.ossAKSecret)
 	if err != nil {
@@ -865,7 +768,6 @@ func (sm *StorageManager) CheckRestored(remoteKey string) (bool, error) {
 
 	// GetObjectDetailedMeta returns full metadata including the X-Oss-Restore header.
 	meta, err := bucket.GetObjectDetailedMeta(ossKey)
-	usedFallback := false
 	if err != nil {
 		errMsg := err.Error()
 		// Distinguish "object not found" (404 NoSuchKey) from other HEAD errors.
@@ -873,24 +775,7 @@ func (sm *StorageManager) CheckRestored(remoteKey string) (bool, error) {
 		// by GC based on an inconsistent hash_index). This is a data-integrity
 		// problem, NOT a thaw issue.
 		if strings.Contains(errMsg, "404") || strings.Contains(errMsg, "NoSuchKey") {
-			// If we added .bin suffix and got 404, try without suffix as fallback
-			if ossKey != remoteKey {
-				meta, err = bucket.GetObjectDetailedMeta(remoteKey)
-				if err == nil {
-					// Found without suffix — use this path instead
-					slog.Warn("object found without .bin suffix, using raw key", "key", remoteKey)
-					ossKey = remoteKey
-					usedFallback = true
-				} else {
-					errMsg2 := err.Error()
-					if strings.Contains(errMsg2, "404") || strings.Contains(errMsg2, "NoSuchKey") {
-						return false, fmt.Errorf("object %q does not exist in OSS (404 NoSuchKey) — checked both %q and %q; it may have been deleted by GC or never uploaded; verify hash_index/backup_files consistency (files.hash vs storage_key)", remoteKey, sm.ossObjectKey(remoteKey), remoteKey)
-					}
-					return false, fmt.Errorf("head object %q (oss key: %q): %w", remoteKey, sm.ossObjectKey(remoteKey), err)
-				}
-			} else {
-				return false, fmt.Errorf("object %q does not exist in OSS (404 NoSuchKey) — it may have been deleted by GC or never uploaded; verify hash_index/backup_files consistency (files.hash vs storage_key)", remoteKey)
-			}
+			return false, fmt.Errorf("object %q does not exist in OSS (404 NoSuchKey) — it may have been deleted by GC or never uploaded; verify hash_index/backup_files consistency (files.hash vs storage_key)", remoteKey)
 		} else if strings.Contains(errMsg, "OperationNotSupported") || strings.Contains(errMsg, "InvalidObjectState") {
 			// This error indicates we tried to HEAD an object that is in a
 			// storage class that doesn't support direct HEAD operations.
@@ -901,8 +786,6 @@ func (sm *StorageManager) CheckRestored(remoteKey string) (bool, error) {
 			return false, fmt.Errorf("head object %q (oss key: %q): %w", remoteKey, ossKey, err)
 		}
 	}
-
-	_ = usedFallback
 
 	// Check storage class first. If the object is in an archive/cold tier, it
 	// requires restoration before download, regardless of the presence/absence
@@ -993,7 +876,7 @@ func (sm *StorageManager) List(ctx context.Context, prefix string) ([]string, er
 		prefix += "/"
 	}
 
-	remoteSpec := fmt.Sprintf("%s:%s", sm.remoteName, prefix)
+	remoteSpec := sm.remoteSpec(prefix)
 	cmd := exec.CommandContext(ctx, sm.rcloneBin,
 		"lsf", remoteSpec,
 		"--config", sm.rcloneConf,
@@ -1060,7 +943,7 @@ func (sm *StorageManager) GetStorageUsage(ctx context.Context, prefix string) (i
 		prefix += "/"
 	}
 
-	remoteSpec := fmt.Sprintf("%s:%s", sm.remoteName, prefix)
+	remoteSpec := sm.remoteSpec(prefix)
 	cmd := exec.CommandContext(ctx, sm.rcloneBin,
 		"size", remoteSpec,
 		"--config", sm.rcloneConf,
@@ -1246,7 +1129,7 @@ func (sm *StorageManager) HeadObject(ctx context.Context, remoteKey string) (*Ob
 		return nil, fmt.Errorf("rclone binary not found")
 	}
 
-	remoteSpec := fmt.Sprintf("%s:%s", sm.remoteName, remoteKey)
+	remoteSpec := sm.remoteSpec(remoteKey)
 	cmd := exec.CommandContext(ctx, sm.rcloneBin,
 		"lsjson", remoteSpec,
 		"--config", sm.rcloneConf,
@@ -1366,7 +1249,7 @@ func (sm *StorageManager) Ping(ctx context.Context) error {
 	if sm.rcloneBin == "" {
 		return fmt.Errorf("rclone binary not found")
 	}
-	remoteSpec := fmt.Sprintf("%s:", sm.remoteName)
+	remoteSpec := fmt.Sprintf("%s:%s", sm.remoteName, sm.ossBucket)
 	cmd := exec.CommandContext(ctx, sm.rcloneBin,
 		"lsf", remoteSpec,
 		"--config", sm.rcloneConf,

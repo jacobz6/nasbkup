@@ -224,7 +224,7 @@ func TestDashboardStats(t *testing.T) {
 			StorageClass: "ColdArchive",
 			Endpoint:     "oss-cn-hangzhou.aliyuncs.com",
 			Bucket:       "my-bucket",
-			RemoteName:   "oss-crypt",
+			RemoteName:   "oss",
 			Region:       "cn-hangzhou",
 		},
 		LastBackupTime:      &now,

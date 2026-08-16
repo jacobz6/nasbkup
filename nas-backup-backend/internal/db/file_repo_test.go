@@ -328,3 +328,49 @@ func TestFileRepository_scanFileRecord_EmptyBackupStatus(t *testing.T) {
 		t.Errorf("expected last_backup_id=0, got %d", rec.LastBackupID)
 	}
 }
+
+// TestFileRepository_JoinByBackup_NoAmbiguousBackupID guards against the
+// "ambiguous column name: backup_id" regression: joining files with
+// backup_files must qualify every selected column (both tables have backup_id).
+func TestFileRepository_JoinByBackup_NoAmbiguousBackupID(t *testing.T) {
+	database := setupFileTestDB(t)
+	defer database.Close()
+	fileRepo := database.FileRepo
+	backupRepo := database.BackupRepo
+
+	now := time.Now().UTC().Truncate(time.Second)
+	fileID, err := fileRepo.Upsert("/data/a.txt", 100, now, "hash_a", 90001)
+	if err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	backupID, err := backupRepo.Create()
+	if err != nil {
+		t.Fatalf("Create backup: %v", err)
+	}
+	if err := backupRepo.AddBackupFile(&models.BackupFileRecord{
+		BackupID: backupID, FileID: fileID, StorageKey: "data/00/hash_a.enc",
+		CompressType: "none", OriginalSize: 100, StoredSize: 100,
+	}); err != nil {
+		t.Fatalf("AddBackupFile: %v", err)
+	}
+
+	// Previously these JOIN queries errored with "ambiguous column name: backup_id".
+	recs, total, err := fileRepo.SearchActiveFiles(SearchActiveFilesParams{BackupID: &backupID})
+	if err != nil {
+		t.Fatalf("SearchActiveFiles with BackupID: %v", err)
+	}
+	if total != 1 || len(recs) != 1 {
+		t.Fatalf("expected 1 result, got total=%d len=%d", total, len(recs))
+	}
+	if recs[0].Path != "/data/a.txt" {
+		t.Errorf("expected path=/data/a.txt, got %q", recs[0].Path)
+	}
+
+	list, err := fileRepo.ListActiveByBackup(backupID, "")
+	if err != nil {
+		t.Fatalf("ListActiveByBackup: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 listed file, got %d", len(list))
+	}
+}

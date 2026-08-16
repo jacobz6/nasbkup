@@ -78,24 +78,6 @@ chmod +x scripts/setup-rclone.sh
 
 ---
 
-### `nas-backup-backend/scripts/patch-rclone-crypt-password.sh`
-
-一键修复 rclone crypt 远端缺失密码的问题。
-
-**位置**：`nas-backup-backend/scripts/patch-rclone-crypt-password.sh`
-
-**使用场景**：当 rclone.conf 中 `[oss-crypt]` 段的 `password` 或 `password2` 字段缺失时，使用此脚本自动补全。
-
-**使用方法**：
-
-```bash
-cd nas-backup-backend
-chmod +x scripts/patch-rclone-crypt-password.sh
-./scripts/patch-rclone-crypt-password.sh
-```
-
----
-
 ### `nas-backup-backend/scripts/backup.sh`
 
 CLI 手动触发备份脚本，优先通过 API 触发，服务未运行时尝试直连二进制。

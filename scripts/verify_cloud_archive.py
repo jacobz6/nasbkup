@@ -221,7 +221,7 @@ def rclone_ls():
     """List objects in OSS via rclone directly."""
     try:
         result = subprocess.run(
-            [str(RCLONE_BIN), "lsf", "oss-crypt:", "--config", str(RCLONE_CONF), "--recursive", "--files-only"],
+            [str(RCLONE_BIN), "lsf", "oss:", "--config", str(RCLONE_CONF), "--recursive", "--files-only"],
             capture_output=True, text=True, timeout=60
         )
         if result.returncode == 0:
@@ -537,7 +537,7 @@ def run_tests():
             test_key = oss_files[0]
             tmp_enc = TEST_DIR / "temp_encrypted_test.bin"
             result = subprocess.run(
-                [str(RCLONE_BIN), "copyto", f"oss-crypt:{test_key}", str(tmp_enc),
+                [str(RCLONE_BIN), "copyto", f"oss:{test_key}", str(tmp_enc),
                  "--config", str(RCLONE_CONF)],
                 capture_output=True, text=True, timeout=60
             )

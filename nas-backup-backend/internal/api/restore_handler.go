@@ -427,6 +427,19 @@ func (r *Router) handleStorageHealth(w http.ResponseWriter, req *http.Request) {
 	}, http.StatusOK)
 }
 
+// handleStorageStatus reports OSS connection / oss.db parse / engine readiness
+// for the dashboard "OSS 存储信息" status light. Always returns 200 unless the
+// engine itself is unavailable; individual health flags carry their own error
+// messages so the UI can render a per-check status light.
+// GET /api/storage/status
+func (r *Router) handleStorageStatus(w http.ResponseWriter, req *http.Request) {
+	ctx, cancel := context.WithTimeout(req.Context(), 30*time.Second)
+	defer cancel()
+
+	status := r.engine.StorageStatusFor(ctx)
+	r.jsonResponse(w, status, http.StatusOK)
+}
+
 // handleRefreshOSSDB pulls the latest authoritative oss.db from OSS, replacing
 // the local working copy. Local restore_jobs are preserved across the swap.
 // Used by the restore page "更新" button to re-sync with OSS after another

@@ -6,8 +6,9 @@ import {
   Database, Cloud, Server,
 } from 'lucide-react';
 import {
-  dashboardApi, backupApi, gcApi, createProgressStream,
+  dashboardApi, backupApi, gcApi, storageApi, createProgressStream,
   type DashboardStats, type BackupRecord, type ProgressEvent, type ProgressPhase,
+  type StorageStatus,
 } from '@/utils/api';
 import { StatusBadge } from '@/components/ui/StatusBadge';
 import { GaugeChart } from '@/components/ui/GaugeChart';
@@ -89,6 +90,27 @@ const initialProgress: ProgressState = {
   currentFile: '',
 };
 
+// StatusLight renders a single green/amber/red status light for the "OSS 存储
+// 信息" card. warn=true shows "等待" (e.g. no oss.db snapshot yet); otherwise ok
+// shows "正常" and !ok shows "异常" with an optional hint.
+function StatusLight({ ok, warn, label, hint }: { ok: boolean; warn?: boolean; label: string; hint?: string }) {
+  const dot = warn ? 'bg-amber-500' : ok ? 'bg-emerald-500' : 'bg-rose-500';
+  const text = warn ? 'text-amber-400' : ok ? 'text-emerald-400' : 'text-rose-400';
+  const statusText = warn ? '等待' : ok ? '正常' : '异常';
+  return (
+    <div className="flex items-center justify-between">
+      <span className="text-slate-400">{label}</span>
+      <span className="flex items-center gap-2">
+        {hint && <span className="text-xs text-slate-500 truncate max-w-[160px]" title={hint}>{hint}</span>}
+        <span className={`inline-flex items-center gap-1.5 text-sm font-medium ${text}`}>
+          <span className={`w-2.5 h-2.5 rounded-full ${dot}`} />
+          {statusText}
+        </span>
+      </span>
+    </div>
+  );
+}
+
 export function Dashboard() {
   const [stats, setStats] = useState<DashboardStats>({
     total_files: 0,
@@ -117,6 +139,9 @@ export function Dashboard() {
   const [confirm, setConfirm] = useState<{ open: boolean; title: string; message: string; onConfirm: () => void }>({
     open: false, title: '', message: '', onConfirm: () => {},
   });
+  // OSS / oss.db / engine health for the "OSS 存储信息" status light.
+  const [storageStatus, setStorageStatus] = useState<StorageStatus | null>(null);
+  const [storageStatusLoading, setStorageStatusLoading] = useState(true);
   const [progress, setProgress] = useState<ProgressState>(initialProgress);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const logCounter = useRef(0);
@@ -151,15 +176,28 @@ export function Dashboard() {
     }
   }, [page]);
 
+  const fetchStorageStatus = useCallback(async () => {
+    try {
+      const res = await storageApi.getStatus();
+      if (res.success && res.data) {
+        setStorageStatus(res.data);
+      }
+    } catch (e) {
+      console.error('Failed to fetch storage status:', e);
+    } finally {
+      setStorageStatusLoading(false);
+    }
+  }, []);
+
   const fetchAll = useCallback(async () => {
     try {
-      await Promise.all([fetchStats(), fetchHistory()]);
+      await Promise.all([fetchStats(), fetchHistory(), fetchStorageStatus()]);
     } catch (e) {
       console.error('Failed to fetch all:', e);
     } finally {
       setLoading(false);
     }
-  }, [fetchStats, fetchHistory]);
+  }, [fetchStats, fetchHistory, fetchStorageStatus]);
 
   // 用 ref 持有最新的 fetchAll 引用，避免 SSE useEffect 依赖 fetchAll
   // 导致 progress.isRunning 变化时 SSE 连接断开重连。
@@ -445,6 +483,31 @@ export function Dashboard() {
             <Server size={18} className="text-brand-400" />
             <h2 className="text-base font-semibold text-white">OSS 存储信息</h2>
           </div>
+
+          {/* OSS 状态灯：连接 / 云端数据库解析 / 引擎就绪 收敛为一盏灯 */}
+          {storageStatusLoading ? (
+            <div className="flex items-center gap-2 text-sm text-slate-500 border-b border-surface-3 pb-4 mb-4">
+              <RefreshCw size={14} className="animate-spin" /> 正在检测 OSS 状态...
+            </div>
+          ) : storageStatus ? (
+            <div className="border-b border-surface-3 pb-4 mb-4">
+              <StatusLight
+                ok={storageStatus.oss_connected && storageStatus.oss_db_parsed && storageStatus.ready}
+                warn={!storageStatus.ready || (storageStatus.oss_connected && !storageStatus.oss_db_exists)}
+                label="OSS 状态"
+                hint={
+                  storageStatus.oss_error ||
+                  storageStatus.db_error ||
+                  (!storageStatus.oss_db_exists ? '首次备份后生成云端数据库' : undefined)
+                }
+              />
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 text-sm text-rose-400 border-b border-surface-3 pb-4 mb-4">
+              <AlertCircle size={14} /> 无法获取 OSS 状态
+            </div>
+          )}
+
           <div className="space-y-3 text-sm">
             <div className="flex items-center justify-between">
               <span className="text-slate-400">归档类型</span>

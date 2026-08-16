@@ -60,17 +60,27 @@ func (m *RestoreJobManager) CreateJob(req *models.RestoreRequest) (*models.Resto
 	// inside restoreFile) treat req.RestoreToOriginal=true, req.OutputDir="",
 	// and req.OutputDir="__original__" uniformly as "restore to files.Path from DB".
 	// This is required because the new frontend UI no longer exposes a custom
-	// output-dir picker and always sends output_dir="" + restore_to_original=true.
+	// output-dir picker and always sends output_dir="" + restore_to_original=true,
+	// or output_dir="__project_restores__" for 方案2.
+	projectRestoresMode := false
 	if req.RestoreToOriginal || req.OutputDir == "" {
 		req.OutputDir = "__original__"
 		req.RestoreToOriginal = true
 	} else if req.OutputDir == "__original__" {
 		req.RestoreToOriginal = true
+	} else if req.OutputDir == projectRestoresSentinel {
+		// 方案2: restore into a fixed folder under the project data directory.
+		// Resolve the sentinel to the concrete path here so the job record stores
+		// a real path and downstream MkdirAll works. This internal dir is exempt
+		// from the allowed-base-dirs validation below.
+		req.OutputDir = projectRestoresDir(m.config)
+		projectRestoresMode = true
 	}
 
 	// --- validate output directory ---
-	// Skip output dir validation when restoring to original paths.
-	if !req.RestoreToOriginal {
+	// Skip output dir validation when restoring to original paths or using the
+	// fixed project-restores folder (both are internal/self-managed locations).
+	if !req.RestoreToOriginal && !projectRestoresMode {
 		allowedDirs := m.allowedRestoreDirs()
 		if err := ValidateOutputDir(req.OutputDir, allowedDirs); err != nil {
 			return nil, err

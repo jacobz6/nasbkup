@@ -35,6 +35,28 @@ const maxThawWait = 6 * time.Hour
 // once the thaw completes.
 const thawPollInterval = 30 * time.Second
 
+// projectRestoresSentinel is the value the frontend sends in output_dir to
+// request "方案2": restore each file into a fixed folder under the project
+// data directory (<data_dir>/restores) preserving the full directory depth of
+// the original path. It is resolved to a concrete path at normalization time.
+const projectRestoresSentinel = "__project_restores__"
+
+// projectRestoresDir returns the fixed project-level restore directory under the
+// backend's data directory (<data_dir>/restores). Used for "方案2": all restored
+// files are placed here, preserving the full directory depth of each original
+// path. Shares the same location as the cross-platform fallback so the user
+// always knows where to look regardless of how a restore was targeted.
+func projectRestoresDir(cfg *config.AppConfig) string {
+	dataDir := filepath.Join(".", "data")
+	if cfg != nil && cfg.Database.Path != "" {
+		dataDir = filepath.Dir(cfg.Database.Path)
+	}
+	if absDir, err := filepath.Abs(dataDir); err == nil {
+		dataDir = absDir
+	}
+	return filepath.Join(dataDir, "restores")
+}
+
 // Restorer handles file restoration from backup storage.
 type Restorer struct {
 	db          *db.Database
@@ -96,14 +118,19 @@ func (r *Restorer) RestoreWithOptions(ctx context.Context, req *models.RestoreRe
 	//   req.RestoreToOriginal == true        → restore each file to files.Path (from DB)
 	//   req.OutputDir      == "__original__" → same meaning (legacy sentinel)
 	//   req.OutputDir      == "" + RestoreToOriginal not set → treat as restore-to-original
-	//                        because the new UI never lets users pick a custom dir.
-	// Downstream code (MkdirAll, restoreFile target-path selection) still keys
-	// off OutputDir == "__original__", so canonicalize here once.
+	//                        because the new UI only offers two restore modes.
+	//   req.OutputDir      == "__project_restores__" → 方案2: restore into a fixed
+	//                        folder under the project data directory, preserving the
+	//                        full directory depth of each original path.
+	// Downstream code (MkdirAll, restoreFile target-path selection) keys off
+	// OutputDir == "__original__" for the original-path mode, so canonicalize here once.
 	if req.RestoreToOriginal || req.OutputDir == "" {
 		req.OutputDir = "__original__"
 		req.RestoreToOriginal = true
 	} else if req.OutputDir == "__original__" {
 		req.RestoreToOriginal = true
+	} else if req.OutputDir == projectRestoresSentinel {
+		req.OutputDir = projectRestoresDir(r.config)
 	}
 
 	// 1. Query file records matching the request.
@@ -154,26 +181,7 @@ func (r *Restorer) RestoreWithOptions(ctx context.Context, req *models.RestoreRe
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// 2. Compute the common base directory to strip from output paths
-	// so that directory structure is preserved under outputDir.
-	// For restore-to-original, stripPrefix is "/" so that the full path
-	// (minus leading slash) is used relative to root.
-	stripPrefix := ""
-	if restoreToOriginal {
-		// Use root "/" as the base; the file's full path will be used as-is.
-		stripPrefix = ""
-	} else {
-		switch len(files) {
-		case 1:
-			stripPrefix = filepath.Dir(filepath.Dir(files[0].Path))
-		default:
-			if len(files) > 1 {
-				stripPrefix = longestCommonDirPrefix(files)
-			}
-		}
-	}
-
-	// 3. Process each file.
+	// 2. Process each file.
 	result := &models.RestoreResult{
 		TotalFiles: len(files),
 	}
@@ -230,7 +238,7 @@ func (r *Restorer) RestoreWithOptions(ctx context.Context, req *models.RestoreRe
 					"path", fileRec.Path, "file_id", fileRec.ID)
 				restoreErr = fmt.Errorf("no backup file record for file_id %d", fileRec.ID)
 			} else {
-				restoreErr = r.restoreFile(ctx, fileRec, bfRec, req.OutputDir, stripPrefix, req.Expedited, tmpDir, conflictStrategy, req.FallbackBaseDir)
+				restoreErr = r.restoreFile(ctx, fileRec, bfRec, req.OutputDir, req.Expedited, tmpDir, conflictStrategy, req.FallbackBaseDir)
 			}
 
 			if onProgress != nil {
@@ -382,7 +390,6 @@ func (r *Restorer) restoreFile(
 	fileRec *models.FileRecord,
 	bfRec *models.BackupFileRecord,
 	outputDir string,
-	stripPrefix string,
 	expedited bool,
 	tmpDir string,
 	conflictStrategy string,
@@ -484,7 +491,8 @@ func (r *Restorer) restoreFile(
 				case <-time.After(thawPollInterval):
 				}
 
-				restored, checkErr := r.storage.CheckRestored(bfRec.StorageKey)
+				var checkErr error
+				restored, checkErr = r.storage.CheckRestored(bfRec.StorageKey)
 				if checkErr != nil {
 					slog.Warn("check restore status failed during retry",
 						"storage_key", bfRec.StorageKey, "error", checkErr)
@@ -546,13 +554,12 @@ func (r *Restorer) restoreFile(
 			outputPath = fileRec.Path
 		}
 	} else {
-		relPath := fileRec.Path
-		if stripPrefix != "" {
-			relPath = strings.TrimPrefix(fileRec.Path, stripPrefix)
-			relPath = strings.TrimPrefix(relPath, string(filepath.Separator))
-		} else {
-			relPath = filepath.Base(fileRec.Path)
-		}
+		// 方案2 (project restores) or legacy custom dir: preserve the full
+		// directory depth of the original path under outputDir, so a file
+		// backed up at /home/user/docs/a.txt lands at
+		// <outputDir>/home/user/docs/a.txt. Leading path separators are
+		// stripped so the original absolute path becomes a relative path.
+		relPath := strings.TrimLeft(fileRec.Path, `/\`)
 		outputPath = filepath.Join(outputDir, relPath)
 	}
 
@@ -719,24 +726,6 @@ func detectCrossPlatformFallback(samplePath string, cfg *config.AppConfig) (stri
 	// empty directory we just created (best-effort; non-fatal on failure).
 	os.Remove(parentDir)
 	return "", false
-}
-
-func longestCommonDirPrefix(files []*models.FileRecord) string {
-	if len(files) == 0 {
-		return ""
-	}
-	prefix := filepath.Dir(files[0].Path)
-	for _, f := range files[1:] {
-		dir := filepath.Dir(f.Path)
-		for !strings.HasPrefix(dir, prefix+string(filepath.Separator)) && prefix != dir {
-			parent := filepath.Dir(prefix)
-			if parent == prefix {
-				return ""
-			}
-			prefix = parent
-		}
-	}
-	return prefix
 }
 
 // ValidateOutputDir checks that outputDir is under one of the allowed base

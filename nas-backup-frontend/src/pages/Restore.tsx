@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import {
   RotateCcw, Play, Square, Search, FolderOpen, Download, Inbox,
   CheckCircle, XCircle, Activity, Terminal, AlertCircle, Info,
-  HardDrive, Clock, Zap, FileText, RefreshCw,
+  HardDrive, Clock, FileText, RefreshCw,
 } from 'lucide-react';
 import {
   restoreApi,
@@ -143,17 +143,6 @@ const jobColumns: Column<RestoreJobRecord>[] = [
     ),
   },
   {
-    key: 'expedited',
-    header: '加急',
-    className: 'w-16',
-    render: (r) =>
-      r.expedited ? (
-        <Zap size={14} className="text-amber-400" />
-      ) : (
-        <span className="text-slate-600">-</span>
-      ),
-  },
-  {
     key: 'elapsed_ms',
     header: '耗时',
     className: 'w-20',
@@ -192,14 +181,14 @@ export function Restore() {
   const [selectedSize, setSelectedSize] = useState(0);
 
   // ── Restore config ───────────────────────────────────────────────
-  // The restore destination defaults to each file's original path (as
-  // recorded in the backup DB), but the user may override it with a custom
-  // target directory. Backup version selection is not supported — the system
-  // always restores from the latest backup (disaster recovery, not versioning).
-  const [restoreMode, setRestoreMode] = useState<'original' | 'custom'>('original');
-  const [outputDir, setOutputDir] = useState('');
+  // 恢复目标仅提供两个方案：
+  //   方案1 (original): 恢复到备份时记录的原始路径（files.path）。若还原环境与
+  //                     备份环境不是同一系统（无法解析如 D:\ 等盘符），后端会自动
+  //                     滑退到方案2。
+  //   方案2 (project):  在项目目录下（data/restores/）创建一个还原文件夹，所有文件
+  //                     还原到该文件夹下，并保留原始目录深度关系。
+  const [restoreMode, setRestoreMode] = useState<'original' | 'project'>('original');
   const [conflictStrategy, setConflictStrategy] = useState<'skip' | 'overwrite' | 'rename'>('skip');
-  const [expedited, setExpedited] = useState(false);
   const [restoring, setRestoring] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
 
@@ -344,17 +333,11 @@ export function Restore() {
     }
 
     const toOriginal = restoreMode === 'original';
-    if (!toOriginal && !outputDir.trim()) {
-      addToast({ type: 'error', message: '请填写自定义目标目录' });
-      return;
-    }
-
     const data = {
       paths: selectedPaths,
-      output_dir: toOriginal ? '' : outputDir.trim(),
+      output_dir: toOriginal ? '' : '__project_restores__',
       restore_to_original: toOriginal,
       conflict_strategy: conflictStrategy,
-      expedited,
     };
 
     setRestoring(true);
@@ -380,18 +363,12 @@ export function Restore() {
   // ── Full restore (all files) ─────────────────────────────────────
   const handleFullRestore = async () => {
     const toOriginal = restoreMode === 'original';
-    if (!toOriginal && !outputDir.trim()) {
-      addToast({ type: 'error', message: '请填写自定义目标目录' });
-      return;
-    }
-
     const data = {
       paths: [],
       pattern: '*',
-      output_dir: toOriginal ? '' : outputDir.trim(),
+      output_dir: toOriginal ? '' : '__project_restores__',
       restore_to_original: toOriginal,
       conflict_strategy: conflictStrategy,
-      expedited,
     };
 
     setRestoring(true);
@@ -545,7 +522,7 @@ export function Restore() {
         <div className="mt-4 flex items-start gap-2 text-xs text-slate-500 bg-surface-2/50 border border-surface-3 rounded-lg p-3">
           <Info size={14} className="shrink-0 mt-0.5 text-slate-400" />
           <div>
-            选择要恢复的文件，配置恢复参数后点击"开始恢复"。归档存储（ColdArchive）的文件需要先解冻才能下载，开启"加急解冻"可加速此过程。
+            选择要恢复的文件，配置恢复参数后点击"开始恢复"。归档存储（ColdArchive）的文件需要先解冻才能下载。
             也可使用"一键全盘恢复"恢复所有备份文件。
           </div>
         </div>
@@ -854,20 +831,16 @@ export function Restore() {
                 <label className="block text-sm text-slate-400 mb-1.5">恢复目标</label>
                 <select
                   value={restoreMode}
-                  onChange={(e) => setRestoreMode(e.target.value as 'original' | 'custom')}
+                  onChange={(e) => setRestoreMode(e.target.value as 'original' | 'project')}
                   className="input-field text-sm"
                 >
-                  <option value="original">原始路径（备份时记录的 files.path）</option>
-                  <option value="custom">自定义目录</option>
+                  <option value="original">方案1：原始路径（备份时记录的 files.path）</option>
+                  <option value="project">方案2：项目还原文件夹（保留目录深度）</option>
                 </select>
-                {restoreMode === 'custom' && (
-                  <input
-                    type="text"
-                    value={outputDir}
-                    onChange={(e) => setOutputDir(e.target.value)}
-                    placeholder="例如：/tmp/restored"
-                    className="input-field text-sm mt-2"
-                  />
+                {restoreMode === 'project' && (
+                  <p className="text-xs text-slate-500 mt-2">
+                    文件将恢复到项目目录下的还原文件夹（data/restores/），并保留原始目录深度关系。
+                  </p>
                 )}
               </div>
 
@@ -884,28 +857,6 @@ export function Restore() {
                   <option value="rename">重命名冲突文件 (rename)</option>
                 </select>
               </div>
-
-              {/* Expedited thawing */}
-              <div className="flex items-center justify-between border-t border-surface-3 pt-4">
-                <div>
-                  <label className="text-sm text-slate-300">加急解冻</label>
-                  <p className="text-xs text-slate-500 mt-0.5">加速归档文件的解冻过程（仅 ColdArchive 生效）</p>
-                </div>
-                <button
-                  onClick={() => setExpedited(!expedited)}
-                  className={cn(
-                    'relative w-10 h-5 rounded-full transition-colors',
-                    expedited ? 'bg-brand-500' : 'bg-slate-600'
-                  )}
-                >
-                  <span
-                    className={cn(
-                      'absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform',
-                      expedited ? 'left-5' : 'left-0.5'
-                    )}
-                  />
-                </button>
-              </div>
             </div>
           </div>
 
@@ -918,9 +869,7 @@ export function Restore() {
                 setConfirm({
                   open: true,
                   title: '确认恢复',
-                  message: `即将恢复 ${selectedIds.size} 个文件（共 ${formatFileSize(selectedSize)}）。${
-                    expedited ? '已开启加急解冻。' : ''
-                  }冲突策略：${conflictStrategy}。是否继续？`,
+                  message: `即将恢复 ${selectedIds.size} 个文件（共 ${formatFileSize(selectedSize)}）。冲突策略：${conflictStrategy}。是否继续？`,
                   onConfirm: handleStartRestore,
                 })
               }

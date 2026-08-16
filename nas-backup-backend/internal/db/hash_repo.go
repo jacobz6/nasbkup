@@ -347,20 +347,23 @@ func (r *HashRepository) CountAll() (int64, error) {
 }
 
 // HasRefCountMismatches returns true if any hash_index.ref_count disagrees with
-// the actual number of active files referencing that hash. This is a lightweight
-// single-query check used by the dashboard's "needs reconcile" indicator.
+// the number of backup_files rows referencing that storage_key. ref_count is
+// maintained per backup session (one increment per file-reference in
+// backup_files), so comparing against DISTINCT active files in the files table
+// would spuriously flag every file that is backed up across multiple sessions.
+// This is a lightweight single-query check used by the dashboard's
+// "needs reconcile" indicator.
 func (r *HashRepository) HasRefCountMismatches() (bool, error) {
 	var exists int
 	err := r.db.QueryRow(`
 		SELECT EXISTS(
 			SELECT 1 FROM hash_index hi
 			LEFT JOIN (
-				SELECT hash, COUNT(*) AS cnt
-				FROM files
-				WHERE status = 'active' AND hash <> ''
-				GROUP BY hash
-			) fc ON hi.hash = fc.hash
-			WHERE COALESCE(fc.cnt, 0) <> hi.ref_count
+				SELECT storage_key, COUNT(*) AS cnt
+				FROM backup_files
+				GROUP BY storage_key
+			) bf ON hi.storage_key = bf.storage_key
+			WHERE COALESCE(bf.cnt, 0) <> hi.ref_count
 		)
 	`).Scan(&exists)
 	if err != nil {

@@ -290,16 +290,22 @@ func (e *Engine) reconcileGatherAndCompare(ctx context.Context, report *Reconcil
 	return nil
 }
 
-// reconcileRefCount compares hash_index.ref_count against the actual number
-// of active files in the files table grouped by hash. Mismatches are recorded
-// in the report and fixed in the apply phase (when not dry-run).
+// reconcileRefCount compares hash_index.ref_count against the number of
+// backup_files rows per storage_key (the metric ref_count is actually
+// maintained to track). Mismatches are recorded in the report and fixed in the
+// apply phase (when not dry-run).
 func (e *Engine) reconcileRefCount(ctx context.Context, report *ReconcileReport) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	actualCounts, err := e.db.FileRepo.CountActiveByHash()
+	// ref_count is incremented once per file-reference written to backup_files
+	// (one per backup session), so the authoritative target is the count of
+	// backup_files rows grouped by storage_key. Counting DISTINCT active files
+	// would undercount and shrink ref_count to zero for content still referenced
+	// by backup history, letting GC delete objects that restore still needs.
+	bfCounts, err := e.db.BackupRepo.ListAllBackupFileStorageKeys()
 	if err != nil {
-		err = fmt.Errorf("count active files by hash: %w", err)
+		err = fmt.Errorf("count backup_files by storage_key: %w", err)
 		report.Errors = append(report.Errors, err.Error())
 		return err
 	}
@@ -313,15 +319,14 @@ func (e *Engine) reconcileRefCount(ctx context.Context, report *ReconcileReport)
 
 	for _, r := range hashRecords {
 		// Skip reconciler-synthesized hash entries: their hash is synthetic
-		// (prefixed with "reconciled:") and does not correspond to any real
-		// files.hash, so CountActiveByHash will always report 0. These rows
-		// exist solely to keep hash_index ↔ backup_files consistent and to
-		// prevent GC from deleting the OSS object; ref_count is intentionally
-		// kept at 1.
+		// (prefixed with "reconciled:") and they are kept at ref_count=1 on
+		// purpose to prevent GC from deleting the OSS object referenced by
+		// backup_files. Their storage_key may be referenced but their ref_count
+		// is intentionally controlled, so never recompute it.
 		if strings.HasPrefix(r.Hash, "reconciled:") {
 			continue
 		}
-		actual := actualCounts[r.Hash]
+		actual := bfCounts[r.StorageKey]
 		if r.RefCount != actual {
 			report.RefCountMismatches = append(report.RefCountMismatches, RefCountMismatch{
 				Hash:         r.Hash,

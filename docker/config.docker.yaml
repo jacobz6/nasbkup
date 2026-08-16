@@ -127,7 +127,7 @@ oss:
 rclone:
   binary_path: "/usr/bin/rclone"
   config_path: "/app/data/rclone.conf"
-  remote_name: "oss-crypt"
+  remote_name: "oss"
 
 # ---------------------------------------------------------------------------
 # Logging

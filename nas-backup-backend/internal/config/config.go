@@ -214,7 +214,7 @@ func DefaultConfig() *AppConfig {
 		Rclone: RcloneConfig{
 			BinaryPath: "rclone",
 			ConfigPath: "./data/rclone.conf",
-			RemoteName: "oss-crypt",
+			RemoteName: "oss",
 		},
 		Logging: LoggingConfig{
 			Level:    "info",

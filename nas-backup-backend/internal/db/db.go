@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -27,6 +28,14 @@ type Database struct {
 	LogRepo         *LogRepository
 	ConfigRepo      *ConfigRepository
 	RestoreJobRepo  *RestoreJobRepository
+
+	// dbMu serializes Reopen (and Close) against each other. Reopen swaps the
+	// underlying *sql.DB (close old file, open new one); without this lock two
+	// concurrent refreshes can each call Close() on the connection the other
+	// just opened, leaving the shared handle in a closed state and surfacing as
+	// "sql: database is closed" in unrelated in-flight operations (e.g. a
+	// concurrently-starting backup's scan).
+	dbMu sync.Mutex
 }
 
 // Conn exposes the underlying *sql.DB handle to callers that need it (for
@@ -35,6 +44,22 @@ type Database struct {
 // repository layer). Callers MUST NOT close the returned handle.
 func (d *Database) Conn() *sql.DB {
 	return d.db
+}
+
+// EnsureSchema runs any pending migrations against the current connection.
+// It is safe to call multiple times: already-applied migrations are skipped.
+// This is used before operations that depend on a specific table existing
+// (e.g. exporting restore_jobs before an OSS DB swap), so a stale or
+// older-version local DB is brought up to date instead of failing with a
+// "no such table" error.
+func (d *Database) EnsureSchema() error {
+	if d.db == nil {
+		return fmt.Errorf("database connection is not open")
+	}
+	if err := runMigrations(d.db); err != nil {
+		return fmt.Errorf("ensure schema: %w", err)
+	}
+	return nil
 }
 
 // Open creates or opens the SQLite database at the given path and runs

@@ -26,6 +26,13 @@ func NewFileRepository(db *sql.DB) *FileRepository {
 // fileColumns is the full column list for the files table, used by all SELECT queries.
 const fileColumns = "id, path, size, mod_time, hash, status, backup_id, inode, created_at, updated_at, last_backup_status, last_backup_error, last_backup_at, last_backup_id"
 
+// fileJoinColumns is the same column list but fully qualified with the files
+// table alias `f`, for queries that JOIN files with backup_files. The naive
+// "f." + fileColumns concatenation only prefixes the FIRST column and leaves
+// columns shared with backup_files (e.g. backup_id) unqualified, which yields
+// "ambiguous column name: backup_id" at runtime on a JOIN.
+const fileJoinColumns = "f.id, f.path, f.size, f.mod_time, f.hash, f.status, f.backup_id, f.inode, f.created_at, f.updated_at, f.last_backup_status, f.last_backup_error, f.last_backup_at, f.last_backup_id"
+
 // scanFileRecord scans a single file row from a scanner into a FileRecord.
 // The inode column is read from the database but discarded since the model
 // does not expose it as a field.
@@ -414,7 +421,7 @@ func (r *FileRepository) ListActiveByBackup(backupID int64, dirPath string) ([]*
 	)
 	if dirPath != "" {
 		query = `
-			SELECT f.` + fileColumns + `
+			SELECT ` + fileJoinColumns + `
 			FROM files f
 			INNER JOIN backup_files bf ON bf.file_id = f.id
 			WHERE bf.backup_id = ? AND f.status = 'active' AND f.path LIKE ?
@@ -423,7 +430,7 @@ func (r *FileRepository) ListActiveByBackup(backupID int64, dirPath string) ([]*
 		args = append(args, backupID, dirPath+"/%")
 	} else {
 		query = `
-			SELECT f.` + fileColumns + `
+			SELECT ` + fileJoinColumns + `
 			FROM files f
 			INNER JOIN backup_files bf ON bf.file_id = f.id
 			WHERE bf.backup_id = ? AND f.status = 'active'
@@ -472,7 +479,7 @@ func (r *FileRepository) SearchActiveFiles(params SearchActiveFilesParams) ([]*m
 	)
 
 	if params.BackupID != nil {
-		selectClause = `SELECT f.` + fileColumns + ` FROM files f INNER JOIN backup_files bf ON bf.file_id = f.id`
+		selectClause = `SELECT ` + fileJoinColumns + ` FROM files f INNER JOIN backup_files bf ON bf.file_id = f.id`
 		countClause = `SELECT COUNT(*) FROM files f INNER JOIN backup_files bf ON bf.file_id = f.id`
 		whereClause += " AND bf.backup_id = ? AND f.status = 'active'"
 		args = append(args, *params.BackupID)
@@ -563,35 +570,4 @@ func (r *FileRepository) GetByID(id int64) (*models.FileRecord, error) {
 		return nil, fmt.Errorf("get file by id %d: %w", id, err)
 	}
 	return rec, nil
-}
-
-// CountActiveByHash returns a map of hash → count of active files referencing
-// that hash. Used by the reconciler to rebuild ref_count for hash_index.
-func (r *FileRepository) CountActiveByHash() (map[string]int, error) {
-	rows, err := r.db.Query(`
-		SELECT hash, COUNT(*) AS cnt
-		FROM files
-		WHERE status = 'active' AND hash <> ''
-		GROUP BY hash
-	`)
-	if err != nil {
-		return nil, fmt.Errorf("count active files by hash: %w", err)
-	}
-	defer rows.Close()
-
-	result := make(map[string]int)
-	for rows.Next() {
-		var (
-			hash string
-			cnt  int
-		)
-		if err := rows.Scan(&hash, &cnt); err != nil {
-			return nil, fmt.Errorf("scan count by hash row: %w", err)
-		}
-		result[hash] = cnt
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate count by hash: %w", err)
-	}
-	return result, nil
 }
