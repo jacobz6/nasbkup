@@ -453,6 +453,31 @@ func (e *Engine) NeedsReconcile() bool {
 	return false
 }
 
+// autoReconcileTimeout bounds a single automatic reconcile pass (OSS listing +
+// batch existence checks over a large bucket).
+const autoReconcileTimeout = 30 * time.Minute
+
+// ReconcileIfNeeded runs an automatic reconciliation, but only when the cheap
+// NeedsReconcile check detects drift; in the common (healthy) case it is a
+// near-zero-cost no-op (NeedsReconcile only queries the local DB and does not
+// list OSS objects). When drift is found it runs a full reconcile, which
+// applies fixes and pushes the repaired DB back to OSS as the authoritative
+// source. It is intended to be called after a backup completes.
+func (e *Engine) ReconcileIfNeeded() {
+	if !e.NeedsReconcile() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), autoReconcileTimeout)
+	defer cancel()
+	report, err := e.Reconcile(ctx, false)
+	if err != nil {
+		e.logger.Warn("automatic reconcile failed", "error", err)
+		return
+	}
+	e.logger.Info("automatic reconcile applied fixes",
+		"applied", len(report.AppliedFixes), "errors", len(report.Errors))
+}
+
 // RunGarbageCollection cleans up orphan data in OSS and the database.
 // It refuses to run while a backup is in progress to avoid deleting objects
 // that are in the process of being uploaded but not yet recorded in
@@ -564,12 +589,18 @@ func (e *Engine) executeBackup(ctx context.Context, backupID int64) (retErr erro
 	var failedFiles int
 	var fileErrors []string
 
-	// Cleanup cancellation tracking on exit (runs last due to LIFO).
+	// Cleanup cancellation tracking on exit (runs last due to LIFO). Triggered
+	// after PushOSSDB so the authoritative OSS db is already current, and after
+	// runningBackupID is cleared so reconcile's own backup lock does not block.
 	defer func() {
 		e.mu.Lock()
 		delete(e.cancelFuncs, backupID)
 		e.runningBackupID = 0
 		e.mu.Unlock()
+
+		// 自愈：仅在检测到漂移时才做全量对账（开销极低），修复后回写权威源 OSS。
+		// 异步执行，不阻塞备份调用路径的返回。
+		go e.ReconcileIfNeeded()
 	}()
 
 	// Sync the DB to OSS (runs after UpdateStatus, before cleanup). Must

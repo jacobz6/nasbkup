@@ -119,7 +119,6 @@ export function Dashboard() {
     oss_quota_bytes: 0,
     backup_count: 0,
     unique_hash_count: 0,
-    needs_reconcile: false,
     oss_info: {
       storage_class: '',
       endpoint: '',
@@ -590,20 +589,6 @@ export function Dashboard() {
             <div className="flex items-center justify-between">
               <span className="text-slate-500">唯一哈希记录</span>
               <span className="text-slate-300 font-mono">{stats.unique_hash_count}</span>
-            </div>
-            <div className="flex items-center justify-between">
-              <span className="text-slate-500">对账状态</span>
-              {stats.needs_reconcile ? (
-                <span className="flex items-center gap-1.5 text-rose-400">
-                  <span className="w-2 h-2 rounded-full bg-rose-500" />
-                  需要修复
-                </span>
-              ) : (
-                <span className="flex items-center gap-1.5 text-emerald-400">
-                  <span className="w-2 h-2 rounded-full bg-emerald-500" />
-                  正常
-                </span>
-              )}
             </div>
           </div>
         </div>

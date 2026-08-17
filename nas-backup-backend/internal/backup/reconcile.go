@@ -31,6 +31,10 @@ import (
 	"github.com/nas-backup/internal/models"
 )
 
+// reconcilePushTimeout bounds a single PushOSSDB upload of the repaired DB back
+// to the authoritative OSS source after a reconcile fix.
+const reconcilePushTimeout = 30 * time.Minute
+
 // RefCountMismatch captures a single ref_count drift between hash_index and
 // the actual number of active files in the files table referencing that hash.
 type RefCountMismatch struct {
@@ -168,6 +172,24 @@ func (e *Engine) Reconcile(ctx context.Context, dryRun bool) (*ReconcileReport, 
 	} else {
 		// In dry-run, populate SkippedFixes so the operator can preview.
 		e.reconcileCollectSkippedFixes(report)
+	}
+
+	// ── Step 5: 回流权威源 ─────────────────────────────────────────────
+	// 本地 DB 只是 OSS oss.db 的工作副本，OSS 才是唯一权威源。任何修复都必须
+	// PushOSSDB 回写到 OSS，否则下次 Pull 到的权威 DB 会覆盖掉本地修复。
+	if !dryRun && len(report.AppliedFixes) > 0 {
+		if svc := e.getDBBackupSvc(); svc != nil {
+			pushCtx, pushCancel := context.WithTimeout(context.Background(), reconcilePushTimeout)
+			if err := svc.PushOSSDB(pushCtx); err != nil {
+				err = fmt.Errorf("push reconciled oss.db to OSS: %w", err)
+				report.Errors = append(report.Errors, err.Error())
+				e.logger.Error("reconcile: push repaired oss.db to OSS failed", "error", err)
+			} else {
+				e.logger.Info("reconcile: pushed repaired oss.db to OSS as authoritative",
+					"applied_fixes", len(report.AppliedFixes))
+			}
+			pushCancel()
+		}
 	}
 
 	e.logger.Info("reconciliation completed",

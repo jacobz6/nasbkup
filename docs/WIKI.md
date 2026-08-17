@@ -55,7 +55,7 @@
 - **冷归档友好**：支持 OSS ColdArchive 存储类，含解冻（thaw）流程
 - **定时调度**：基于 cron 表达式的自动备份调度，自动判断全量/增量
 - **实时进度反馈**：基于 SSE 的实时备份进度推送，含阶段、百分比、当前文件、实时日志
-- **数据一致性保障**：三层数据一致性对账（OSS ↔ hash_index ↔ backup_files），支持 DryRun 审计和自动修复
+- **数据一致性保障**：三层数据一致性对账（OSS ↔ hash_index ↔ backup_files），**备份完成后后台自动触发**，修复后回写 OSS 权威源；前端对用户透明
 - **崩溃恢复**：启动时自动清理残留状态，全量备份重建映射，锁内双重检查防止竞态
 
 ### 技术栈
@@ -141,8 +141,8 @@ nasbkup_system/
 │   │   │   ├── Content.tsx      # 内容选择
 │   │   │   ├── Strategy.tsx     # 策略设置
 │   │   │   ├── Logs.tsx         # 日志查看
-│   │   │   ├── Reconcile.tsx    # 系统对账
 │   │   │   └── Restore.tsx      # 数据恢复页面
+│   │   │   # Reconcile.tsx 已移除，对账改由后端自动触发（见 3.6）
 │   │   ├── store/               # Zustand 状态
 │   │   ├── utils/               # 工具函数（api.ts 含 SSE 客户端）
 │   │   ├── lib/                 # 通用库
@@ -170,7 +170,7 @@ nasbkup_system/
 ```
 ┌─────────────────────────────────────────────────────┐
 │               Frontend (React SPA)                  │
-│  Dashboard / Content / Strategy / Logs / Reconcile  │
+│  Dashboard / Content / Strategy / Logs / Restore  │
 │         (含 SSE EventSource 进度订阅)                │
 └────────────────────────┬────────────────────────────┘
                          │ HTTP API (JSON) + SSE 实时流
@@ -688,7 +688,8 @@ type Engine struct {
 | `Cancel` | `(backupID) error` | 取消运行中的备份 |
 | `RunningBackupID` | `() (int64, bool)` | 获取当前运行中的备份 ID |
 | `NeedsReconcile` | `() bool` | 轻量级一致性检查（不列 OSS，检查 ref_count 漂移和状态错误） |
-| `Reconcile` | `(ctx, dryRun) (*ReconcileReport, error)` | 执行完整数据一致性对账 |
+| `Reconcile` | `(ctx, dryRun) (*ReconcileReport, error)` | 执行完整数据一致性对账；非 dry-run 应用修复后回调 PushOSSDB 回流权威源 |
+| `ReconcileIfNeeded` | `()` | 自动对账：NeedsReconcile 命中才跑 Reconcile(false)，备份完成后异步触发 |
 | `RunGarbageCollection` | `(ctx) error` | 执行垃圾回收 |
 
 #### 并发安全与崩溃恢复
@@ -808,7 +809,8 @@ data: {"type":"progress","phase":"uploading","current":150,"total":200,"percent"
 
 | 方法 | 签名 | 说明 |
 |------|------|------|
-| `Reconcile` | `(ctx, dryRun) (*ReconcileReport, error)` | 执行完整对账 |
+| `Reconcile` | `(ctx, dryRun) (*ReconcileReport, error)` | 执行完整对账；非 dry-run 应用修复后会将修复后的 DB 回写为 OSS 权威源（Step5 回流） |
+| `ReconcileIfNeeded` | `()` | 自动对账入口：`NeedsReconcile()` 未命中（健康时）则零开销返回；命中才跑 `Reconcile(false)` |
 
 **检查项（6 类不一致）**：
 
@@ -828,10 +830,16 @@ data: {"type":"progress","phase":"uploading","current":150,"total":200,"percent"
 - DryRun=true 只检查不修改数据库/OSS
 - 修复操作在事务中执行
 - OSS 上的孤儿对象不会自动删除（避免误删），仅记录在报告中
+- **本地 DB 只是副本，OSS `oss.db` 才是唯一权威源**：非 dry-run 应用修复后，必须 `PushOSSDB` 把修复后的 DB 回写为 OSS 权威源，否则下次 Pull 到的权威 DB 会覆盖掉本地修复（Step5 回流）。仅当 `AppliedFixes` 非空时才回流，避免无意义的上传。
 
 **并发控制**：`Reconcile` 方法内部会 `engine.mu.Lock()` 获取备份锁，确保与备份任务互斥。
 
-**轻量级检查**：`NeedsReconcile()` 不列 OSS，仅检查 DB 层 ref_count 漂移和备份状态错误，用于仪表板快速提示。
+**轻量级检查**：`NeedsReconcile()` 不列 OSS，仅检查 DB 层 ref_count 漂移和备份状态错误。
+
+**自动触发（用户无感知）**：对账已从用户操作收敛为后台自愈。每次备份完成后（终态写入 + PushOSSDB 之后、`runningBackupID` 清零后），异步调用 `ReconcileIfNeeded()`：
+- 健康时仅跑 `NeedsReconcile()` 轻量查询即返回，开销近乎为零
+- 检测到漂移才跑全量 `Reconcile(false)`，修复后回流权威源
+- 前端已**整体移除**对账页面/菜单/首页对账状态灯；仅后端保留 `/api/reconcile` 作为运维逃生门。
 
 ### 3.7 文件扫描器 (scanner)
 
@@ -1139,8 +1147,8 @@ BrowserRouter
     ├── /restore    → Restore (文件恢复)
     ├── /strategy   → Strategy (策略设置)
     ├── /logs       → Logs (日志)
-    └── /reconcile  → Reconcile (数据一致性对账)
 ```
+<!-- /reconcile 路由已移除（对账收敛为后端自动触发，见 3.6 Reconciler 节） -->
 
 ### 4.3 状态管理 (Zustand)
 
@@ -1207,12 +1215,11 @@ API_BASE = `/api`（开发环境代理到后端）
 | `logApi` | `list(params)` | GET /logs |
 | | `get(id)` | GET /logs/{id} |
 | `gcApi` | `trigger()` | POST /gc |
-| `reconcileApi` | `run(dryRun?)` | POST /api/reconcile?dry_run=true/false |
 | `storageApi` | `health()` | GET /api/storage/health |
 
 #### TypeScript 类型定义
 
-前端定义了与后端 models 对应的 TypeScript 接口：`DashboardStats`（含 `ossInfo`/`ossQuotaBytes`/`backupCount`/`uniqueHashCount`/`needsReconcile`），`BackupRecord`，`BackupStatus`，`BackupType`（新增 `auto`），`BackupDirectory`，`ExclusionRule`，`ScheduleConfig`，`CompressionConfig`，`UploadConfig`（含 `concurrency`），`RetentionConfig`（含 `deletedRetentionDays`），`EncryptionConfig`，`LogRecord`，`LogQueryParams`，`FSEntry`（含 `partialBackup`），`FSBrowseResult`，`ProgressEvent`，`BackupPhase`，`ReconcileReport`，`RefCountMismatch`，`StorageHealthResult`。
+前端定义了与后端 models 对应的 TypeScript 接口：`DashboardStats`（含 `ossInfo`/`ossQuotaBytes`/`backupCount`/`uniqueHashCount`），`BackupRecord`，`BackupStatus`，`BackupType`（新增 `auto`），`BackupDirectory`，`ExclusionRule`，`ScheduleConfig`，`CompressionConfig`，`UploadConfig`（含 `concurrency`），`RetentionConfig`（含 `deletedRetentionDays`），`EncryptionConfig`，`LogRecord`，`LogQueryParams`，`FSEntry`（含 `partialBackup`），`FSBrowseResult`，`ProgressEvent`，`BackupPhase`，`StorageHealthResult`。
 
 ### 4.5 页面详解
 
@@ -1224,11 +1231,12 @@ API_BASE = `/api`（开发环境代理到后端）
 1. **状态横幅**: 显示备份运行状态（运行中/空闲，含进度条和阶段名）、上次备份时间、下次备份时间
    - 运行中时：展示当前阶段（scanning→hashing→uploading→finalizing）、百分比进度条、实时日志尾行（SSE）
    - idle 时：显示 SSE 连接状态指示
-2. **对账告警横幅**: `stats.needsReconcile` 为 true 时显示黄色警告，提示用户前往对账页
+2. **对账告警横幅**: 已移除（对账收敛为后端自动触发，前端不再暴露对账状态）
+   <!-- 原：stats.needsReconcile 为 true 时显示黄色警告，提示用户前往对账页 -->
 3. **仪表盘图表** (3 列): OSS 存储使用率（含配额/已用/总节省）、去重节省、压缩节省
 4. **统计卡片** (4 列): 备份总数、唯一哈希数、活跃文件数、OSS 使用量
 5. **OSS 信息卡片**: 显示存储类型、Endpoint、Bucket、Region
-6. **操作按钮**: 一键备份（auto 类型）、全量备份、取消备份、垃圾回收、数据对账
+6. **操作按钮**: 一键备份（auto 类型）、全量备份、取消备份、垃圾回收
 7. **备份历史表格**: ID、类型（full/inc/auto）、状态（彩色徽章）、文件数、大小、上传量、去重跳过、开始/完成时间
 8. **分页组件**
 
@@ -1289,28 +1297,10 @@ API_BASE = `/api`（开发环境代理到后端）
 - 点击详情按钮展开/折叠日志详情
 - 级别颜色: DEBUG=灰, INFO=蓝, WARN=黄, ERROR=红
 
-#### Reconcile 页面 (`src/pages/Reconcile.tsx`)
+#### ~~Reconcile 页面~~（已移除）
 
-**功能**: 数据一致性对账（诊断与修复）
-
-**布局**:
-1. **操作栏**: "执行对账检查（Dry Run）"按钮、"执行修复"按钮（红色）、健康状态指示器
-2. **上次检查结果摘要**: 执行时间、耗时、DryRun 标识、发现问题总数/已修复数/错误数
-3. **问题分类卡片**（按问题类型分块）:
-   - OSS 孤儿对象（仅告警，不自动删除）
-   - 悬空哈希索引（ref=0，无OSS对象）
-   - ref_count 不匹配项
-   - 孤立 backup_files 记录
-   - 备份状态异常
-   - 每个分类显示数量和详情列表（hash/路径/原因）
-4. **实时日志面板**: 对账执行过程中的实时输出
-5. **存储健康检查**: OSS 连通性状态、延迟 ms
-
-**交互**:
-- Dry Run 按钮：只读检查，不修改数据
-- 修复按钮：执行对账并自动修复可修复项，需二次确认
-- 执行中按钮置灰，显示加载状态
-- 对账完成后各问题卡片展开显示详情，已修复项标记为绿色
+**状态**: `src/pages/Reconcile.tsx` 已删除（2026-08-17）。
+对账已从用户可见功能收敛为**后端自动触发**的自愈能力：每次备份完成后异步执行 `ReconcileIfNeeded()`，前端不再提供对账页面/菜单/首页对账状态灯，`reconcileApi`/`ReconcileReport` 等前端类型一并移除。详见 3.6 Reconciler 节。后端 `/api/reconcile` 保留作为运维逃生门。
 
 #### Restore 页面 (`src/pages/Restore.tsx`)
 
@@ -1361,7 +1351,8 @@ API_BASE = `/api`（开发环境代理到后端）
 - 右上角 Toast 通知区域（4 秒自动消失）
 
 **Sidebar** (`src/components/layout/Sidebar.tsx`)
-- 5 个导航项: 全览(/)、内容选择(/content)、策略设置(/strategy)、日志(/logs)、数据对账(/reconcile)
+- 5 个导航项: 全览(/)、内容选择(/content)、恢复(/restore)、策略设置(/strategy)、日志(/logs)
+  <!-- 原 6 项含 系统对账(/reconcile)，已移除 -->
 - 底部折叠/展开按钮
 - 活跃路由高亮
 
