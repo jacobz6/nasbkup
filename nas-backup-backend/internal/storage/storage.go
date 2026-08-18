@@ -6,6 +6,7 @@ package storage
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -359,15 +360,133 @@ func readCredentialsFromRcloneConf(rcloneConfPath string) (string, string, bool)
 	return ak, sk, true
 }
 
+// Encrypted object layout constants shared with crypto.EncryptFile:
+// salt (32 bytes) || chunk1: nonce (12 bytes) || ciphertext+tag || ...
+// Used by readFirstChunkNonce to extract the first-chunk nonce (the IV
+// recorded in backup_files.encrypted_iv) from an existing OSS object without
+// downloading the whole object.
+const (
+	encryptedSaltSize  = 32
+	encryptedNonceSize = 12
+)
+
 // Upload uploads a local file to OSS via rclone. It retries up to 3 times with
 // exponential backoff on failure. The context allows cancellation of in-flight
 // uploads (e.g. when the backup is cancelled).
+//
+// Upload performs a no-clobber existence pre-check: if the object already
+// exists in OSS the upload is skipped and nil is returned. This guards
+// content-addressed backup objects in a multi-environment shared-bucket setup
+// (overwriting would desync other environments' recorded IVs). Use
+// UploadOverwrite for authoritative objects that must always be replaced
+// (e.g. oss.db.enc), or UploadOrReuseNonce when the caller needs to know
+// whether the object pre-existed and which IV it actually carries.
 //
 // On failure the captured stderr includes rclone's verbose log (run with -v)
 // so that the underlying OSS error code (e.g. InvalidArgument /
 // EntityTooLarge) is preserved in the returned error message instead of just
 // "BadRequest: Bad Request".
 func (sm *StorageManager) Upload(ctx context.Context, localPath, remoteKey string) error {
+	return sm.upload(ctx, localPath, remoteKey, true)
+}
+
+// UploadOverwrite uploads localPath to remoteKey unconditionally, skipping the
+// existence pre-check performed by Upload. It is intended for authoritative
+// objects such as oss.db.enc / oss.db.iv, where the previous snapshot MUST be
+// replaced by the new one — otherwise the no-clobber check would silently skip
+// the upload and leave a stale authoritative copy in OSS forever.
+func (sm *StorageManager) UploadOverwrite(ctx context.Context, localPath, remoteKey string) error {
+	return sm.upload(ctx, localPath, remoteKey, false)
+}
+
+// UploadOrReuseNonce uploads localPath to remoteKey with the same no-clobber
+// semantics as Upload, but additionally tells the caller which IV (base64
+// first-chunk nonce) the object actually stored in OSS carries:
+//
+//   - uploaded=true: the object was newly uploaded from localPath; the caller
+//     should record the IV it computed when encrypting localPath.
+//   - uploaded=false: the object already existed; this method reads the
+//     first-chunk nonce embedded in the existing object (the 12-byte nonce
+//     following the 32-byte HKDF salt) and returns it, so the caller records
+//     an IV that actually matches the stored object.
+//
+// Without this, a stale local hash_index (e.g. after a DB was pulled from OSS
+// before the authoritative oss.db was updated) would encrypt with a fresh
+// random nonce, Upload would skip because the object exists, and the recorded
+// IV would never match the object — breaking restore with "nonce mismatch on
+// first chunk".
+func (sm *StorageManager) UploadOrReuseNonce(ctx context.Context, localPath, remoteKey string) (iv string, uploaded bool, err error) {
+	exists, preErr := sm.Exists(ctx, remoteKey)
+	if preErr == nil && exists {
+		// Object already exists. Preferred path: reuse its embedded nonce so
+		// the recorded IV matches the stored object without any write.
+		if nonce, nErr := sm.readFirstChunkNonce(ctx, remoteKey); nErr == nil {
+			slog.Info("upload skipped: object already exists in OSS, reusing existing nonce",
+				"remote_key", remoteKey)
+			return nonce, false, nil
+		} else {
+			// Nonce not readable — e.g. the object is in an archive tier and
+			// currently frozen (reading it would require a thaw, which is a
+			// restore-time concern, not a backup-time one). Fall back to
+			// overwriting the object with the freshly encrypted bytes so the
+			// caller records an IV that matches what is actually stored.
+			// Content is identical (same hash ⇒ same plaintext, and the same
+			// master key), so overwriting only changes the nonce, never the
+			// data. Not overwriting would leave a recorded IV that never
+			// matches the object — a guaranteed restore failure.
+			slog.Info("object already exists but nonce not readable, overwriting with fresh encryption",
+				"remote_key", remoteKey, "reason", nErr.Error())
+			if owErr := sm.upload(ctx, localPath, remoteKey, false); owErr != nil {
+				return "", false, fmt.Errorf("overwrite existing object %q: %w", remoteKey, owErr)
+			}
+			return "", true, nil
+		}
+	}
+	if err := sm.upload(ctx, localPath, remoteKey, true); err != nil {
+		return "", false, err
+	}
+	return "", true, nil
+}
+
+// readFirstChunkNonce reads the 12-byte AES-GCM nonce of the first chunk from
+// an OSS object: the object layout is salt(32) || nonce(12) || ... (see
+// crypto.EncryptFile), so the nonce lives at bytes [32, 44). It uses
+// `rclone cat --offset 32 --count 12` to avoid downloading the whole object.
+// The nonce is returned base64-encoded, matching the encrypted_iv format
+// produced by crypto.EncryptFile.
+func (sm *StorageManager) readFirstChunkNonce(ctx context.Context, remoteKey string) (string, error) {
+	if sm.rcloneBin == "" {
+		return "", fmt.Errorf("rclone binary not found")
+	}
+	remoteSpec := sm.remoteSpec(remoteKey)
+	cmd := exec.CommandContext(ctx, sm.rcloneBin,
+		"cat", remoteSpec,
+		"--config", sm.rcloneConf,
+		"--offset", "32",
+		"--count", "12",
+	)
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", fmt.Errorf("rclone cat %q (offset %d, count %d): %w (stderr: %s)",
+			remoteSpec, encryptedSaltSize, encryptedNonceSize, err, strings.TrimSpace(stderr.String()))
+	}
+	nonce := []byte(stdout.String())
+	if len(nonce) != encryptedNonceSize {
+		return "", fmt.Errorf("expected %d-byte nonce at offset %d of %q, got %d bytes",
+			encryptedNonceSize, encryptedSaltSize, remoteKey, len(nonce))
+	}
+	return base64.StdEncoding.EncodeToString(nonce), nil
+}
+
+// upload implements Upload/UploadOverwrite. When skipIfExists is true the
+// upload is skipped (returning nil) if the object already exists in OSS.
+func (sm *StorageManager) upload(ctx context.Context, localPath, remoteKey string, skipIfExists bool) error {
 	if sm.rcloneBin == "" {
 		return fmt.Errorf("rclone binary not found")
 	}
@@ -388,11 +507,13 @@ func (sm *StorageManager) Upload(ctx context.Context, localPath, remoteKey strin
 	// corrupt the other instance's backup because AES-GCM uses a random IV per
 	// encryption. This application-level Exists() check is the sole no-clobber
 	// defense (rclone has no --no-clobber flag despite rumors).
-	exists, preErr := sm.Exists(ctx, remoteKey)
-	if preErr == nil && exists {
-		slog.Info("upload skipped: object already exists in OSS",
-			"remote_key", remoteKey)
-		return nil
+	if skipIfExists {
+		exists, preErr := sm.Exists(ctx, remoteKey)
+		if preErr == nil && exists {
+			slog.Info("upload skipped: object already exists in OSS",
+				"remote_key", remoteKey)
+			return nil
+		}
 	}
 
 	return sm.withRetry(ctx, defaultRetryCount, func() error {

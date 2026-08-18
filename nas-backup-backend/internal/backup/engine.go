@@ -206,28 +206,46 @@ func (e *Engine) waitForOSS(ctx context.Context, svc *DBBackupService) error {
 }
 
 // pullAndPreserveRestoreJobs pulls the latest oss.db from OSS, preserving
-// local restore_jobs across the DB overwrite. Returns (true, nil) if the DB
-// was pulled; (false, nil) if OSS had no oss.db (first-time deployment).
+// local restore_jobs AND config tables (backup_directories, exclusion_rules,
+// config_kv) across the DB overwrite. Returns (true, nil) if the DB was
+// pulled; (false, nil) if OSS had no oss.db (first-time deployment).
 func (e *Engine) pullAndPreserveRestoreJobs(ctx context.Context) (bool, error) {
 	svc := e.getDBBackupSvc()
 	if svc == nil {
 		return false, nil
 	}
 
-	// Ensure the local schema is up to date before querying restore_jobs.
-	// A stale or older-version local DB may lack the restore_jobs table; running
-	// migrations here brings it up to date instead of failing with "no such table".
+	// Ensure the local schema is up to date before querying any tables.
+	// A stale or older-version local DB may lack tables; running migrations
+	// here brings it up to date instead of failing with "no such table".
 	if err := e.db.EnsureSchema(); err != nil {
-		e.logger.Warn("ensure schema before export restore jobs failed", "error", err)
+		e.logger.Warn("ensure schema before export failed", "error", err)
 	}
 
-	// Export local restore_jobs before DB overwrite. A missing table (e.g. the
-	// authoritative oss.db came from an older version) is not fatal: we simply
-	// have no local restore history to preserve.
+	// Export local state before DB overwrite. Missing tables are not fatal:
+	// we simply have no local state to preserve.
 	localJobs, err := e.db.RestoreJobRepo.ExportAll()
 	if err != nil {
 		e.logger.Warn("failed to export restore jobs before pull; continuing without local restore history", "error", err)
 		localJobs = nil
+	}
+
+	localDirs, err := e.db.ConfigRepo.ExportDirectories()
+	if err != nil {
+		e.logger.Warn("failed to export backup directories before pull; continuing with OSS-pulled directories", "error", err)
+		localDirs = nil
+	}
+
+	localExclusions, err := e.db.ConfigRepo.ExportExclusionRules()
+	if err != nil {
+		e.logger.Warn("failed to export exclusion rules before pull; continuing with OSS-pulled rules", "error", err)
+		localExclusions = nil
+	}
+
+	localConfigKV, err := e.db.ConfigRepo.GetAll()
+	if err != nil {
+		e.logger.Warn("failed to export config_kv before pull; continuing with OSS-pulled config", "error", err)
+		localConfigKV = nil
 	}
 
 	// Pull oss.db from OSS (overwrites local DB file).
@@ -250,7 +268,26 @@ func (e *Engine) pullAndPreserveRestoreJobs(ctx context.Context) (bool, error) {
 	// Recreate scanner/deduplicator against the fresh connection.
 	e.rebindAfterReopen()
 
-	// Import restore_jobs back into the fresh DB.
+	// Re-import local state into the fresh DB. Config tables are imported
+	// before restore_jobs so that any foreign-key dependencies are satisfied.
+	if len(localDirs) > 0 {
+		if err := e.db.ConfigRepo.ImportDirectories(localDirs); err != nil {
+			e.logger.Warn("failed to re-import backup directories after pull", "error", err)
+		}
+	}
+
+	if len(localExclusions) > 0 {
+		if err := e.db.ConfigRepo.ImportExclusionRules(localExclusions); err != nil {
+			e.logger.Warn("failed to re-import exclusion rules after pull", "error", err)
+		}
+	}
+
+	if len(localConfigKV) > 0 {
+		if err := e.db.ConfigRepo.ImportConfigKV(localConfigKV); err != nil {
+			e.logger.Warn("failed to re-import config_kv after pull", "error", err)
+		}
+	}
+
 	if len(localJobs) > 0 {
 		if err := e.db.RestoreJobRepo.ImportBatch(localJobs); err != nil {
 			e.logger.Warn("failed to re-import restore jobs after pull", "error", err)
@@ -261,11 +298,12 @@ func (e *Engine) pullAndPreserveRestoreJobs(ctx context.Context) (bool, error) {
 }
 
 // RefreshFromOSS pulls the latest authoritative oss.db from OSS, preserving
-// local restore_jobs across the DB overwrite. It is exposed for the
-// "refresh-oss-db" API so the operator can manually re-sync the local DB from
-// OSS without restarting the service (e.g. after another machine performed a
-// backup). Returns (true, nil) when a new DB was pulled; (false, nil) when OSS
-// has no oss.db yet (first-time deployment).
+// local state (restore_jobs, backup_directories, exclusion_rules, config_kv)
+// across the DB overwrite. It is exposed for the "refresh-oss-db" API so the
+// operator can manually re-sync the local DB from OSS without restarting the
+// service (e.g. after another machine performed a backup). Returns (true, nil)
+// when a new DB was pulled; (false, nil) when OSS has no oss.db yet
+// (first-time deployment).
 func (e *Engine) RefreshFromOSS(ctx context.Context) (bool, error) {
 	return e.pullAndPreserveRestoreJobs(ctx)
 }
@@ -1275,8 +1313,20 @@ func (e *Engine) processAndUploadFile(
 		e.progress.PublishLog(backupID, "info", "上传文件",
 			fmt.Sprintf("%s → %s", entry.Path, storageKey))
 	}
-	if err := e.storage.Upload(ctx, encryptedPath, storageKey); err != nil {
+	reuseIV, uploaded, err := e.storage.UploadOrReuseNonce(ctx, encryptedPath, storageKey)
+	if err != nil {
 		return 0, 0, 0, "", "", "", fmt.Errorf("upload file: %w", err)
+	}
+	if !uploaded {
+		// The object already existed in OSS (content-addressed no-clobber
+		// skip), e.g. the local hash_index was stale and had no row for this
+		// hash while the object was still there. Record the existing object's
+		// actual first-chunk nonce instead of the fresh random one generated
+		// above — otherwise the recorded IV would never match the stored
+		// object and restore would fail with "nonce mismatch on first chunk".
+		e.logger.Info("object already existed in OSS, reusing existing object nonce",
+			"path", entry.Path, "storage_key", storageKey)
+		encIV = reuseIV
 	}
 
 	// Verify upload.

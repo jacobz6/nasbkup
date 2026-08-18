@@ -107,21 +107,26 @@ deploy_main() {
     step "配置 rclone"
 
     if [[ "$USE_REAL_OSS" == "true" ]]; then
-        info "配置真实阿里云 OSS..."
-        read -rp "OSS Endpoint (如 oss-cn-hangzhou.aliyuncs.com): " oss_endpoint
-        read -rp "OSS Bucket 名称: " oss_bucket
-        read -rp "Access Key ID: " oss_ak
-        read -rsp "Access Key Secret: " oss_sk; echo ""
-
-        if [[ -x "${BACKEND_DIR}/scripts/setup-rclone.sh" ]]; then
-            "${BACKEND_DIR}/scripts/setup-rclone.sh" \
-                --endpoint "$oss_endpoint" --bucket "$oss_bucket" \
-                --ak "$oss_ak" --sk "$oss_sk" --config-path "$RCLONE_CONFIG"
-        else
-            fail "setup-rclone.sh 不存在于 ${BACKEND_DIR}/scripts/"
+        info "生产模式：真实阿里云 OSS（以 config.yaml 的 oss 段为唯一权威源）"
+        # config.yaml 是 OSS 配置的唯一权威源，后端启动时 EnsureRcloneConfig
+        # 会依据 config.yaml 自动生成真实 s3 的 rclone.conf。
+        # 这里只需清理历史遗留的本地模拟配置（type=local），避免 type=local
+        # 残留导致备份写入本地只读根目录而失败。
+        if [[ -f "$RCLONE_CONFIG" ]] && grep -q '^[[:space:]]*type[[:space:]]*=[[:space:]]*local' "$RCLONE_CONFIG"; then
+            rm -f "$RCLONE_CONFIG"
+            info "已删除遗留的本地模拟 rclone.conf（启动时将按 config.yaml 自动重建为真实 OSS）"
+        fi
+        # 校验 config.yaml 真实 OSS 配置是否完整
+        local miss=()
+        [[ -z "$(awk '/^  endpoint:/{gsub(/[" ]/,"",$2);print $2}' "$CONFIG_FILE")" ]]          && miss+=("endpoint")
+        [[ -z "$(awk '/^  bucket:/{gsub(/[" ]/,"",$2);print $2}' "$CONFIG_FILE")" ]]            && miss+=("bucket")
+        [[ -z "$(awk '/^  access_key_id:/{gsub(/[" ]/,"",$2);print $2}' "$CONFIG_FILE")" ]]     && miss+=("access_key_id")
+        [[ -z "$(awk '/^  access_key_secret:/{gsub(/[" ]/,"",$2);print $2}' "$CONFIG_FILE")" ]] && miss+=("access_key_secret")
+        if [[ ${#miss[@]} -gt 0 ]]; then
+            fail "config.yaml 的 oss 段缺少配置: ${miss[*]}。请先在 nas-backup-backend/config.yaml 填写真实 OSS 配置后重试。"
         fi
     else
-        info "配置本地文件系统 remote（离线测试模式）..."
+        info "配置本地文件系统 remote（离线测试模式，--local）..."
         cat > "$RCLONE_CONFIG" <<EOF
 # Rclone 配置 - 本地测试模式（$(date -Iseconds)）
 # 使用本地文件系统模拟云存储（无加密层，由应用层 master.key 提供加密）
@@ -132,14 +137,22 @@ EOF
         chmod 600 "$RCLONE_CONFIG"
     fi
 
-    rclone config show --config "$RCLONE_CONFIG" &>/dev/null && success "rclone 配置验证通过" || fail "rclone 配置验证失败"
+    if [[ -f "$RCLONE_CONFIG" ]]; then
+        rclone config show --config "$RCLONE_CONFIG" &>/dev/null && success "rclone 配置验证通过" || warn "rclone 配置已写入（内容以后端启动生成为准）"
+    else
+        info "rclone.conf 尚未生成（生产模式将由后端启动时依据 config.yaml 自动生成）"
+    fi
 
     # ------------------------------------------------------------------
     # Step 6: 生成 config.yaml
     # ------------------------------------------------------------------
     step "生成应用配置 config.yaml"
-    _generate_macos_config "$CONFIG_FILE" "$test_dir" "$test_source_dir"
-    success "配置文件已写入: ${CONFIG_FILE}"
+    if [[ "$USE_REAL_OSS" == "true" && -f "$CONFIG_FILE" ]]; then
+        info "生产模式：保留现有 config.yaml（含真实 OSS 配置），不覆盖"
+    else
+        _generate_macos_config "$CONFIG_FILE" "$test_dir" "$test_source_dir"
+        success "配置文件已写入: ${CONFIG_FILE}"
+    fi
 
     # ------------------------------------------------------------------
     # Step 7: rclone 二进制
@@ -246,8 +259,13 @@ EOF
     echo -e "    3. 打开浏览器: http://localhost:5173"
     echo -e "    4. 运行 E2E:   ./scripts/verify-e2e.sh"
     echo ""
-    echo -e "  ${BOLD}切换到真实 OSS:${NC}"
-    echo -e "    ./scripts/deploy.sh --with-oss"
+    if [[ "$USE_REAL_OSS" == "true" ]]; then
+        echo -e "  ${BOLD}OSS 模式:${NC}  生产（真实阿里云 OSS，以 config.yaml oss 段为准）"
+        echo -e "  ${BOLD}本地测试:${NC}   ./scripts/deploy.sh --local"
+    else
+        echo -e "  ${BOLD}OSS 模式:${NC}  本地文件系统模拟（--local 测试模式）"
+        echo -e "  ${BOLD}生产模式:${NC}   ./scripts/deploy.sh"
+    fi
     echo ""
 }
 

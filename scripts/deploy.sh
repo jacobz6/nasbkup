@@ -6,7 +6,7 @@
 #
 #   macOS  (本地开发/测试):
 #     - Homebrew 安装依赖（rclone/zstd/go/node/python3/openssl）
-#     - 本地文件系统模拟云存储（可选 --with-oss 切换真实 OSS）
+#     - 默认连接真实阿里云 OSS（生产模式；如需本地模拟测试加 --local）
 #     - 构建后端 + 前端
 #     - 生成启动便捷脚本
 #
@@ -17,17 +17,18 @@
 #     - 编译后端 + 构建前端
 #
 # 用法:
-#   ./scripts/deploy.sh                       # 自动检测平台部署
+#   ./scripts/deploy.sh                       # 生产部署（macOS 默认真实 OSS；Debian 需 sudo）
+#   ./scripts/deploy.sh --local               # macOS 本地模拟测试（离线，不碰真实 OSS）
 #   ./scripts/deploy.sh --platform macos      # 强制 macOS 模式
 #   ./scripts/deploy.sh --platform debian     # 强制 Debian 模式
 #   sudo ./scripts/deploy.sh                  # Debian 生产部署（含 systemd + Nginx）
 #
 # 通用选项:
+#   --local              本地文件系统模拟云存储（仅 macOS 测试；默认走真实 OSS）
 #   --skip-deps           跳过系统依赖安装
 #   --skip-frontend       跳过前端构建（Debian 模式，仅后端部署）
 #   --no-nginx            跳过 Nginx 配置（Debian 模式）
 #   --install-dir DIR     指定安装目录（Debian 模式，默认自动检测）
-#   --with-oss            配置真实阿里云 OSS（macOS 模式，交互式输入凭证）
 #   --platform macos|debian  强制指定平台（默认自动检测）
 #   --help                显示帮助
 # ==============================================================================
@@ -51,7 +52,8 @@ SKIP_DEPS=false
 SKIP_FRONTEND=false
 NO_NGINX=false
 INSTALL_DIR=""
-USE_REAL_OSS=false
+# 默认生产：真实阿里云 OSS。仅 macOS 测试用 --local 切换为本地模拟。
+USE_REAL_OSS=true
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -60,7 +62,8 @@ while [[ $# -gt 0 ]]; do
         --skip-frontend)  SKIP_FRONTEND=true; shift ;;
         --no-nginx)       NO_NGINX=true; shift ;;
         --install-dir)    INSTALL_DIR="$2"; shift 2 ;;
-        --with-oss)       USE_REAL_OSS=true; shift ;;
+        --local)          USE_REAL_OSS=false; shift ;;
+        --with-oss)       USE_REAL_OSS=true; shift ;;   # 向后兼容，等价于默认
         -h|--help)
             awk 'NR>=2 && NR<=32 {sub(/^# ?/,""); print}' "$0"
             exit 0 ;;

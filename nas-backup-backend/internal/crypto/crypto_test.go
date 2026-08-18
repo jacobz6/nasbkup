@@ -2,6 +2,7 @@ package crypto
 
 import (
 	"bytes"
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"testing"
@@ -409,6 +410,49 @@ func TestEncryptedFileStructure(t *testing.T) {
 	chunk1Nonce := remaining[:nonceSize]
 	if len(chunk1Nonce) != nonceSize {
 		t.Fatalf("invalid nonce size: %d", len(chunk1Nonce))
+	}
+}
+
+// TestFirstChunkNoncePosition 验证首个 chunk 的 nonce 位于密文 [32, 44) 字节处。
+// 该布局是 storage.readFirstChunkNonce（rclone cat --offset 32 --count 12）的跨包契约，
+// 若布局变更，读取到的非本地 nonce 会与 DecryptFile 的校验不一致。
+func TestFirstChunkNoncePosition(t *testing.T) {
+	tmpDir := t.TempDir()
+	keyPath := filepath.Join(tmpDir, "key.bin")
+
+	e, err := NewEncryptor(keyPath)
+	if err != nil {
+		t.Fatalf("NewEncryptor failed: %v", err)
+	}
+
+	plainPath := filepath.Join(tmpDir, "plain.dat")
+	if err := os.WriteFile(plainPath, []byte("layout contract content"), 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	encryptedPath := filepath.Join(tmpDir, "encrypted.enc")
+	iv, err := e.EncryptFile(plainPath, encryptedPath)
+	if err != nil {
+		t.Fatalf("EncryptFile failed: %v", err)
+	}
+
+	data, err := os.ReadFile(encryptedPath)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if len(data) < keySize+nonceSize {
+		t.Fatalf("encrypted file too short: %d bytes", len(data))
+	}
+
+	// 与 storage.readFirstChunkNonce 的契约一致：salt(32) 后紧跟 nonce(12)。
+	embedded := data[keySize : keySize+nonceSize]
+	want, err := base64.StdEncoding.DecodeString(iv)
+	if err != nil {
+		t.Fatalf("decode iv failed: %v", err)
+	}
+	if !bytes.Equal(embedded, want) {
+		t.Fatalf("nonce at offset [%d,%d) = %x, want %x (matches EncryptFile iv)",
+			keySize, keySize+nonceSize, embedded, want)
 	}
 }
 

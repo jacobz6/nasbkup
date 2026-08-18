@@ -228,11 +228,19 @@ func (s *DBBackupService) PushOSSDB(ctx context.Context) error {
 
 	// Step 6: upload the new .enc and .iv. If the .iv upload fails we must
 	// delete the orphaned .enc to avoid leaving an unrecoverable snapshot.
+	//
+	// CRITICAL: use UploadOverwrite (not Upload). Upload's no-clobber existence
+	// pre-check would skip the upload once oss.db.enc exists, leaving the
+	// authoritative OSS snapshot frozen at its first-ever version forever —
+	// every later backup's records would never reach OSS, and a subsequent pull
+	// (startup / before-backup / refresh) would revert the local DB to that
+	// stale snapshot, desyncing recorded IVs from the actual OSS objects and
+	// breaking restore with "nonce mismatch on first chunk".
 	s.logger.Info("uploading oss.db", "key", ossDBEncKey)
-	if err := s.storage.Upload(ctx, localEnc, ossDBEncKey); err != nil {
+	if err := s.storage.UploadOverwrite(ctx, localEnc, ossDBEncKey); err != nil {
 		return fmt.Errorf("upload oss.db.enc: %w", err)
 	}
-	if err := s.storage.Upload(ctx, localIV, ossDBIVKey); err != nil {
+	if err := s.storage.UploadOverwrite(ctx, localIV, ossDBIVKey); err != nil {
 		s.logger.Error("failed to upload oss.db.iv, deleting orphaned oss.db.enc", "error", err)
 		_ = s.storage.Delete(ctx, ossDBEncKey)
 		return fmt.Errorf("upload oss.db.iv (orphaned .enc cleaned up): %w", err)

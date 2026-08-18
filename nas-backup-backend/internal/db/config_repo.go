@@ -213,6 +213,73 @@ func (r *ConfigRepository) GetEnabledDirectories() ([]*models.BackupDirectory, e
 	return dirs, nil
 }
 
+// ExportDirectories reads all backup_directories rows. Used by PullOSSDB to
+// preserve local directory config across DB-overwrite: the caller snapshots
+// the rows into memory before the local DB file is replaced, then calls
+// ImportDirectories to write them back after the new DB is reopened.
+func (r *ConfigRepository) ExportDirectories() ([]*models.BackupDirectory, error) {
+	rows, err := r.db.Query(`
+		SELECT id, path, recursive, enabled, description
+		FROM backup_directories ORDER BY id
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("export backup directories: %w", err)
+	}
+	defer rows.Close()
+
+	dirs := make([]*models.BackupDirectory, 0)
+	for rows.Next() {
+		d, err := scanBackupDirectory(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan backup directory row during export: %w", err)
+		}
+		dirs = append(dirs, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate backup directories during export: %w", err)
+	}
+	return dirs, nil
+}
+
+// ImportDirectories inserts backup_directories rows in a single transaction,
+// preserving the original IDs. Existing rows in the target table are deleted
+// first so the local config always wins over the OSS-pulled DB.
+func (r *ConfigRepository) ImportDirectories(dirs []*models.BackupDirectory) error {
+	if len(dirs) == 0 {
+		return nil
+	}
+
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin transaction for import backup directories: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM backup_directories`); err != nil {
+		return fmt.Errorf("clear backup directories before import: %w", err)
+	}
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO backup_directories (id, path, recursive, enabled, description)
+		VALUES (?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare import backup directory insert: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, d := range dirs {
+		if _, err := stmt.Exec(d.ID, d.Path, boolToInt(d.Recursive), boolToInt(d.Enabled), d.Description); err != nil {
+			return fmt.Errorf("insert backup directory %q: %w", d.Path, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit import backup directories: %w", err)
+	}
+	return nil
+}
+
 // CountDirectories returns the total number of backup directory entries.
 func (r *ConfigRepository) CountDirectories() (int64, error) {
 	var count int64
@@ -367,4 +434,110 @@ func (r *ConfigRepository) GetEnabledExclusionRules() ([]*models.ExclusionRule, 
 		return nil, fmt.Errorf("iterate enabled exclusion rules: %w", err)
 	}
 	return rules, nil
+}
+
+// ExportExclusionRules reads all exclusion_rules rows. Used by PullOSSDB to
+// preserve local exclusion rules across DB-overwrite.
+func (r *ConfigRepository) ExportExclusionRules() ([]*models.ExclusionRule, error) {
+	rows, err := r.db.Query(`
+		SELECT id, pattern, rule_type, enabled
+		FROM exclusion_rules ORDER BY id
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("export exclusion rules: %w", err)
+	}
+	defer rows.Close()
+
+	rules := make([]*models.ExclusionRule, 0)
+	for rows.Next() {
+		rule, err := scanExclusionRule(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan exclusion rule row during export: %w", err)
+		}
+		rules = append(rules, rule)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate exclusion rules during export: %w", err)
+	}
+	return rules, nil
+}
+
+// ImportExclusionRules inserts exclusion_rules rows in a single transaction,
+// preserving the original IDs. Existing rows are deleted first so the local
+// config always wins over the OSS-pulled DB.
+func (r *ConfigRepository) ImportExclusionRules(rules []*models.ExclusionRule) error {
+	if len(rules) == 0 {
+		return nil
+	}
+
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin transaction for import exclusion rules: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM exclusion_rules`); err != nil {
+		return fmt.Errorf("clear exclusion rules before import: %w", err)
+	}
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO exclusion_rules (id, pattern, rule_type, enabled)
+		VALUES (?, ?, ?, ?)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare import exclusion rule insert: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, rule := range rules {
+		if _, err := stmt.Exec(rule.ID, rule.Pattern, rule.RuleType, boolToInt(rule.Enabled)); err != nil {
+			return fmt.Errorf("insert exclusion rule %q: %w", rule.Pattern, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit import exclusion rules: %w", err)
+	}
+	return nil
+}
+
+// ImportConfigKV bulk-upserts config_kv entries in a single transaction.
+// Existing keys are overwritten; new keys are inserted. Used by PullOSSDB to
+// preserve local strategy/config settings across DB-overwrite.
+func (r *ConfigRepository) ImportConfigKV(entries map[string]string) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin transaction for import config_kv: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Delete all existing rows first so the local config fully replaces the
+	// OSS-pulled config (including removing keys that were deleted locally).
+	if _, err := tx.Exec(`DELETE FROM config_kv`); err != nil {
+		return fmt.Errorf("clear config_kv before import: %w", err)
+	}
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO config_kv (key, value, updated_at) VALUES (?, ?, ?)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare import config_kv insert: %w", err)
+	}
+	defer stmt.Close()
+
+	now := Now()
+	for k, v := range entries {
+		if _, err := stmt.Exec(k, v, now); err != nil {
+			return fmt.Errorf("insert config_kv %q: %w", k, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit import config_kv: %w", err)
+	}
+	return nil
 }

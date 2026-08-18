@@ -315,9 +315,16 @@ func (s *Scanner) processFile(
 	result *ScanResult,
 	progress func(scanned int),
 ) {
-	result.TotalScanned++
+	// Deduplicate: skip paths already processed by another (overlapping) backup
+	// directory. Without this guard, a file under both /resume and
+	// /resume/MyResume-WORKER would produce two FileChange entries for the
+	// same path, causing a UNIQUE constraint violation in backup_files.
+	if scannedPaths[path] {
+		return
+	}
 	scannedPaths[path] = true
 
+	result.TotalScanned++
 	if progress != nil {
 		progress(result.TotalScanned)
 	}
