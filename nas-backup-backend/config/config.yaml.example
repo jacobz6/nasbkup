@@ -128,7 +128,7 @@ backup:
   # Encryption settings
   encryption:
     algorithm: "AES-256-GCM"
-    key_file_path: "./data/master.key"
+    key_file_path: "./config/master.key"
 
 # ---------------------------------------------------------------------------
 # Alibaba Cloud OSS settings

@@ -105,10 +105,11 @@ detect_paths() {
     BACKEND_DIR="${PROJECT_ROOT}/nas-backup-backend"
     FRONTEND_DIR="${PROJECT_ROOT}/nas-backup-frontend"
     DATA_DIR="${BACKEND_DIR}/data"
-    CONFIG_FILE="${BACKEND_DIR}/config.yaml"
+    CONFIG_DIR="${BACKEND_DIR}/config"
+    CONFIG_FILE="${CONFIG_DIR}/config.yaml"
     APP_LOG_FILE="${DATA_DIR}/logs/nas-backup.log"
 
-    export PROJECT_ROOT BACKEND_DIR FRONTEND_DIR DATA_DIR CONFIG_FILE APP_LOG_FILE
+    export PROJECT_ROOT BACKEND_DIR FRONTEND_DIR DATA_DIR CONFIG_DIR CONFIG_FILE APP_LOG_FILE
 }
 
 # ------------------------------------------------------------------------------

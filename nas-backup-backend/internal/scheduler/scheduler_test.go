@@ -379,26 +379,7 @@ func TestBackupRepoUpdate(t *testing.T) {
 	}
 }
 
-func TestConfigToModelsScheduleConfig(t *testing.T) {
-	cfg := &config.AppConfig{
-		Backup: config.BackupConfig{
-			Schedule: config.ScheduleConfig{
-				Enabled:  true,
-				CronExpr: "0 */6 * * *",
-				Timezone: "Asia/Shanghai",
-			},
-		},
-	}
-
-	mc := cfg.ToModelsScheduleConfig()
-	if !mc.Enabled {
-		t.Error("expected Enabled true")
-	}
-	if mc.CronExpr != "0 */6 * * *" {
-		t.Errorf("expected CronExpr %q, got %q", "0 */6 * * *", mc.CronExpr)
-	}
-}
-
+// TestConfigToModelsRetentionConfig 测试保留配置转换
 func TestConfigToModelsRetentionConfig(t *testing.T) {
 	cfg := &config.AppConfig{
 		Backup: config.BackupConfig{

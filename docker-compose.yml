@@ -28,7 +28,7 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - DATA_DIR=/app/data
-      - KEY_FILE=/app/data/master.key
+      - KEY_FILE=/app/data/config/master.key
       - RCLONE_CONF=/app/data/rclone.conf
       - CONFIG_FILE=/app/config.yaml
 

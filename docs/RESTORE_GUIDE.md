@@ -20,13 +20,13 @@
 
 - **用途**：AES-256-GCM 加密算法的主密钥。系统在上传文件到 OSS 前使用此密钥对数据进行加密，恢复时必须使用同一密钥进行解密。
 - **丢失后果**：**所有云端加密数据永远无法恢复**。OSS 中的数据全部为加密态，没有此密钥即无法解密。
-- **默认位置**：`./data/master.key`
-- **生成方式**：`openssl rand -base64 32 > ./data/master.key`
+- **默认位置**：`./config/master.key`
+- **生成方式**：`openssl rand -base64 32 > ./config/master.key`
 
 ### 2. `rclone.conf` -- rclone 配置文件
 
-- **用途**：包含 OSS 访问凭证（AccessKey ID/Secret）以及 rclone crypt 远程存储的加密密码（password/password2）。系统通过此配置与阿里云 OSS 通信。
-- **丢失后果**：无法连接 OSS 云存储，也无法正确解密 rclone crypt 层的数据文件名和内容。
+- **用途**：包含 OSS 访问凭证（AccessKey ID/Secret），仅含单个原生 `[oss]` 远程（无 crypt 层）。系统通过此配置与阿里云 OSS 通信；内容加/解密由应用层 `master.key` 负责。
+- **丢失后果**：无法连接 OSS 云存储，无法定位云端对象。
 - **默认位置**：`./data/rclone.conf`
 - **说明**：系统可从 `config.yaml` 中的 OSS 配置自动生成此文件，但建议保留已生成好的副本以避免版本差异。
 
@@ -44,7 +44,7 @@
 | 文件 | 说明 | 丢失后果 |
 |------|------|----------|
 | **`master.key`** | AES-256 主密钥 | 所有云端加密数据永远无法恢复 |
-| **`rclone.conf`** | OSS 凭证 + crypt 密码 | 无法连接 OSS 或解密 rclone crypt 层 |
+| **`rclone.conf`** | OSS 凭证 | 无法连接 OSS 云存储 |
 
 建议采用**至少两种**以下方式进行异地备份：
 
@@ -93,7 +93,7 @@
 ### 前置条件
 
 1. NAS Backup 系统正常运行（后端服务和前端均可访问）。
-2. `master.key`、`rclone.conf`、`nas-backup.db` 三个文件完好且位于 `./data/` 目录。
+2. `master.key`（位于 `./config/`）、`rclone.conf`、`nas-backup.db`（位于 `./data/`）三个文件完好可用。
 3. 已成功执行过至少一次备份，且目标文件包含在备份范围内。
 4. 网络可正常访问阿里云 OSS。
 
@@ -135,37 +135,37 @@
 
 ```bash
 # 1. 查看最近的备份会话
-./restore-cli -config config.yaml backups
+./restore-cli -config config/config.yaml backups
 
 # 2. 列出可恢复的文件（默认使用最近一次完成的备份）
-./restore-cli -config config.yaml list
+./restore-cli -config config/config.yaml list
 
 # 3. 列出特定目录下的可恢复文件
-./restore-cli -config config.yaml list /mnt/data/documents
+./restore-cli -config config/config.yaml list /mnt/data/documents
 
 # 4. 查看单个文件的详细信息（含存储密钥、压缩类型、哈希等）
-./restore-cli -config config.yaml info /mnt/data/documents/report.pdf
+./restore-cli -config config/config.yaml info /mnt/data/documents/report.pdf
 
 # 5. 恢复单个文件到指定目录
-./restore-cli -config config.yaml restore /mnt/data/documents/report.pdf -o /tmp/restored/
+./restore-cli -config config/config.yaml restore /mnt/data/documents/report.pdf -o /tmp/restored/
 
 # 6. 恢复整个目录到指定位置
-./restore-cli -config config.yaml restore-dir /mnt/data/documents -o /tmp/restored/
+./restore-cli -config config/config.yaml restore-dir /mnt/data/documents -o /tmp/restored/
 
 # 7. 恢复特定备份版本的文件（通过 --backup-id 指定）
-./restore-cli -config config.yaml --backup-id 3 restore /mnt/data/documents/report.pdf -o /tmp/restored/
+./restore-cli -config config/config.yaml --backup-id 3 restore /mnt/data/documents/report.pdf -o /tmp/restored/
 
 # 8. 使用加速解冻恢复 ColdArchive 文件
-./restore-cli -config config.yaml --expedited restore /mnt/data/documents/archive.zip -o /tmp/restored/
+./restore-cli -config config/config.yaml --expedited restore /mnt/data/documents/archive.zip -o /tmp/restored/
 
 # 9. 验证单个文件（下载 -> 解密 -> 解压 -> SHA-256 校验，不写入输出目录）
-./restore-cli -config config.yaml verify /mnt/data/documents/report.pdf
+./restore-cli -config config/config.yaml verify /mnt/data/documents/report.pdf
 
 # 10. 批量验证目录下的文件
-./restore-cli -config config.yaml verify-dir /mnt/data/documents
+./restore-cli -config config/config.yaml verify-dir /mnt/data/documents
 
 # 11. 采样验证（仅验证前 10 个文件）
-./restore-cli -config config.yaml verify-dir /mnt/data/documents --limit 10
+./restore-cli -config config/config.yaml verify-dir /mnt/data/documents --limit 10
 ```
 
 ### 注意事项
@@ -257,11 +257,11 @@ npm run build
 mkdir -p /opt/nas-backup/nas-backup-backend/data/logs
 
 # 从备份介质复制二件套
-cp /path/to/backup/master.key   /opt/nas-backup/nas-backup-backend/data/master.key
+cp /path/to/backup/master.key   /opt/nas-backup/nas-backup-backend/config/master.key
 cp /path/to/backup/rclone.conf   /opt/nas-backup/nas-backup-backend/data/rclone.conf
 
 # 设置正确的文件权限
-chmod 600 /opt/nas-backup/nas-backup-backend/data/master.key
+chmod 600 /opt/nas-backup/nas-backup-backend/config/master.key
 chmod 600 /opt/nas-backup/nas-backup-backend/data/rclone.conf
 ```
 
@@ -273,7 +273,7 @@ chmod 600 /opt/nas-backup/nas-backup-backend/data/rclone.conf
 cd /opt/nas-backup/nas-backup-backend
 
 # 使用 restore-cli 从 OSS 拉取加密数据库并解密到本地
-./restore-cli -config config.yaml bootstrap
+./restore-cli -config config/config.yaml bootstrap
 
 # 输出示例：
 # Available database backup versions:
@@ -291,7 +291,7 @@ cd /opt/nas-backup/nas-backup-backend
 ```bash
 # 列出 OSS 中的数据库备份版本（需先手动 bootstrap 任意版本）
 # 或者使用 --o 指定输出路径，不覆盖默认路径
-./restore-cli -config config.yaml bootstrap -o ./data/nas-backup.db
+./restore-cli -config config/config.yaml bootstrap -o ./data/nas-backup.db
 ```
 
 #### 4. 配置 config.yaml
@@ -321,7 +321,7 @@ backup:
       description: "Documents"
   encryption:
     algorithm: "AES-256-GCM"
-    key_file_path: "/opt/nas-backup/nas-backup-backend/data/master.key"
+    key_file_path: "/opt/nas-backup/nas-backup-backend/config/master.key"
 
 oss:
   endpoint: "oss-cn-hangzhou.aliyuncs.com"
@@ -333,7 +333,7 @@ oss:
 rclone:
   binary_path: "/usr/bin/rclone"
   config_path: "/opt/nas-backup/nas-backup-backend/data/rclone.conf"
-  remote_name: "oss-crypt"
+  remote_name: "oss"
 ```
 
 > **说明**：OSS 凭证信息可以从 `rclone.conf` 中获取（以混淆形式存储），也可以从你自己的安全记录中恢复。
@@ -342,7 +342,7 @@ rclone:
 
 ```bash
 cd /opt/nas-backup/nas-backup-backend
-./nas-backup -config config.yaml
+./nas-backup -config config/config.yaml
 ```
 
 或者配置 systemd 服务后启动（推荐生产环境）：
@@ -389,17 +389,17 @@ sudo systemctl start nas-backup
 
 ```bash
 # 查看所有备份会话，确认数据版本
-./restore-cli -config config.yaml backups
+./restore-cli -config config/config.yaml backups
 
 # 列出所有可恢复文件
-./restore-cli -config config.yaml list
+./restore-cli -config config/config.yaml list
 
 # 恢复整个备份目录
-./restore-cli -config config.yaml restore-dir /mnt/data/documents -o /mnt/data/documents
-./restore-cli -config config.yaml restore-dir /mnt/data/photos -o /mnt/data/photos
+./restore-cli -config config/config.yaml restore-dir /mnt/data/documents -o /mnt/data/documents
+./restore-cli -config config/config.yaml restore-dir /mnt/data/photos -o /mnt/data/photos
 
 # 或逐目录恢复并限制并发数（适合 ColdArchive 场景）
-./restore-cli -config config.yaml --expedited restore-dir /mnt/data/documents -o /mnt/data/documents
+./restore-cli -config config/config.yaml --expedited restore-dir /mnt/data/documents -o /mnt/data/documents
 ```
 
 ### 验证恢复完整性
@@ -408,11 +408,11 @@ sudo systemctl start nas-backup
 
 ```bash
 # 方式一：CLI 验证（下载 -> 解密 -> 解压 -> SHA-256 校验）
-./restore-cli -config config.yaml verify-dir /mnt/data/documents
-./restore-cli -config config.yaml verify-dir /mnt/data/photos
+./restore-cli -config config/config.yaml verify-dir /mnt/data/documents
+./restore-cli -config config/config.yaml verify-dir /mnt/data/photos
 
 # 方式二：采样验证（仅验证部分文件以节省时间）
-./restore-cli -config config.yaml verify-dir /mnt/data/documents --limit 20
+./restore-cli -config config/config.yaml verify-dir /mnt/data/documents --limit 20
 
 # 方式三：通过 Web UI 查看恢复作业结果
 # 检查恢复作业详情中的成功/失败文件数和失败文件列表
@@ -450,7 +450,7 @@ sudo systemctl start nas-backup
 2. **备份旧 NAS 的三件套**
    ```bash
    mkdir -p /tmp/nas-backup-essentials
-   cp /opt/nas-backup/nas-backup-backend/data/master.key   /tmp/nas-backup-essentials/
+   cp /opt/nas-backup/nas-backup-backend/config/master.key   /tmp/nas-backup-essentials/
    cp /opt/nas-backup/nas-backup-backend/data/rclone.conf   /tmp/nas-backup-essentials/
    cp /opt/nas-backup/nas-backup-backend/data/nas-backup.db /tmp/nas-backup-essentials/
    ```
@@ -465,8 +465,8 @@ sudo systemctl start nas-backup
 5. **恢复数据**
    ```bash
    # 恢复所有备份目录的数据
-   ./restore-cli -config config.yaml restore-dir /mnt/data/documents -o /mnt/data/documents
-   ./restore-cli -config config.yaml restore-dir /mnt/data/photos -o /mnt/data/photos
+   ./restore-cli -config config/config.yaml restore-dir /mnt/data/documents -o /mnt/data/documents
+   ./restore-cli -config config/config.yaml restore-dir /mnt/data/photos -o /mnt/data/photos
    ```
 
 6. **启动新 NAS 的备份服务**，确认定时调度正常。
@@ -477,11 +477,11 @@ sudo systemctl start nas-backup
 
 ```bash
 # 1. 对比恢复后的文件数量与备份记录
-./restore-cli -config config.yaml list /mnt/data/documents | wc -l
+./restore-cli -config config/config.yaml list /mnt/data/documents | wc -l
 
 # 2. 采样验证文件哈希
-./restore-cli -config config.yaml verify-dir /mnt/data/documents --limit 20
-./restore-cli -config config.yaml verify-dir /mnt/data/photos --limit 20
+./restore-cli -config config/config.yaml verify-dir /mnt/data/documents --limit 20
+./restore-cli -config config/config.yaml verify-dir /mnt/data/photos --limit 20
 
 # 3. 检查 OSS 存储健康状态（通过 Web UI 或 API）
 curl http://127.0.0.1:8080/api/storage/health
@@ -517,7 +517,7 @@ curl -X POST http://127.0.0.1:8080/api/reconcile?dry_run=true
 #### `backups` -- 列出备份会话
 
 ```bash
-./restore-cli -config config.yaml backups
+./restore-cli -config config/config.yaml backups
 ```
 
 输出示例：
@@ -533,13 +533,13 @@ ID     TYPE         STATUS      FILES       SIZE         COMPLETED_AT
 
 ```bash
 # 列出所有可恢复文件
-./restore-cli -config config.yaml list
+./restore-cli -config config/config.yaml list
 
 # 列出指定目录下的可恢复文件
-./restore-cli -config config.yaml list /mnt/data/documents
+./restore-cli -config config/config.yaml list /mnt/data/documents
 
 # 列出特定备份版本中的文件
-./restore-cli -config config.yaml --backup-id 2 list /mnt/data/documents
+./restore-cli -config config/config.yaml --backup-id 2 list /mnt/data/documents
 ```
 
 输出包含文件路径、大小、哈希前 8 位和修改时间。
@@ -547,7 +547,7 @@ ID     TYPE         STATUS      FILES       SIZE         COMPLETED_AT
 #### `info <文件路径>` -- 查看文件详细备份信息
 
 ```bash
-./restore-cli -config config.yaml info /mnt/data/documents/report.pdf
+./restore-cli -config config/config.yaml info /mnt/data/documents/report.pdf
 ```
 
 输出包含文件记录（ID、路径、大小、哈希、状态）和备份文件记录（备份 ID、存储密钥、压缩类型、原始大小、存储大小、加密 IV）。
@@ -555,7 +555,7 @@ ID     TYPE         STATUS      FILES       SIZE         COMPLETED_AT
 #### `verify <文件路径>` -- 验证单个文件
 
 ```bash
-./restore-cli -config config.yaml verify /mnt/data/documents/report.pdf
+./restore-cli -config config/config.yaml verify /mnt/data/documents/report.pdf
 ```
 
 完整执行 下载 -> 解密 -> 解压 -> SHA-256 校验 流水线，验证通过输出 `VERIFIED`，验证失败输出 `FAILED`。验证使用临时目录，结束后自动清理。
@@ -564,13 +564,13 @@ ID     TYPE         STATUS      FILES       SIZE         COMPLETED_AT
 
 ```bash
 # 验证目录下所有文件
-./restore-cli -config config.yaml verify-dir /mnt/data/documents
+./restore-cli -config config/config.yaml verify-dir /mnt/data/documents
 
 # 仅验证前 20 个文件
-./restore-cli -config config.yaml verify-dir /mnt/data/documents --limit 20
+./restore-cli -config config/config.yaml verify-dir /mnt/data/documents --limit 20
 
 # 验证特定备份版本
-./restore-cli -config config.yaml --backup-id 2 verify-dir /mnt/data/documents
+./restore-cli -config config/config.yaml --backup-id 2 verify-dir /mnt/data/documents
 ```
 
 输出包含总数、成功数、失败数、数据量和耗时。
@@ -579,26 +579,26 @@ ID     TYPE         STATUS      FILES       SIZE         COMPLETED_AT
 
 ```bash
 # 基本恢复
-./restore-cli -config config.yaml restore /mnt/data/documents/report.pdf -o /tmp/restored/
+./restore-cli -config config/config.yaml restore /mnt/data/documents/report.pdf -o /tmp/restored/
 
 # 恢复特定版本
-./restore-cli -config config.yaml --backup-id 2 restore /mnt/data/documents/report.pdf -o /tmp/restored/
+./restore-cli -config config/config.yaml --backup-id 2 restore /mnt/data/documents/report.pdf -o /tmp/restored/
 
 # 使用加速解冻
-./restore-cli -config config.yaml --expedited restore /mnt/data/documents/archive.zip -o /tmp/restored/
+./restore-cli -config config/config.yaml --expedited restore /mnt/data/documents/archive.zip -o /tmp/restored/
 ```
 
 #### `restore-dir <目录路径> -o <输出目录>` -- 恢复整个目录
 
 ```bash
 # 恢复整个目录
-./restore-cli -config config.yaml restore-dir /mnt/data/documents -o /tmp/restored/
+./restore-cli -config config/config.yaml restore-dir /mnt/data/documents -o /tmp/restored/
 
 # 限制恢复文件数
-./restore-cli -config config.yaml restore-dir /mnt/data/documents -o /tmp/restored/ --limit 50
+./restore-cli -config config/config.yaml restore-dir /mnt/data/documents -o /tmp/restored/ --limit 50
 
 # 加速解冻 + 特定版本
-./restore-cli -config config.yaml --backup-id 3 --expedited restore-dir /mnt/data/documents -o /tmp/restored/
+./restore-cli -config config/config.yaml --backup-id 3 --expedited restore-dir /mnt/data/documents -o /tmp/restored/
 ```
 
 输出汇总：总文件数、已恢复数、失败数、数据量和耗时。失败文件会列出具体路径。
@@ -609,10 +609,10 @@ ID     TYPE         STATUS      FILES       SIZE         COMPLETED_AT
 
 ```bash
 # 恢复到配置文件指定的默认路径
-./restore-cli -config config.yaml bootstrap
+./restore-cli -config config/config.yaml bootstrap
 
 # 恢复到自定义路径
-./restore-cli -config config.yaml bootstrap -o /tmp/nas-backup.db
+./restore-cli -config config/config.yaml bootstrap -o /tmp/nas-backup.db
 ```
 
 此命令不需要本地数据库已存在（它是恢复数据库本身），只需 `master.key` 和 `rclone.conf`。
@@ -622,7 +622,7 @@ ID     TYPE         STATUS      FILES       SIZE         COMPLETED_AT
 正常情况下数据库在每次备份成功后自动上传。此命令用于手动触发：
 
 ```bash
-./restore-cli -config config.yaml db-backup
+./restore-cli -config config/config.yaml db-backup
 ```
 
 上传的数据库保留最近 3 个版本，旧版本自动清理。
@@ -733,7 +733,7 @@ curl -X POST http://127.0.0.1:8080/api/restore/jobs/{id}/cancel
 
 ```bash
 # 方法1：使用 restore-cli 从 OSS 恢复最新数据库
-./restore-cli -config config.yaml bootstrap
+./restore-cli -config config/config.yaml bootstrap
 
 # 方法2：手动检查本地数据库是否可修复
 sqlite3 ./data/nas-backup.db "PRAGMA integrity_check;"
@@ -754,14 +754,14 @@ sqlite3 ./data/nas-backup.db "PRAGMA integrity_check;"
 
 ```bash
 # 方式一：CLI 验证
-./restore-cli -config config.yaml backups
+./restore-cli -config config/config.yaml backups
 # 如能列出备份会话，说明数据库和 OSS 连接均正常
 
 # 方式二：API 验证
 curl http://127.0.0.1:8080/api/storage/health
 
 # 方式三：手动测试 rclone
-rclone lsf oss-crypt: --config ./data/rclone.conf --max-depth 1
+rclone lsf oss: --config ./data/rclone.conf --max-depth 1
 ```
 
 ### Q10：恢复大量文件时如何提高效率？

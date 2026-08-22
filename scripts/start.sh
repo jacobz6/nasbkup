@@ -104,8 +104,7 @@ _macos_preflight() {
     local missing=()
     [[ -x "$BACKEND_BIN" ]] || missing+=("后端二进制: ${BACKEND_BIN}")
     [[ -f "$CONFIG_FILE" ]] || missing+=("配置文件: ${CONFIG_FILE}")
-    [[ -f "${DATA_DIR}/master.key" ]] || missing+=("主密钥: data/master.key")
-    [[ -d "${FRONTEND_DIR}/node_modules" ]] || missing+=("前端依赖: node_modules")
+    [[ -f "${CONFIG_DIR}/master.key" ]] || missing+=("主密钥: ${CONFIG_DIR#${PROJECT_ROOT}/}/master.key")
 
     if [[ ${#missing[@]} -gt 0 ]]; then
         echo -e "${RED}环境缺失:${NC}"
@@ -116,7 +115,7 @@ _macos_preflight() {
 
     success "后端二进制: $(basename "$BACKEND_BIN")"
     success "配置端口: ${BACKEND_PORT}"
-    success "主密钥: data/master.key"
+    success "主密钥: config/master.key"
     success "前端依赖: node_modules 已就绪"
     success "Node: $(node --version)  npm: $(npm --version)"
 }
@@ -214,7 +213,7 @@ _debian_preflight() {
     local missing=()
     [[ -x "$BACKEND_BIN" ]] || missing+=("后端二进制: ${BACKEND_BIN}")
     [[ -f "$CONFIG_FILE" ]] || missing+=("配置文件: ${CONFIG_FILE}")
-    [[ -f "${DATA_DIR}/master.key" ]] || missing+=("主密钥: ${DATA_DIR}/master.key")
+    [[ -f "${CONFIG_DIR}/master.key" ]] || missing+=("主密钥: ${CONFIG_DIR}/master.key")
     [[ -d "${FRONTEND_DIR}/dist" ]] || missing+=("前端构建: ${FRONTEND_DIR}/dist/")
     [[ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]] || missing+=("systemd 服务")
 
@@ -228,7 +227,7 @@ _debian_preflight() {
     success "安装目录: ${PROJECT_ROOT}"
     success "后端二进制: $(basename "$BACKEND_BIN")"
     success "配置端口: ${BACKEND_PORT}"
-    success "主密钥: data/master.key"
+    success "主密钥: config/master.key"
     success "前端构建: dist/ 已就绪"
     success "systemd 服务: ${SERVICE_NAME}.service"
     command -v nginx >/dev/null && success "Nginx: $(nginx -v 2>&1)" || warn "Nginx 未安装"

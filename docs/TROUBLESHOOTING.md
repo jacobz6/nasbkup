@@ -31,9 +31,7 @@
 |------|------|----------|
 | 备份运行但 0 文件处理 | `backup.directories` 为空或路径不对 | 检查 config.yaml 的 `backup.directories` 路径是否存在；通过 Web UI 或 API 添加 |
 | `output directory is not under any allowed base directories` | 恢复目录白名单限制 | 在 config.yaml 的 `server.restore_base_dirs` 添加允许的父目录；或使用 `restore_to_original=true` |
-| rclone crypt remote 找不到上游 | rclone.conf 中 raw remote 名称不对 | raw remote **必须**命名为 `[oss]`，crypt remote 命名为 `[oss-crypt]` |
-| 上传文件找不到/加密不生效 | crypt remote 的 `remote = oss:path` 路径错误 | 格式为 `remote = oss:<绝对路径>`，不要漏掉冒号 |
-| 后端启动失败 | config.yaml 语法错误 / `data/` 目录权限 / 端口占用 | `go run ./cmd/nas-backup/ -config config.yaml` 看详细错误；检查 8080 端口 |
+| 后端启动失败 | config.yaml 语法错误 / `data/` 目录权限 / 端口占用 | `go run ./cmd/nas-backup/ -config config/config.yaml` 看详细错误；检查 8080 端口 |
 
 ### config.yaml 关键字段速查
 
@@ -53,7 +51,7 @@ oss:                          # 有值时才用 OSS SDK 发起解冻请求；全
 rclone:
   binary_path: "./bin/rclone"
   config_path: "./data/rclone.conf"
-  remote_name: "oss-crypt"    # 必须与 rclone.conf 的 section 名一致
+  remote_name: "oss"    # 必须与 rclone.conf 的 section 名一致
 ```
 
 ---
@@ -147,7 +145,7 @@ curl -s -X POST http://127.0.0.1:8080/api/restore \
 
 ```bash
 cd nas-backup-backend
-./restore-cli -file "/path/to/file" -backup-id 1 -to-original -config ./config.yaml
+./restore-cli -file "/path/to/file" -backup-id 1 -to-original -config ./config/config.yaml
 ```
 
 ---
@@ -158,14 +156,14 @@ cd nas-backup-backend
 |------|----------|
 | 测试脚本 SHA256 不匹配 | 检查恢复前是否修改了源文件；检查是否恢复了旧版本而非最新 |
 | 测试受旧数据干扰 | 每次运行验证前删除旧 `nas-backup.db`：`rm -f data/nas-backup.db*` |
-| 加密文件找不到 | rclone crypt 加密了文件名，用 `rclone ls oss-crypt:` 查看真实存储结构 |
+| 加密文件找不到 | 文件名/路径明文，内容为 `.enc` 后缀加密对象；用 `rclone ls oss:` 查看真实存储结构 |
 | `/api/health` 返回 404 | 没有 `/api/health` 端点，用 `/api/dashboard/stats` 代替 |
 
 ### 去重验证策略
 
 同批次内重复文件去重和跨批次去重表现不同。可靠验证方法：
-1. 第一次全量备份后，新增一个已知内容的重复文件
-2. 触发第二次（增量）备份
+1. 第一次备份后，新增一个已知内容的重复文件
+2. 触发第二次备份
 3. 检查 `skipped_by_dedup` 计数
 
 ---
@@ -180,7 +178,7 @@ cd nas-backup-backend
 | 恢复报 bucket name 错误 | 确认 storage.go 有 endpoint/bucket 空值检查（本地模式跳过 OSS SDK） |
 | rclone 命令找不到 | 检查 `rclone.binary_path` 配置；确认 `./bin/rclone` 可执行 |
 | 中文路径乱码 | `export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8` |
-| 加密文件找不到 | `rclone ls oss-crypt:` 查看加密后的存储结构 |
+| 加密文件找不到 | 用 `rclone ls oss:` 查看真实存储结构 |
 | 前端一直「解冻中」 | 见[第四节解冻专项排查](#四解冻archivecoldarchive专项排查) |
 
 ---

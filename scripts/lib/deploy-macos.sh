@@ -17,7 +17,8 @@ deploy_main() {
     BACKEND_DIR="${PROJECT_ROOT}/nas-backup-backend"
     FRONTEND_DIR="${PROJECT_ROOT}/nas-backup-frontend"
     DATA_DIR="${BACKEND_DIR}/data"
-    CONFIG_FILE="${BACKEND_DIR}/config.yaml"
+    CONFIG_DIR="${BACKEND_DIR}/config"
+    CONFIG_FILE="${CONFIG_DIR}/config.yaml"
     RCLONE_CONFIG="${DATA_DIR}/rclone.conf"
 
     local test_dir="${PROJECT_ROOT}/test-env"
@@ -84,7 +85,8 @@ deploy_main() {
     # Step 3: 测试环境目录
     # ------------------------------------------------------------------
     step "创建测试环境目录"
-    mkdir -p "$DATA_DIR" "${DATA_DIR}/logs" "$local_cloud_dir" "$test_source_dir" "$test_restore_dir"
+    mkdir -p "$CONFIG_DIR" "$DATA_DIR" "${DATA_DIR}/logs" "$local_cloud_dir" "$test_source_dir" "$test_restore_dir"
+    success "配置目录: ${CONFIG_DIR}"
     success "数据目录: ${DATA_DIR}"
     success "本地云存储: ${local_cloud_dir}"
 
@@ -92,7 +94,7 @@ deploy_main() {
     # Step 4: 主密钥
     # ------------------------------------------------------------------
     step "生成主加密密钥"
-    local master_key="${DATA_DIR}/master.key"
+    local master_key="${CONFIG_DIR}/master.key"
     if [[ ! -f "$master_key" ]]; then
         openssl rand -hex 32 > "$master_key"
         chmod 600 "$master_key"
@@ -123,7 +125,7 @@ deploy_main() {
         [[ -z "$(awk '/^  access_key_id:/{gsub(/[" ]/,"",$2);print $2}' "$CONFIG_FILE")" ]]     && miss+=("access_key_id")
         [[ -z "$(awk '/^  access_key_secret:/{gsub(/[" ]/,"",$2);print $2}' "$CONFIG_FILE")" ]] && miss+=("access_key_secret")
         if [[ ${#miss[@]} -gt 0 ]]; then
-            fail "config.yaml 的 oss 段缺少配置: ${miss[*]}。请先在 nas-backup-backend/config.yaml 填写真实 OSS 配置后重试。"
+            fail "config.yaml 的 oss 段缺少配置: ${miss[*]}。请先在 nas-backup-backend/config/config.yaml 填写真实 OSS 配置后重试。"
         fi
     else
         info "配置本地文件系统 remote（离线测试模式，--local）..."
@@ -206,12 +208,23 @@ EOF
     step "构建 React 前端"
     cd "$FRONTEND_DIR"
 
+    # 依赖是否过期: node_modules 缺失，或 package.json / package-lock.json 比
+    # node_modules/.package-lock.json 新。未变则跳过安装，大幅减少每次部署耗时。
+    # 注意不用 npm ci（会删除整个 node_modules 全量重装 + 全量下载）。
+    local needs_install=false
     if [[ ! -d node_modules ]]; then
-        info "安装 npm 依赖..."
-        npm install
+        needs_install=true
+    elif [[ ! -f node_modules/.package-lock.json ]]; then
+        needs_install=true
+    elif [[ "package.json" -nt node_modules/.package-lock.json ]] || [[ "package-lock.json" -nt node_modules/.package-lock.json ]]; then
+        needs_install=true
+    fi
+
+    if [[ "$needs_install" == "true" ]]; then
+        info "安装/更新 npm 依赖（增量优先本地缓存）..."
+        npm install --prefer-offline
     else
-        info "npm 依赖已存在，运行 npm ci 确保一致性..."
-        npm ci 2>/dev/null || npm install
+        info "npm 依赖已是最新，跳过安装（仅构建）"
     fi
     success "npm 依赖已就绪"
 
@@ -350,14 +363,13 @@ backup:
       - ".pdf"
 
   retention:
-    version_keep_count: 5
     orphan_grace_days: 30
-    full_reset_interval_months: 6
     keep_deleted_days: 30
+    db_bkup_keep_count: 5
 
   encryption:
     algorithm: "AES-256-GCM"
-    key_file_path: "./data/master.key"
+    key_file_path: "./config/master.key"
 
 oss:
   endpoint: ""
@@ -390,7 +402,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}/nas-backup-backend"
 echo "启动 NAS Backup 后端 http://127.0.0.1:8080 ... (Ctrl+C 停止)"
-exec ./nas-backup -config config.yaml
+exec ./nas-backup -config config/config.yaml
 STARTSCRIPT
     chmod +x "${SCRIPT_DIR}/start-backend.sh"
 

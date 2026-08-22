@@ -173,27 +173,6 @@ func TestDefaultConfigFn(t *testing.T) {
 	}
 }
 
-// TestToModelsScheduleConfig 测试调度配置转换
-func TestToModelsScheduleConfig(t *testing.T) {
-	cfg := &AppConfig{
-		Backup: BackupConfig{
-			Schedule: ScheduleConfig{
-				Enabled:  true,
-				CronExpr: "0 */6 * * *",
-				Timezone: "Asia/Shanghai",
-			},
-		},
-	}
-
-	modelsCfg := cfg.ToModelsScheduleConfig()
-	if !modelsCfg.Enabled {
-		t.Error("expected Enabled to be true")
-	}
-	if modelsCfg.CronExpr != "0 */6 * * *" {
-		t.Errorf("expected CronExpr %q, got %q", "0 */6 * * *", modelsCfg.CronExpr)
-	}
-}
-
 // TestToModelsCompressionConfig 测试压缩配置转换
 func TestToModelsCompressionConfig(t *testing.T) {
 	cfg := &AppConfig{

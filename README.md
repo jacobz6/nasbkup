@@ -221,7 +221,7 @@ docker compose exec nas-backup restore-cli -config /app/config.yaml bootstrap
 # 后端
 cd nas-backup-backend
 go mod download
-go run cmd/nas-backup/main.go -config config.yaml
+go run cmd/nas-backup/main.go -config config/config.yaml
 
 # 前端（另一个终端）
 cd nas-backup-frontend

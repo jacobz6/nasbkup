@@ -46,7 +46,7 @@ import (
 )
 
 func main() {
-	configPath := flag.String("config", "config.yaml", "Path to configuration file")
+	configPath := flag.String("config", "./config/config.yaml", "Path to configuration file")
 	backupID := flag.Int64("backup-id", 0, "Target backup session ID (0 = latest completed)")
 	expedited := flag.Bool("expedited", false, "Use expedited thaw for ColdArchive objects")
 	outDir := flag.String("o", "", "Output directory for restore/restore-dir commands")
@@ -141,7 +141,7 @@ Commands:
   restore-dir <dir> -o <outdir> Restore all files under a directory to outdir
 
 Flags:
-  --config       Path to config.yaml (default: config.yaml)
+  --config       Path to config.yaml (default: ./config/config.yaml)
   --backup-id N  Target a specific backup session (default: latest completed)
   --expedited    Use expedited thaw for ColdArchive objects
   -o <dir>       Output directory (for restore/restore-dir)

@@ -31,8 +31,6 @@ func (r *Router) handleBackupTrigger(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 	}
-	_ = triggerReq.Type // accepted for backward compatibility, ignored
-
 	// Check engine readiness AFTER basic validation
 	if !r.engine.Ready() {
 		r.jsonError(w, "engine is still initializing from OSS, please retry", http.StatusServiceUnavailable)

@@ -25,7 +25,8 @@ deploy_main() {
     BACKEND_DIR="${INSTALL_DIR}/nas-backup-backend"
     FRONTEND_DIR="${INSTALL_DIR}/nas-backup-frontend"
     DATA_DIR="${BACKEND_DIR}/data"
-    CONFIG_FILE="${BACKEND_DIR}/config.yaml"
+    CONFIG_DIR="${BACKEND_DIR}/config"
+    CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 
     # ------------------------------------------------------------------
     # Pre-flight
@@ -163,11 +164,11 @@ deploy_main() {
     # Step 5: 数据目录 + 主密钥
     # ------------------------------------------------------------------
     step "设置数据目录"
-    mkdir -p "${DATA_DIR}/logs"
+    mkdir -p "${CONFIG_DIR}" "${DATA_DIR}/logs"
     chmod 700 "${DATA_DIR}"
     success "数据目录: ${DATA_DIR}"
 
-    local master_key="${DATA_DIR}/master.key"
+    local master_key="${CONFIG_DIR}/master.key"
     if [[ ! -f "$master_key" ]]; then
         info "生成主加密密钥..."
         openssl rand -hex 32 > "$master_key"
@@ -225,13 +226,24 @@ deploy_main() {
         export npm_config_registry="https://registry.npmmirror.com"
         info "npm registry: ${npm_config_registry}"
 
+        # 依赖是否过期: node_modules 缺失，或 package.json / package-lock.json 比
+        # node_modules/.package-lock.json 新。未变则跳过安装，大幅减少每次部署耗时。
+        # 不用 npm ci（会删除整个 node_modules 全量重装 + 全量下载）。
+        local needs_install=false
         if [[ ! -d node_modules ]]; then
-            info "安装 npm 依赖..."
-            npm ci --production=false --registry=https://registry.npmmirror.com || \
+            needs_install=true
+        elif [[ ! -f node_modules/.package-lock.json ]]; then
+            needs_install=true
+        elif [[ "package.json" -nt node_modules/.package-lock.json ]] || [[ "package-lock.json" -nt node_modules/.package-lock.json ]]; then
+            needs_install=true
+        fi
+
+        if [[ "$needs_install" == "true" ]]; then
+            info "安装/更新 npm 依赖（增量优先本地缓存）..."
+            npm install --production=false --prefer-offline --registry=https://registry.npmmirror.com || \
             npm install --production=false --registry=https://registry.npmmirror.com
         else
-            info "npm 依赖已存在，运行 npm ci..."
-            npm ci --production=false --registry=https://registry.npmmirror.com || warn "npm ci 失败，继续使用现有 node_modules"
+            info "npm 依赖已是最新，跳过安装（仅构建）"
         fi
         success "npm 依赖已就绪"
 
@@ -294,8 +306,9 @@ deploy_main() {
     step "验证构建"
     success "后端二进制: ${BACKEND_DIR}/nas-backup"
     [[ "$SKIP_FRONTEND" == "false" && -d "${FRONTEND_DIR}/dist" ]] && success "前端构建: ${FRONTEND_DIR}/dist/"
+    success "配置目录: ${CONFIG_DIR}"
     success "数据目录: ${DATA_DIR}"
-    [[ -f "${DATA_DIR}/master.key" ]] && success "主密钥: ${DATA_DIR}/master.key"
+    [[ -f "${CONFIG_DIR}/master.key" ]] && success "主密钥: ${CONFIG_DIR}/master.key"
     success "rclone: ${BACKEND_DIR}/bin/rclone"
 
     if [[ "$is_root" == "true" ]] && systemctl is-active --quiet nas-backup 2>/dev/null; then
@@ -547,8 +560,8 @@ _fix_config_paths() {
     if [[ -n "$key_path" ]] && [[ "$key_path" == /* ]] && [[ ! -f "$key_path" ]]; then
         local line
         line=$(grep -n 'key_file_path:' "$cfg" | head -1 | cut -d: -f1)
-        sed -i "${line}s|.*|  key_file_path: \"./data/master.key\"|" "$cfg"
-        success "已修正 key_file_path 为 ./data/master.key"
+        sed -i "${line}s|.*|  key_file_path: \"./config/master.key\"|" "$cfg"
+        success "已修正 key_file_path 为 ./config/master.key"
     fi
 
     # database path

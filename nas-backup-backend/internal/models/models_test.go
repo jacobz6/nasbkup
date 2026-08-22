@@ -487,17 +487,6 @@ func TestLogListResult(t *testing.T) {
 	}
 }
 
-// TestBackupTriggerRequest 测试 BackupTriggerRequest 结构体
-func TestBackupTriggerRequest(t *testing.T) {
-	req := BackupTriggerRequest{
-		Type: "full",
-	}
-
-	if req.Type != "full" {
-		t.Errorf("expected Type %q, got %q", "full", req.Type)
-	}
-}
-
 // TestRestoreRequest 测试 RestoreRequest 结构体
 func TestRestoreRequest(t *testing.T) {
 	backupID := int64(42)

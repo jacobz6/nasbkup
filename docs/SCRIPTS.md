@@ -37,7 +37,7 @@
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `DATA_DIR` | `/app/data` | 数据目录 |
-| `KEY_FILE` | `${DATA_DIR}/master.key` | 加密密钥路径 |
+| `KEY_FILE` | `${DATA_DIR}/config/master.key` | 加密密钥路径 |
 | `RCLONE_CONF` | `${DATA_DIR}/rclone.conf` | rclone 配置路径 |
 | `CONFIG_FILE` | `/app/config.yaml` | 应用配置路径 |
 
@@ -47,14 +47,13 @@
 
 ### `nas-backup-backend/scripts/setup-rclone.sh`
 
-交互式 rclone 配置脚本，自动配置 OSS 和 crypt 远程存储。
+交互式 rclone 配置脚本，自动配置单个原生 OSS（S3 兼容）远程存储。
 
 **位置**：`nas-backup-backend/scripts/setup-rclone.sh`
 
 **功能**：
 - 引导用户输入 OSS Endpoint、Bucket、AccessKey ID/Secret
-- 自动生成 rclone crypt 加密密码
-- 自动生成完整的 `rclone.conf` 配置文件
+- 自动生成完整的 `rclone.conf` 配置文件（仅含 `[oss]` 原生远程，无 crypt 层；内容加密由应用层 `master.key` 负责）
 - 设置正确的文件权限（600）
 
 **使用方法**：
@@ -80,7 +79,7 @@ chmod +x scripts/setup-rclone.sh
 
 ### `nas-backup-backend/scripts/backup.sh`
 
-CLI 手动触发备份脚本，优先通过 API 触发，服务未运行时尝试直连二进制。
+CLI 手动触发备份脚本，通过运行中的后端 HTTP API 触发备份。
 
 **位置**：`nas-backup-backend/scripts/backup.sh`
 
@@ -90,17 +89,14 @@ CLI 手动触发备份脚本，优先通过 API 触发，服务未运行时尝�
 cd nas-backup-backend
 chmod +x scripts/backup.sh
 
-# 默认触发 auto 模式备份
+# 触发一次备份（每次都是独立会话，无全量/增量之分）
 ./scripts/backup.sh
 
-# 指定备份类型
-./scripts/backup.sh full        # 全量备份
-./scripts/backup.sh incremental # 增量备份
-./scripts/backup.sh auto        # 智能模式（自动判断）
-
-# 指定配置文件
-./scripts/backup.sh auto -c /path/to/config.yaml
+# 指定配置文件（仅用于提示）
+./scripts/backup.sh --config /path/to/config.yaml
 ```
+
+> 前提：后端服务需已运行在 `localhost:8080`。
 
 ---
 

@@ -553,7 +553,7 @@ def run_tests():
         enc_working = True  # Don't fail the whole test for this
         warn(f"Encryption check error (non-critical): {e}")
 
-    report.record("Client-side encryption (rclone crypt)", not plaintext_leak,
+    report.record("Client-side encryption (app-layer AES-256-GCM)", not plaintext_leak,
                   "Encrypted blobs do not contain plaintext content" if not plaintext_leak else "WARNING: Plaintext detected!")
 
     # Empty file
@@ -766,7 +766,7 @@ def generate_html_report(result):
                     <p><strong>End-to-End Workflow Verified:</strong></p>
                     <ul>
                         <li><strong>Local → Cloud Backup:</strong> Files are compressed, encrypted, and uploaded to Alibaba Cloud OSS Archive storage successfully</li>
-                        <li><strong>Client-Side Encryption:</strong> rclone crypt ensures all data is encrypted before leaving the local machine (AES encryption)</li>
+                        <li><strong>Client-Side Encryption:</strong> application-layer AES-256-GCM encrypts all data with master.key before upload</li>
                         <li><strong>Compression:</strong> zstd compression reduces storage size for compressible files</li>
                         <li><strong>Archive Thaw:</strong> Restore automatically initiates Expedited thaw and waits for completion</li>
                         <li><strong>Cloud → Local Restore:</strong> Files are downloaded, decrypted, decompressed, and verified</li>

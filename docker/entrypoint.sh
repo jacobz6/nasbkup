@@ -12,7 +12,7 @@ set -eu
 
 DATA_DIR="${DATA_DIR:-/app/data}"
 LOG_DIR="${DATA_DIR}/logs"
-KEY_FILE="${KEY_FILE:-${DATA_DIR}/master.key}"
+KEY_FILE="${KEY_FILE:-${DATA_DIR}/config/master.key}"
 RCLONE_CONF="${RCLONE_CONF:-${DATA_DIR}/rclone.conf}"
 NAS_BACKUP_BIN="/usr/local/bin/nas-backup"
 CONFIG_FILE="${CONFIG_FILE:-/app/config.yaml}"
@@ -28,7 +28,7 @@ err()  { printf "\033[1;31m[entrypoint]\033[0m %s\n" "$*" >&2; }
 # 1. 初始化数据目录
 # -----------------------------------------------------------------------------
 log "数据目录: ${DATA_DIR}"
-mkdir -p "${DATA_DIR}" "${LOG_DIR}"
+mkdir -p "${DATA_DIR}" "${DATA_DIR}/config" "${LOG_DIR}"
 
 # -----------------------------------------------------------------------------
 # 2. 首次启动生成主密钥 (32 字节随机，base64 编码)

@@ -1,37 +1,31 @@
 #!/bin/bash
-# backup.sh — Manual backup wrapper script
-# Usage: ./backup.sh [--full|--incremental] [--config CONFIG_PATH]
+# backup.sh — Manual backup trigger wrapper
+# Usage: ./backup.sh [--config CONFIG_PATH]
 #
-# This script provides a convenient CLI for triggering backups
-# without the HTTP API.
+# Every backup is a standalone session (no full/incremental distinction),
+# so this simply triggers a backup through the running backend HTTP API.
+#
+# Prerequisite: the backend service must be running on localhost:8080.
 
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# Defaults
+# Defaults & arg parsing
 # ---------------------------------------------------------------------------
-BACKUP_TYPE="incremental"
 CONFIG_PATH=""
-NAS_BACKUP_BIN=""
+API_URL="http://localhost:8080/api/backup/trigger"
+STATUS_URL="http://localhost:8080/api/backup/status"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# ---------------------------------------------------------------------------
-# Parse arguments
-# ---------------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --full)         BACKUP_TYPE="full";        shift ;;
-        --incremental)  BACKUP_TYPE="incremental"; shift ;;
-        --config)       CONFIG_PATH="$2";          shift 2 ;;
+        --config)       CONFIG_PATH="$2"; shift 2 ;;
         -h|--help)
-            echo "Usage: $0 [--full|--incremental] [--config CONFIG_PATH]"
+            echo "Usage: $0 [--config CONFIG_PATH]"
             echo ""
             echo "Options:"
-            echo "  --full          Run a full backup (default: incremental)"
-            echo "  --incremental   Run an incremental backup"
-            echo "  --config PATH   Path to config.yaml"
+            echo "  --config PATH   Path to config.yaml (informational only)"
             exit 0 ;;
         *)
             echo "Unknown option: $1" >&2
@@ -39,68 +33,27 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Default config path
 if [[ -z "$CONFIG_PATH" ]]; then
-    CONFIG_PATH="${PROJECT_DIR}/config.yaml"
+    CONFIG_PATH="${PROJECT_DIR}/config/config.yaml"
 fi
-
-# ---------------------------------------------------------------------------
-# Find nas-backup binary
-# ---------------------------------------------------------------------------
-if [[ -z "$NAS_BACKUP_BIN" ]]; then
-    # Check common locations
-    candidates=(
-        "${PROJECT_DIR}/nas-backup"
-        "${PROJECT_DIR}/bin/nas-backup"
-        "$(command -v nas-backup 2>/dev/null || true)"
-    )
-    for candidate in "${candidates[@]}"; do
-        if [[ -x "$candidate" ]]; then
-            NAS_BACKUP_BIN="$candidate"
-            break
-        fi
-    done
-fi
-
-if [[ -z "$NAS_BACKUP_BIN" ]]; then
-    echo "ERROR: nas-backup binary not found." >&2
-    echo "Build it first: cd ${PROJECT_DIR} && go build -o nas-backup ./cmd/nas-backup" >&2
-    exit 1
-fi
+echo "  Config: ${CONFIG_PATH}"
 
 # ---------------------------------------------------------------------------
 # Trigger backup via API
 # ---------------------------------------------------------------------------
-# If the server is running, use the API
-API_URL="http://localhost:8080/api/backup/trigger"
-
-echo "Triggering ${BACKUP_TYPE} backup..."
-echo "  Config: ${CONFIG_PATH}"
-
-# Try API first (if server is running)
-if curl -sf --max-time 5 "http://localhost:8080/api/backup/status" >/dev/null 2>&1; then
-    echo "  Server is running, triggering via API..."
-    
-    RESPONSE=$(curl -sf -X POST "$API_URL" \
-        -H "Content-Type: application/json" \
-        -d "{\"type\": \"${BACKUP_TYPE}\"}" 2>&1) || {
-        echo "ERROR: Failed to trigger backup via API" >&2
-        echo "  $RESPONSE" >&2
-        exit 1
-    }
-    
-    echo "✓ Backup triggered successfully"
-    echo "  Response: $RESPONSE"
-else
-    echo "  Server is not running. Starting backup directly..."
-    
-    # Run the binary directly with a one-shot command
-    # This requires the binary to support a --backup flag
-    cd "${PROJECT_DIR}"
-    "$NAS_BACKUP_BIN" --config "$CONFIG_PATH" --backup "$BACKUP_TYPE" 2>&1 || {
-        echo "ERROR: Backup failed" >&2
-        exit 1
-    }
-    
-    echo "✓ Backup completed"
+if ! curl -sf --max-time 5 "$STATUS_URL" >/dev/null 2>&1; then
+    echo "ERROR: Backend server is not reachable at ${STATUS_URL}" >&2
+    echo "Start the backend first: ${PROJECT_DIR}/nas-backup -config ${CONFIG_PATH}" >&2
+    exit 1
 fi
+
+RESPONSE=$(curl -sf -X POST "$API_URL" \
+    -H "Content-Type: application/json" \
+    -d '{}' 2>&1) || {
+    echo "ERROR: Failed to trigger backup via API" >&2
+    echo "  $RESPONSE" >&2
+    exit 1
+}
+
+echo "✓ Backup triggered successfully"
+echo "  Response: $RESPONSE"

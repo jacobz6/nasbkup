@@ -86,7 +86,7 @@ fi
 BACKEND_DIR="${INSTALL_DIR}/nas-backup-backend"
 FRONTEND_DIR="${INSTALL_DIR}/nas-backup-frontend"
 DATA_DIR="${BACKEND_DIR}/data"
-CONFIG_FILE="${BACKEND_DIR}/config.yaml"
+CONFIG_FILE="${BACKEND_DIR}/config/config.yaml"
 BACKEND_BIN="${BACKEND_DIR}/nas-backup"
 RESTORE_CLI_BIN="${BACKEND_DIR}/restore-cli"
 BACKUP_DIR="${DATA_DIR}/rollback-backups/$(date +%Y%m%d_%H%M%S)"

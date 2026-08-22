@@ -60,7 +60,7 @@ nas-backup-frontend/node_modules/
 # ---- 后端构建产物 (Dockerfile 中独立编译) ----
 nas-backup-backend/nas-backup
 nas-backup-backend/data/
-nas-backup-backend/config.yaml
+nas-backup-backend/config/
 
 # ---- 测试脚本 / 临时数据 ----
 scripts/nas_file_generator.py

@@ -64,7 +64,7 @@ volumes:
 |------|--------|------|
 | `TZ` | `Asia/Shanghai` | 时区 |
 | `DATA_DIR` | `/app/data` | 数据目录 |
-| `KEY_FILE` | `/app/data/master.key` | 加密密钥文件路径 |
+| `KEY_FILE` | `/app/data/config/master.key` | 加密密钥文件路径 |
 | `RCLONE_CONF` | `/app/data/rclone.conf` | rclone 配置文件路径 |
 | `CONFIG_FILE` | `/app/config.yaml` | 应用配置文件路径 |
 
@@ -83,8 +83,9 @@ cpus: "2.0"            # CPU 核心数上限 2
 ```
 ./data/
 ├── nas-backup.db          # SQLite 数据库（元数据）
-├── master.key             # AES-256 加密主密钥（极其重要！）
 ├── rclone.conf            # rclone OSS 配置
+├── config/
+│   └── master.key         # AES-256 加密主密钥（极其重要！）
 └── logs/
     ├── nas-backup.log
     └── nas-backup-stdout.log
@@ -196,7 +197,7 @@ backup:
     timezone: "Asia/Shanghai"
   encryption:
     algorithm: "AES-256-GCM"
-    key_file_path: "/opt/nas-backup/nas-backup-backend/data/master.key"
+    key_file_path: "/opt/nas-backup/nas-backup-backend/config/master.key"
 
 oss:
   endpoint: "oss-cn-hangzhou.aliyuncs.com"
@@ -209,7 +210,7 @@ oss:
 rclone:
   binary_path: "/usr/bin/rclone"
   config_path: "/opt/nas-backup/nas-backup-backend/data/rclone.conf"
-  remote_name: "oss-crypt"
+  remote_name: "oss"
 
 logging:
   level: "info"
@@ -481,8 +482,8 @@ sudo systemctl start nas-backup-test
 ### 密钥生成（首次部署必做）
 
 ```bash
-openssl rand -base64 32 > ./data/master.key
-chmod 600 ./data/master.key
+openssl rand -base64 32 > ./config/master.key
+chmod 600 ./config/master.key
 ```
 
 > ⚠️ **`master.key` 和 `rclone.conf` 是恢复数据的唯一凭证，必须异地备份！**
@@ -518,16 +519,9 @@ access_key_id = YOUR_ACCESS_KEY_ID
 secret_access_key = YOUR_ACCESS_KEY_SECRET
 endpoint = oss-cn-hangzhou.aliyuncs.com
 acl = private
-
-[oss-crypt]
-type = crypt
-remote = oss:your-bucket-name/nas-backup
-filename_encryption = standard
-directory_name_encryption = true
-password = YOUR_RCLONE_CRYPT_PASSWORD
 ```
 
-> `password` 可通过 `rclone obscure your-password` 生成。
+> 仅需单个原生 `[oss]` 远程，无 crypt 层；内容加/解密由应用层 `master.key` 负责。
 
 ### OSS 配置（Docker 环境首次启动后）
 
@@ -608,7 +602,7 @@ sudo systemctl stop / start / restart nas-backup
 简要步骤：
 
 1. 在新环境部署（方式 A 或 B）
-2. 将备份的 `master.key` 和 `rclone.conf` 放到 `./data/` 目录
+2. 将备份的 `master.key` 放到 `config/` 目录、`rclone.conf` 放到 `./data/` 目录
 3. 启动服务
 4. 使用 `restore-cli` 从 OSS 引导恢复数据库：
 
@@ -618,7 +612,7 @@ docker compose exec nas-backup restore-cli -config /app/config.yaml bootstrap
 
 # 裸机
 cd /opt/nas-backup/nas-backup-backend
-./restore-cli -config config.yaml bootstrap
+./restore-cli -config config/config.yaml bootstrap
 ```
 
 5. 通过 Web UI 或 CLI 恢复文件
@@ -634,7 +628,7 @@ cd /opt/nas-backup/nas-backup-backend
 | 无法访问 Web UI | 检查端口映射/防火墙；`docker compose ps` / `systemctl status nas-backup` |
 | API 返回 502 | 等待后端启动（首次 10-30 秒）；检查后端是否运行 |
 | 前端白屏 | 检查 `dist/` 是否存在；`nginx -t` 验证配置 |
-| 备份失败 | 检查 rclone 配置和 OSS 凭证；`rclone lsd oss-crypt:` 测试连通性 |
+| 备份失败 | 检查 rclone 配置和 OSS 凭证；`rclone lsd oss:` 测试连通性 |
 | 权限错误无法读取 NAS 目录 | 检查宿主机目录权限；NFS/SMB 挂载需允许 Docker/systemd 访问 |
 | 数据库被锁定 | 确保只有一个实例运行；检查 `./data/` 目录权限 |
 | 局域网无法访问 | 确认服务器 IP；检查 Nginx 监听端口；NAS 防火墙放行 |

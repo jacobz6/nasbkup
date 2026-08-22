@@ -45,8 +45,3 @@ export function formatDuration(ms: number): string {
   const remainSeconds = seconds % 60;
   return `${minutes}m ${remainSeconds}s`;
 }
-
-export function formatPercent(value: number, total: number): string {
-  if (total === 0) return '0%';
-  return `${((value / total) * 100).toFixed(1)}%`;
-}

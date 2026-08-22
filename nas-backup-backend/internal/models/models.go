@@ -294,11 +294,8 @@ type LogListResult struct {
 // --- Backup trigger ---
 
 // BackupTriggerRequest is the API request body to manually trigger a backup.
-// The legacy "type" field is ignored: every backup is now a standalone
-// session (no full/incremental distinction).
-type BackupTriggerRequest struct {
-	Type string `json:"type,omitempty"` // accepted for backward compatibility, ignored
-}
+// Every backup is a standalone session (no full/incremental distinction).
+type BackupTriggerRequest struct{}
 
 // --- Restore ---
 
@@ -484,22 +481,3 @@ type RestoreProgressEvent struct {
 // during a restore. It enables the RestoreJobManager to relay per-file progress
 // to the SSE broker without coupling the two components directly.
 type FileProgressCallback func(filePath string, fileSize int64, restored bool, err error)
-
-// RestorableFile represents a file that can be restored, enriched with its
-// backup metadata (storage key, compression type, backup count, etc.).
-// Used by GET /api/restore/files to let the frontend browse what is available.
-type RestorableFile struct {
-	ID             int64     `json:"id"`
-	Path           string    `json:"path"`
-	Size           int64     `json:"size"`
-	ModTime        time.Time `json:"mod_time"`
-	Hash           string    `json:"hash,omitempty"`
-	Status         string    `json:"status"`
-	BackupCount    int       `json:"backup_count"`
-	LatestBackupID int64     `json:"latest_backup_id"`
-	LatestBackupAt time.Time `json:"latest_backup_at"`
-	StorageKey     string    `json:"storage_key,omitempty"`
-	CompressType   string    `json:"compress_type,omitempty"`
-	OriginalSize   int64     `json:"original_size"`
-	StoredSize     int64     `json:"stored_size"`
-}

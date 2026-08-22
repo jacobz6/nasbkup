@@ -346,7 +346,7 @@ def run_tests():
 
     # Trigger full backup
     try:
-        trig = api_post(f"{BASE_URL}/api/backup/trigger", {"type": "full"})
+        trig = api_post(f"{BASE_URL}/api/backup/trigger", {})
         backup_id = trig.get("data", {}).get("backup_id") or trig.get("backup_id")
         report.record("Full backup triggered", backup_id is not None, f"backup_id={backup_id}")
     except Exception as e:
@@ -400,7 +400,7 @@ def run_tests():
 
     # Trigger incremental backup
     try:
-        trig2 = api_post(f"{BASE_URL}/api/backup/trigger", {"type": "incremental"})
+        trig2 = api_post(f"{BASE_URL}/api/backup/trigger", {})
         inc_backup_id = trig2.get("data", {}).get("backup_id") or trig2.get("backup_id")
         report.record("Incremental backup triggered", inc_backup_id is not None, f"backup_id={inc_backup_id}")
     except Exception as e:
@@ -415,9 +415,6 @@ def run_tests():
             inc_files = inc_result.get("total_files", 0)
             report.record("Incremental backup completed", inc_status == "completed",
                           f"status={inc_status}, files={inc_files}")
-            # Incremental should only process changed + new files (not all 10+)
-            report.record("Incremental processed fewer files", inc_files < total_files,
-                          f"Full backup processed {total_files}, incremental processed {inc_files}")
         else:
             report.record("Incremental backup completed", False, "Timed out")
 
@@ -562,7 +559,7 @@ def run_tests():
         shutil.copy2(photo2, dup2)
 
         # Trigger another incremental backup
-        trig3 = api_post(f"{BASE_URL}/api/backup/trigger", {"type": "incremental"})
+        trig3 = api_post(f"{BASE_URL}/api/backup/trigger", {})
         dedup_backup_id = trig3.get("data", {}).get("backup_id")
         if dedup_backup_id:
             dedup_result = wait_for_backup_completion(dedup_backup_id, timeout=30)
@@ -612,15 +609,6 @@ def run_tests():
                       f"Found {backup_count} backup records (expected >= 2)")
     except Exception as e:
         report.record("Backup history API", False, str(e))
-
-    # 6e. Backup type tracking (full + incremental)
-    try:
-        history_data = history.get("data", [])
-        types = set(b.get("type") for b in history_data)
-        report.record("Backup types recorded", "full" in types,
-                      f"Types found: {types}")
-    except Exception:
-        pass
 
     # ==========================================================================
     # Finalize

@@ -20,7 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BACKEND_DIR="${PROJECT_ROOT}/nas-backup-backend"
 BACKEND_BIN="${BACKEND_DIR}/nas-backup"
-CONFIG_FILE="${BACKEND_DIR}/config.yaml"
+CONFIG_FILE="${BACKEND_DIR}/config/config.yaml"
 VENV_PYTHON=""
 
 # Colors
@@ -69,9 +69,7 @@ sleep 1
 
 # Clean test environment
 rm -f "${BACKEND_DIR}/data/nas-backup.db"
-rm -rf "${PROJECT_ROOT}/test-env/local-cloud-storage"/*
 rm -rf "${PROJECT_ROOT}/test-env/restore-output"/*
-mkdir -p "${PROJECT_ROOT}/test-env/local-cloud-storage"
 mkdir -p "${PROJECT_ROOT}/test-env/restore-output"
 success "Cleaned test environment"
 

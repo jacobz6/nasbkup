@@ -203,7 +203,7 @@ func DefaultConfig() *AppConfig {
 			},
 			Encryption: EncryptionConfig{
 				Algorithm:   "AES-256-GCM",
-				KeyFilePath: "./data/master.key",
+				KeyFilePath: "./config/master.key",
 			},
 		},
 		OSS: OSSConfig{
@@ -338,15 +338,6 @@ func (c *AppConfig) TempDir() string {
 		return c.Backup.TempDir
 	}
 	return os.TempDir()
-}
-
-// ToModelsScheduleConfig converts the config-layer type to the models-layer type.
-func (c *AppConfig) ToModelsScheduleConfig() models.ScheduleConfig {
-	return models.ScheduleConfig{
-		Enabled:  c.Backup.Schedule.Enabled,
-		CronExpr: c.Backup.Schedule.CronExpr,
-		Timezone: c.Backup.Schedule.Timezone,
-	}
 }
 
 // ToModelsCompressionConfig converts the config-layer type to the models-layer type.

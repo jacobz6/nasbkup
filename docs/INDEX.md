@@ -40,9 +40,10 @@ nasbkup_system/
 │   ├── cmd/
 │   │   ├── nas-backup/          # HTTP 服务入口
 │   │   └── restore-cli/         # CLI 恢复工具
+│   ├── config/                  # 配置与密钥（config.yaml / config.yaml.example / master.key）
 │   ├── internal/                # 内部包（api/backup/scanner/dedup 等）
 │   ├── scripts/                 # 后端辅助脚本
-│   └── data/                    # 运行时数据（DB/密钥/日志）
+│   └── data/                    # 运行时数据（rclone.conf / nas-backup.db）
 ├── nas-backup-frontend/         # React 前端
 │   ├── src/
 │   │   ├── pages/               # 页面组件
@@ -72,7 +73,6 @@ nasbkup_system/
 ## 💡 核心功能一览
 
 - **内容寻址去重**：SHA-256 哈希全局去重，相同内容只存一份
-- **三种备份模式**：全量(full)、增量(incremental)、智能(auto)
 - **端到端加密**：AES-256-GCM + HKDF 每文件密钥派生
 - **zstd 压缩**：最高级别压缩，智能跳过已压缩文件
 - **冷归档支持**：OSS ColdArchive 存储类，标准/加急解冻
@@ -80,9 +80,9 @@ nasbkup_system/
 - **SSE 实时进度**：Server-Sent Events 推送备份/恢复实时进度
 - **数据一致性对账**：三层校验（OSS ↔ hash_index ↔ backup_files）
 - **崩溃恢复**：启动自动清理残留状态，全量备份重建映射
-- **灾难恢复**：每次备份后自动加密上传 DB 到 OSS，支持 bootstrap 重建
+- **灾难恢复**：每次备份后自动加密上传 DB 到 OSS，启动时自动从 OSS 拉取初始化
 - **Web UI 恢复**：异步恢复任务 + SSE 进度 + 历史记录 + 冲突策略
-- **CLI 恢复工具**：restore-cli 独立二进制，支持 verify/restore/bootstrap
+- **CLI 恢复工具**：restore-cli 独立二进制，支持 verify/restore
 
 ---
 

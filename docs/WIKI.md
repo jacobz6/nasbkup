@@ -126,7 +126,7 @@ nasbkup_system/
 │   ├── scripts/                 # 辅助脚本
 │   │   ├── setup-rclone.sh      # rclone 交互式配置
 │   │   └── backup.sh            # CLI 手动触发备份
-│   ├── config.yaml.example      # 配置文件示例
+│   ├── config/                 # 配置与密钥（config.yaml / config.yaml.example / master.key）
 │   ├── go.mod / go.sum
 │   └── README.md
 ├── nas-backup-frontend/         # React 前端
@@ -283,7 +283,6 @@ AppConfig
 | `Load` | `(path string) (*AppConfig, error)` | 从 YAML 文件加载配置，文件不存在则返回默认配置 |
 | `Validate` | `(c *AppConfig) error` | 验证配置一致性和正确性 |
 | `EnsureDataDirs` | `(c *AppConfig) error` | 创建所有必要数据目录 |
-| `ToModelsScheduleConfig` | `(c *AppConfig) models.ScheduleConfig` | 转换为 models 层调度配置 |
 | `ToModelsCompressionConfig` | `(c *AppConfig) models.CompressionConfig` | 转换为 models 层压缩配置 |
 | `ToModelsRetentionConfig` | `(c *AppConfig) models.RetentionConfig` | 转换为 models 层保留配置 |
 | `ToModelsUploadConfig` | `(c *AppConfig) models.UploadConfig` | 转换为 models 层上传配置 |
@@ -381,7 +380,6 @@ AppConfig
 | `RestoreJobStatus` | `pending` / `running` / `completed` / `failed` / `cancelled` | 恢复任务状态 |
 | `RestoreJobRecord` | ID, Status, Paths, Pattern, BackupID, OutputDir, Expedited, ConflictStrategy, TotalFiles, RestoredFiles, FailedFiles, TotalSize, RestoredSize, ElapsedMs, ErrorMessage, CreatedAt, StartedAt, CompletedAt | 恢复任务记录（异步执行） |
 | `RestoreCreateResponse` | JobID, Status, TotalFiles, TotalSize | 创建恢复任务响应 |
-| `RestorableFile` | ID, Path, Size, ModTime, Hash, Status, BackupCount, LatestBackupID, LatestBackupAt, StorageKey, CompressType, OriginalSize, StoredSize | 可恢复文件信息 |
 | `RestorePhase` | `preparing` / `thawing` / `downloading` / `decrypting` / `decompressing` / `verifying` / `moving` / `completed` / `failed` / `cancelled` | 恢复阶段 |
 | `RestoreProgressEvent` | Type, JobID, Phase, PhaseName, Current, Total, Percent, Message, Detail, Level, FilePath, FileSize, RestoredSize, TotalSize, Timestamp | SSE 恢复进度事件 |
 | `FSEntry` | Name, Path, IsDir, Size, ModTime, InBackup, PartialBackup, HasUpdate, WillBackup | 文件系统条目（PartialBackup 表示目录部分纳入备份） |
@@ -1189,7 +1187,7 @@ API_BASE = `/api`（开发环境代理到后端）
 |------|------|-------------|
 | `dashboardApi` | `getStats()` | GET /dashboard/stats |
 | | `getHistory(page, size)` | GET /dashboard/history |
-| `backupApi` | `trigger(type)` | POST /backup/trigger（type 支持 full/incremental/auto） |
+| `backupApi` | `trigger()` | POST /backup/trigger（每次独立会话，无全量/增量之分） |
 | | `cancel(backupId?)` | POST /backup/cancel |
 | | `getStatus()` | GET /backup/status |
 | | `getProgressStreamUrl()` | 返回 SSE 端点 URL `/api/backup/progress/stream` |
@@ -1486,21 +1484,19 @@ SSE 实时进度订阅 Hook：
 | 列 | 类型 | 约束 | 说明 |
 |----|------|------|------|
 | id | INTEGER | PK AUTOINCREMENT | 主键 |
-| type | TEXT | NOT NULL CHECK(full/incremental/auto) | 备份类型（auto 由系统判断） |
-| status | TEXT | NOT NULL DEFAULT 'pending' CHECK(pending/running/completed/failed/cancelled) | 状态 |
-| base_backup_id | INTEGER | | 基础全量备份 ID |
+| status | TEXT | NOT NULL DEFAULT 'pending' CHECK(pending/running/completed/completed_with_errors/failed/cancelled) | 状态 |
 | total_files | INTEGER | NOT NULL DEFAULT 0 | 总文件数 |
 | total_size | INTEGER | NOT NULL DEFAULT 0 | 总大小 |
 | uploaded_size | INTEGER | NOT NULL DEFAULT 0 | 上传大小 |
 | skipped_dedup | INTEGER | NOT NULL DEFAULT 0 | 去重跳过数 |
-| skipped_inc | INTEGER | NOT NULL DEFAULT 0 | 增量跳过数 |
+| failed_files | INTEGER | NOT NULL DEFAULT 0 | 失败文件数 |
 | compress_saved | INTEGER | NOT NULL DEFAULT 0 | 压缩节省 |
 | started_at | TEXT | | 开始时间 |
 | completed_at | TEXT | | 完成时间 |
 | error_message | TEXT | NOT NULL DEFAULT '' | 错误信息 |
 | created_at | TEXT | NOT NULL DEFAULT datetime | 创建时间 |
 
-索引: `idx_backups_status`, `idx_backups_type`, `idx_backups_created`
+索引: `idx_backups_status`, `idx_backups_created`
 
 #### backup_files — 备份-文件关联
 
@@ -1910,8 +1906,8 @@ logger → (标准库)
 cd nas-backup-backend
 go build -o nas-backup ./cmd/nas-backup
 
-# 准备配置
-cp config.yaml.example config.yaml
+# 准备配置（配置与密钥位于 config/ 目录）
+cp config/config.yaml.example config/config.yaml
 # 编辑 config.yaml，配置 OSS 凭证、备份目录等
 
 # 安装依赖工具
@@ -1919,7 +1915,7 @@ cp config.yaml.example config.yaml
 # rclone: brew install rclone / apt install rclone
 
 # 运行
-./nas-backup -config config.yaml
+./nas-backup -config config/config.yaml
 ```
 
 默认监听 `0.0.0.0:8080`。
@@ -1960,19 +1956,18 @@ npm run preview  # 预览构建结果
 
 **文件**: `nas-backup-backend/scripts/backup.sh`
 
-CLI 触发备份的便捷脚本，支持：
-- `./backup.sh full` — 全量备份
-- `./backup.sh incremental` — 增量备份
-- `./backup.sh -c /path/to/config` — 指定配置文件
+CLI 通过运行中的后端 HTTP API 触发备份的便捷脚本（每次都是独立会话，无全量/增量之分）：
+- `./backup.sh` — 触发一次备份
+- `./backup.sh --config /path/to/config` — 指定配置文件（仅提示用）
 
 ### setup-rclone.sh
 
 **文件**: `nas-backup-backend/scripts/setup-rclone.sh`
 
 配置 rclone 远程存储：
-- 创建原始 OSS 远程 `[oss]`
-- 创建加密远程 `[oss-crypt]`
+- 创建单个原生 OSS 远程 `[oss]`（无 crypt 层）
 - 交互式输入 OSS 凭证
+- 内容加/解密由应用层 `master.key` 负责
 
 ### nas_file_generator.py
 
@@ -1989,7 +1984,7 @@ CLI 触发备份的便捷脚本，支持：
 ## 附录：关键设计决策
 
 1. **SQLite 而非 PostgreSQL**：单机部署场景，零依赖，WAL 模式提供足够并发
-2. **rclone 而非纯 SDK 上传**：利用 rclone 的成熟传输逻辑（断点续传、加密远程、多线程）
+2. **rclone 而非纯 SDK 上传**：利用 rclone 的成熟传输逻辑（断点续传、多线程）
 3. **内容寻址存储**：存储键基于内容哈希，天然支持去重
 4. **HKDF 密钥派生**：每文件独立 DEK，salt 随机生成，前向安全性
 5. **流式加密**：256KB 分块，避免大文件占用过多内存
@@ -2065,7 +2060,7 @@ go build -o restore-cli ./cmd/restore-cli
 **步骤 1：确认可用备份**
 
 ```bash
-./restore-cli -config config.yaml backups
+./restore-cli -config config/config.yaml backups
 ```
 输出示例：
 ```
@@ -2079,24 +2074,24 @@ ID     TYPE         STATUS       FILES      SIZE         COMPLETED_AT
 
 ```bash
 # 列出备份 #5 中 /data/docs 下的文件
-./restore-cli -config config.yaml --backup-id 5 list /data/docs
+./restore-cli -config config/config.yaml --backup-id 5 list /data/docs
 
 # 列出备份 #5 中的所有可恢复文件
-./restore-cli -config config.yaml --backup-id 5 list
+./restore-cli -config config/config.yaml --backup-id 5 list
 ```
 > 注意：`--backup-id` 真正生效，只返回该备份会话内的文件（通过 `backup_files` JOIN `files` 查询）。
 
 **步骤 3：查看文件备份元数据**
 
 ```bash
-./restore-cli -config config.yaml info /data/docs/report.pdf
+./restore-cli -config config/config.yaml info /data/docs/report.pdf
 ```
 输出包含 `Lossless: true/false`（原始大小是否等于备份记录 OriginalSize）和 `StorageRatio`（存储压缩比）。
 
 **步骤 4：单文件闭环验证（关键）**
 
 ```bash
-./restore-cli -config config.yaml --backup-id 5 verify /data/docs/report.pdf
+./restore-cli -config config/config.yaml --backup-id 5 verify /data/docs/report.pdf
 ```
 执行完整闭环：下载 → AES-256-GCM 解密 → zstd 解压 → SHA-256 哈希校验。文件落在临时目录，命令结束自动清理。
 
@@ -2112,10 +2107,10 @@ Verifying "/data/docs/report.pdf" ...
 
 ```bash
 # 抽样 20 个文件
-./restore-cli -config config.yaml --backup-id 5 verify-dir /data/docs --limit 20
+./restore-cli -config config/config.yaml --backup-id 5 verify-dir /data/docs --limit 20
 
 # 全量验证
-./restore-cli -config config.yaml --backup-id 5 verify-dir /data/docs --limit 0
+./restore-cli -config config/config.yaml --backup-id 5 verify-dir /data/docs --limit 0
 ```
 查看 `Verify Summary`，`Failed: 0` 表示闭环完整。
 
@@ -2124,7 +2119,7 @@ Verifying "/data/docs/report.pdf" ...
 **单文件恢复**
 
 ```bash
-./restore-cli -config config.yaml --backup-id 5 \
+./restore-cli -config config/config.yaml --backup-id 5 \
   restore /data/docs/report.pdf -o /restore
 ```
 结果路径：`/restore/docs/report.pdf`（保留父目录名，剥离祖父目录）。
@@ -2132,7 +2127,7 @@ Verifying "/data/docs/report.pdf" ...
 **目录恢复**
 
 ```bash
-./restore-cli -config config.yaml --backup-id 5 \
+./restore-cli -config config/config.yaml --backup-id 5 \
   restore-dir /data/docs -o /restore
 ```
 结果：目录结构按公共前缀保留在 `/restore` 下。例：`/data/docs/a.txt` 和 `/data/docs/sub/b.txt` 恢复为 `/restore/docs/a.txt` 和 `/restore/docs/sub/b.txt`。
@@ -2140,7 +2135,7 @@ Verifying "/data/docs/report.pdf" ...
 **全备份恢复**
 
 ```bash
-./restore-cli -config config.yaml --backup-id 5 \
+./restore-cli -config config/config.yaml --backup-id 5 \
   restore-dir / -o /restore
 ```
 
