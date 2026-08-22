@@ -152,8 +152,10 @@ func (s *DBBackupService) PullOSSDB(ctx context.Context) (bool, error) {
 		_ = os.Remove(s.dbPath + suffix)
 	}
 
-	// Atomic-ish swap: rename decrypted file over the local DB path.
-	if err := os.Rename(localDec, s.dbPath); err != nil {
+	// Atomic-ish swap: rename decrypted file over the local DB path. On some
+	// hosts (e.g. NAS) the temp dir and the data dir live on different mounts,
+	// so fall back to copy+delete via moveFile for cross-device (EXDEV) links.
+	if err := moveFile(localDec, s.dbPath); err != nil {
 		return false, fmt.Errorf("overwrite local db: %w", err)
 	}
 
